@@ -163,6 +163,29 @@ extern "C" void dbgui_frame(void) {
         if (ImGui::Button("clear selection")) g_dbg.insp_sel = -1;
     }
     ImGui::End();
+
+    /* ---- Entity Definitions: read-only decode of the district companion
+       L4R*.BUN scripted objects. Definitions only -- no world placement or
+       mesh exists in the data (Phase 50), so this is a decode readout. ---- */
+    ImGui::SetNextWindowSize(ImVec2(430, 0), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Entity Definitions  [Definitions Only - Pending Exe Scripting]");
+    ImGui::Text("%d scripted-object defs decoded from the district companion L4R*.BUN",
+                g_dbg.scripted_count);
+    ImGui::TextDisabled("local OBB extents only; the data carries no world"
+                        " placement or mesh (see docs/FORMATS.md)");
+    ImGui::Separator();
+    if (g_dbg.scripted && g_dbg.scripted_count > 0) {
+        ImGui::Text("%-24s %-8s  %s", "identifier", "hash", "W  x  L  x  H");
+        ImGui::Separator();
+        ImGui::BeginChild("entdefs", ImVec2(0, 320), true);
+        for (int i = 0; i < g_dbg.scripted_count; i++) {
+            const ScriptedDef *e = &g_dbg.scripted[i];
+            ImGui::Text("%-24s %08x  %5.1f x%5.1f x%5.1f",
+                        e->name, e->hash, e->w, e->l, e->h);
+        }
+        ImGui::EndChild();
+    } else ImGui::TextDisabled("no companion entity table loaded for this district");
+    ImGui::End();
 }
 
 extern "C" void dbgui_render(void) {

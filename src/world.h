@@ -7,6 +7,7 @@
 
 #include "nfsu2.h"
 #include "render.h"
+#include "debug.h"   /* ScriptedDef, for world_scripted_defs */
 
 #define WORLD_MAXREG 16
 
@@ -39,5 +40,12 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap);
 /* Ground height at (x,y): same contract as n2_ground_z but only tests the
  * road/terrain meshes whose bbox covers the point (grid lookup). */
 float world_ground_z(const N2Scene *s, float x, float y, float fallback);
+
+/* Decode the scripted-object entity DEFINITIONS (name + FNV-32 hash + local
+ * OBB extents) from each loaded district's companion L4R*.BUN, deduped by
+ * hash. Read-only inspector data — the companion carries no world placement
+ * or mesh (see docs/FORMATS.md). Returns the number written (<= cap). */
+int world_scripted_defs(const World *w, const char *troot,
+                        ScriptedDef *out, int cap);
 
 #endif

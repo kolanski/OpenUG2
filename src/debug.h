@@ -8,6 +8,14 @@
 extern "C" {
 #endif
 
+/* One decoded scripted-object entity definition (0x39200 chunk in a district
+ * companion L4R*.BUN). Local bounding-box extents only; see docs/FORMATS.md. */
+typedef struct {
+    char name[32];         /* ZCV_/ZCS_ identifier, NUL-terminated */
+    unsigned int hash;     /* FNV-32 of the name */
+    float w, l, h;         /* local OBB extents (X, Y, Z) */
+} ScriptedDef;
+
 typedef struct {
     /* --- freecam (works in every build; toggle with F) --- */
     int   freecam;
@@ -80,6 +88,13 @@ typedef struct {
 
     /* --- diagnostics --- */
     int  show_uv_checker;   /* fed to the shader's uUVCheck uniform each frame */
+
+    /* --- scripted-object entity DEFINITIONS (read-only inspector) ---
+       Decoded from the district companion L4R*.BUN (0x39200/0x39201 chunks).
+       DEFINITIONS ONLY: the data carries no world placement or mesh, so this
+       is a decode readout, not live entities. main.c owns the array. */
+    int  scripted_count;
+    const ScriptedDef *scripted;
 } DbgState;
 
 extern DbgState g_dbg;

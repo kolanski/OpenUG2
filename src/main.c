@@ -290,6 +290,16 @@ int main(int argc, char **argv) {
     static uint32_t tmapkey[2048]; static GLuint tmaptex[2048];
     int ntmap = world_bind_textures(&world, tmapkey, tmaptex, 2048);
     printf("track textures bound: %d distinct\n", ntmap);
+
+    /* Scripted-object entity DEFINITIONS from the district companion L4R*.BUN.
+       Read-only decode for the inspector; the data has no world placement or
+       mesh (Phase 50), so these are logged as a table, not instantiated. */
+    static ScriptedDef sdefs[256];
+    int nsd = world_scripted_defs(&world, troot, sdefs, 256);
+    printf("scripted entity defs: %d  [definitions only - no placement in data]\n", nsd);
+    for (int i = 0; i < nsd; i++)
+        printf("  %-24s %08x  %6.1f x%6.1f x%6.1f\n",
+               sdefs[i].name, sdefs[i].hash, sdefs[i].w, sdefs[i].l, sdefs[i].h);
     /* resolve each mesh's texture once — the per-frame key scan was fine for
        one region, not for a whole city of meshes */
     GLuint *mtex = (GLuint *)calloc(nm, sizeof *mtex);
@@ -1553,6 +1563,7 @@ int main(int argc, char **argv) {
             for (int i = 0; i < ni; i++) { icat[i]=cgm[i].cat; ivts[i]=car.meshes[i].nverts; }
             g_dbg.insp_count = ni; g_dbg.insp_cat = icat; g_dbg.insp_verts = ivts;
         }
+        g_dbg.scripted = sdefs; g_dbg.scripted_count = nsd;
         g_dbg.wheel_brands = wheel_brands;
         g_dbg.wheel_brand_n = n_wheel_brands;
         if (g_dbg.wheel_style < 1) g_dbg.wheel_style = wheel_style;

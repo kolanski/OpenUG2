@@ -293,6 +293,63 @@ static void grid_build(World *w) {
     printf("ground grid: %dx%d cells, %d mesh refs\n", gw, gh, start[gw*gh]);
 }
 
+/* ---- scripted-object entity definitions (read-only decode) ----
+   Each entity's 0x39200 record ends with `... 1, 8, FNV-32 hash, char[32]
+   name`, and the name is a ZCV_/ZCS_ token. Anchoring on that token (rather
+   than the 0x39200 chunk, whose preamble length varies) is the robust parse:
+   validate the constant `1, 8` fields at name-12/name-8, take the hash at
+   name-4, then read the paired 0x39201 hull (8-corner local OBB, 48B/corner)
+   that follows within a short window. Definitions only; the data has no world
+   placement or mesh (verified Phase 50, see docs/FORMATS.md). */
+static void sd_scan(const unsigned char *d, long len,
+                    ScriptedDef *out, int cap, int *n) {
+    for (long i = 40; i + 32 < len && *n < cap; i++) {
+        if (!(d[i]=='Z' && d[i+1]=='C' && (d[i+2]=='V' || d[i+2]=='S') && d[i+3]=='_'))
+            continue;
+        if (n2_u32(d + i - 12) != 1 || n2_u32(d + i - 8) != 8) continue;  /* record marker */
+        uint32_t hash = n2_u32(d + i - 4);
+        int seen = 0;
+        for (int k = 0; k < *n; k++) if (out[k].hash == hash) { seen = 1; break; }
+        if (seen) continue;
+        ScriptedDef *e = &out[(*n)++];
+        e->hash = hash;
+        int j = 0; while (j < 31 && d[i+j]) { e->name[j] = (char)d[i+j]; j++; }
+        e->name[j] = 0;
+        e->w = e->l = e->h = 0.0f;
+        for (long p = i + 32; p < i + 160 && p + 8 <= len; p += 4) {  /* paired 0x39201 */
+            if (n2_u32(d + p) != 0x00039201u) continue;
+            long q = p + 8 + 16;                                       /* first OBB corner */
+            if (q + 8*48 <= len) {
+                float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
+                for (int c = 0; c < 8; c++)
+                    for (int a = 0; a < 3; a++) {
+                        float v; memcpy(&v, d + q + c*48 + a*4, 4);
+                        if (v < mn[a]) mn[a] = v;
+                        if (v > mx[a]) mx[a] = v;
+                    }
+                e->w = mx[0]-mn[0]; e->l = mx[1]-mn[1]; e->h = mx[2]-mn[2];
+            }
+            break;
+        }
+    }
+}
+
+int world_scripted_defs(const World *w, const char *troot,
+                        ScriptedDef *out, int cap) {
+    int n = 0;
+    for (int r = 0; r < w->nreg && n < cap; r++) {
+        const char *rn = w->rgn[r].name;
+        /* companion file drops the STREAM prefix: STREAML4RA -> L4RA.BUN */
+        const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
+        char p[1024]; snprintf(p, sizeof p, "%s/%s.BUN", troot, stem);
+        long len = 0; unsigned char *d = n2_read_file(p, &len);
+        if (!d) continue;
+        sd_scan(d, len, out, cap, &n);
+        free(d);
+    }
+    return n;
+}
+
 float world_ground_z(const N2Scene *s, float x, float y, float fallback) {
     if (s->meshes != g_grid.meshes)                        /* not the loaded world */
         return n2_ground_z((N2Scene *)s, x, y, fallback);

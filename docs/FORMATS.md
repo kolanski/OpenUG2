@@ -278,17 +278,28 @@ Container `0x80034020` holds **N named entities** (89 in L4RA). Each entity is a
 0x39202  hull faces (12 triangles)           0x50 bytes (fixed)
 ```
 
-**`0x39200` header** (0x5c body):
+**`0x39200` header** (0x5c body). Offsets are into the chunk body (past the
+8-byte `magic`+`size`), re-measured Phase 51 — an earlier draft of this table
+was shifted 16 bytes because it missed the leading preamble:
 
 | off  | type      | value / meaning                                            |
 |------|-----------|------------------------------------------------------------|
-| 0x00 | u32       | 0                                                          |
-| 0x04 | u32       | 1                                                          |
-| 0x08 | u32       | 8 — class tag, constant across every entity                |
-| 0x0c | u32       | **name hash** (FNV-32 of the name; e.g. DrawBridgeA = `0xca1d510d`) |
-| 0x10 | char[32]  | **name**, NUL-padded (`ZCV_TrainEngineA`, `ZCS_Barrel_A`, …)|
-| 0x30 | u32       | `0x24` — record type / sub-size, constant                  |
-| 0x34 | u8[20]    | zero in this file — reserved / local-transform slot (unused)|
+| 0x00 | u32       | `0x11111111` — filler word                                 |
+| 0x04 | u32       | 3                                                          |
+| 0x08 | u32       | 3                                                          |
+| 0x0c | u32       | per-record instance id (varies)                            |
+| 0x10 | u32       | 0                                                          |
+| 0x14 | u32       | 1                                                          |
+| 0x18 | u32       | 8 — class tag, constant across every entity                |
+| 0x1c | u32       | **name hash** (FNV-32 of the name; e.g. DrawBridgeA = `0xca1d510d`) |
+| 0x20 | char[32]  | **name**, NUL-padded (`ZCV_TrainEngineA`, `ZCS_Barrel_A`, …)|
+| 0x40 | u32       | `0x24` — record type / sub-size, constant                  |
+| 0x44 | u8[…]     | zero in this file — reserved / local-transform slot (unused)|
+
+The engine parses these string-anchored (find the `ZCV_`/`ZCS_` token, verify
+the constant `1, 8` at name-12 / name-8, take the hash at name-4) — robust
+against the preamble, since the chunk body always ends `… 1, 8, hash, name`.
+See `world_scripted_defs()` / the inspector's "Entity Definitions" tab.
 
 **`0x39201` hull vertices** (always 0x180 = 384 B):
 
