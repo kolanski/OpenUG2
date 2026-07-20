@@ -112,7 +112,7 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
                           const uint32_t *wkeys, int nwkeys, int style,
                           N2Scene *lib, GpuMesh **gm, int *ngm,
                           const unsigned char *wtdata, long wtlen,
-                          GLuint *rimtex) {
+                          GLuint *rimtex, float fitR) {
     if (!wldata) { (void)wllen; return 0; }
     for (int i = 0; i < *ngm; i++) {
         glDeleteBuffers(1, &(*gm)[i].vbo);
@@ -125,6 +125,25 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
     int n = n2_load_car(wldata, wllen, lib, wkeys, nwkeys, &wcfg);
     if (n <= 0) return 0;
     rim_drop_welded_tris(lib);
+    /* Fit the aftermarket rim to THIS car's wheel. The library rims are one
+       fixed tuner size (~0.42 radius); a Hummer's arch is far bigger, so the
+       rim floated tiny inside it. Scale every rim submesh (they share the
+       origin) to the car's own stock-wheel radius fitR, which is measured from
+       the car's N2_CAR_TIRE mesh -- the same size the procedural tyre uses, so
+       the two stay consistent when the draw swaps between them at speed. */
+    if (fitR > 0.0f && lib->count) {
+        float bb[6]; n2_mesh_bbox(&lib->meshes[0], bb);
+        float rimR = 0.25f * ((bb[1]-bb[0]) + (bb[5]-bb[4]));   /* mean X-Z radius */
+        if (rimR > 1e-4f) {
+            float sc = fitR / rimR;
+            for (int mi = 0; mi < lib->count; mi++) {
+                N2Mesh *mm = &lib->meshes[mi];
+                for (int v = 0; v < mm->nverts; v++)
+                    for (int a = 0; a < 3; a++) mm->verts[v*5+a] *= sc;
+            }
+            printf("  rim fit: rimR %.3f -> car wheel %.3f (x%.2f)\n", rimR, fitR, sc);
+        }
+    }
     *gm = upload_scene(lib); *ngm = n;
 
     /* Bind the rim's own diffuse out of WHEELS/TEXTURES.BIN. Every submesh of
@@ -319,6 +338,7 @@ int main(int argc, char **argv) {
     GpuMesh wheelmesh; int have_wheel = 0;       /* procedural tyre, built after GL init */
     for (int k=0;k<4;k++){ float I[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}; memcpy(wheelT[k],I,sizeof(I)); }
     float carbb[6] = {0,0,0,0,0,0};              /* body AABB min/max, for wheel placement */
+    float carWheelR = 0.0f;                       /* car's stock wheel radius (rim fit) */
     N2CarConfig carcfg = { 0, 0, 0, 0 };         /* active customization profile (K cycles kits) */
     float spawn[3] = { cx, cy, cz }, heading0 = 0.0f;
     if (cdata) {
@@ -346,6 +366,7 @@ int main(int argc, char **argv) {
         float wR = 0.33f, wHW = 0.11f;
         if (ntv) { wR = 0.25f*((tb1[0]-tb0[0])+(tb1[2]-tb0[2]));   /* mean disc radius */
                    wHW = 0.5f*(tb1[1]-tb0[1]); if (wHW<0.04f) wHW=0.04f; }
+        carWheelR = wR;                            /* aftermarket rims fit to this */
         wheelmesh = make_wheel(wR, wHW); have_wheel = 1;
         /* decode + upload each distinct texture actually bound by a mesh */
         for (int i = 0; i < ncar; i++) {
@@ -523,7 +544,7 @@ int main(int argc, char **argv) {
     GLuint rimtex = 0;    /* real rim diffuse; 0 => fall back to procedural */
     if (load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
                        &wheellib, &wheelgm, &nwheelgm,
-                       wtdata, wtlen, &rimtex))
+                       wtdata, wtlen, &rimtex, carWheelR))
         printf("rims: BBS style %d, %d mesh(es)\n", wheel_style, nwheelgm);
     else
         printf("rims: library unavailable, using procedural wheels\n");
@@ -624,7 +645,7 @@ int main(int argc, char **argv) {
                     wheel_style = wheel_style % 8 + 1;   /* 1..8 */
                     if (load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
                                        &wheellib, &wheelgm, &nwheelgm,
-                                       wtdata, wtlen, &rimtex))
+                                       wtdata, wtlen, &rimtex, carWheelR))
                         printf("rims -> BBS style %d (%d mesh(es))\n", wheel_style, nwheelgm);
                 }
                 else if (k == SDLK_k && cdata) {
@@ -1618,7 +1639,7 @@ int main(int argc, char **argv) {
             wheel_style = g_dbg.wheel_style < 1 ? 1 : g_dbg.wheel_style;
             if (load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
                                &wheellib, &wheelgm, &nwheelgm,
-                               wtdata, wtlen, &rimtex))
+                               wtdata, wtlen, &rimtex, carWheelR))
                 printf("rims -> %s style %d (%d mesh(es))\n",
                        wheel_brands[wheel_brand], wheel_style, nwheelgm);
         }
