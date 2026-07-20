@@ -312,22 +312,33 @@ Decoded corner boxes match real proportions: **DrawBridgeA** 20.4 × 37.2 × 2.1
 So a `ZCV_`/`ZCS_` entity is `name + hash + a local box hull`. There is **no
 world position, orientation, or animation channel inside the triple.**
 
-### World placement (partly decoded, next phase)
+### World placement — NOT present for these entities (Phase 50, re-measured)
 
-Placements live in a separate family in the same file, **linked to the entity
-defs by name hash**, not decoded to completion here:
+**Correction.** A first draft of this section claimed placements "live in a
+separate family… linked to the entity defs by name hash." That was wrong, and
+the retraction matters because it blocks the obvious next step:
 
-- `0x37090` (45 in L4RA, 168 B each): `0x11` filler, a count, a **name hash**
-  (e.g. `0xb8a18038`), a 3×3 orientation, then **world-scale positions**
-  (e.g. `(-712.0, -873.1, +17.7)`). This is the instance/placement record.
-- `0x34250` (824 B, one per file): looks like the placement grid header —
-  leading `93, 93` (cell dims) and a world origin/extent (`-1949, 1445, …`).
-- `0x8003b601` groups (13, with `b602`–`b608` children) and the `0x39200/1/2`
-  triples are cross-referenced by the same hashes.
+- **The `ZCV_` vehicles (trains, drawbridges, trolleys, semis, sweeper) have no
+  placement record anywhere.** Each vehicle hash occurs **exactly once in each
+  companion `L4R*.BUN` — inside its own `0x39200` def — and zero times in the
+  `STREAM*.BUN` geometry.** Nothing gives them a world position or orientation.
+- **`0x37090` is not entity placement.** All 45 records in L4RA carry the *same*
+  constant tag `0xb8a18038` (57 copies in the file), **not** a per-entity name
+  hash — **0 of 45 match any `0x39200` def**. They hold world-scale coordinates
+  and are a different system (traffic/AI spline or spawn grid, undecoded).
+- **`0x34026`** holds 62 records keyed by `ZCS_` *static-prop* hashes (no
+  vehicles) with small parameter floats (`… 1.0, 1.0, 0, 0`) — looks like
+  per-prop scale/state, **not** a world transform (no world-scale translation).
+- **`0x39200` triples carry only a local 8-corner bounding box — no renderable
+  mesh.** There is no train/bridge model in the decoded chunks.
 
-**Open:** confirm the `0x37090` field layout (rotation vs. path-node list — a
-train would carry a spline), resolve the `0x39201 +0x08` u16 pair, and map the
-hash → def linkage before writing any runtime entity update loop.
+**Consequence:** the runtime placement + animation of these entities is **not
+implementable from the currently decoded data** — the hash→placement linkage,
+the per-vehicle world transform, and the entity meshes are all absent here.
+Recovering them needs a further RE pass: decode what `0x37090`/`0x34026`
+actually drive, and find where (if anywhere) the vehicle instances and their
+models are authored — most likely the retail spawn/script system, which may not
+survive in these data files at all.
 
 ## The retail executable
 
