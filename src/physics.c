@@ -17,18 +17,21 @@
  * corner tight at city speed, wide at full tilt) */
 #define TURN_HISPD_DROP  0.55f
 
+PhysTune g_phys_tune = { 1.0f, 1.0f, 1.0f, 220.0f };   /* stock defaults */
+
 float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
                     float throttle, float steer, int handbrake) {
+    float top = g_phys_tune.top_kmh / 3.6f / PHYS_TICKRATE;   /* cap in m/tick */
     float hf[2] = { cosf(*heading), sinf(*heading) };
     float fwd = vel[0]*hf[0] + vel[1]*hf[1];   /* signed forward speed */
     if (throttle > 0) {
         /* throttle tapers as speed builds: punchy off the line, eases near top */
         float sp = *speed < 0 ? -*speed : *speed;
-        float a = PHYS_ACCEL * (1.15f - 0.55f*sp/PHYS_MAXSPD) * throttle;
+        float a = PHYS_ACCEL * g_phys_tune.accel * (1.15f - 0.55f*sp/PHYS_MAXSPD) * throttle;
         vel[0] += hf[0]*a; vel[1] += hf[1]*a;
     } else if (throttle < 0) {
         /* moving forward = brakes (strong); at rest / rolling back = reverse */
-        float a = PHYS_ACCEL * (fwd > 0.01f ? BRAKE_ACCEL : REVERSE_ACCEL);
+        float a = PHYS_ACCEL * (fwd > 0.01f ? BRAKE_ACCEL*g_phys_tune.brake : REVERSE_ACCEL);
         vel[0] += hf[0]*a*throttle; vel[1] += hf[1]*a*throttle;
     } else {
         vel[0] *= COAST_DRAG; vel[1] *= COAST_DRAG;
@@ -38,12 +41,12 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
     float dir = (vel[0]*hf[0]+vel[1]*hf[1]) < 0 ? -1.f : 1.f;  /* fwd vs reverse */
     float sfac = spd/(PHYS_MAXSPD*TURN_RAMP_FRAC); if (sfac > 1) sfac = 1;
     float hifrac = spd/PHYS_MAXSPD; if (hifrac > 1) hifrac = 1;
-    *heading += steer * PHYS_TURN * sfac * (1.0f - TURN_HISPD_DROP*hifrac) * dir;
+    *heading += steer * PHYS_TURN * g_phys_tune.turn * sfac * (1.0f - TURN_HISPD_DROP*hifrac) * dir;
     /* decompose velocity in the new heading frame, clamp forward, scrub side */
     float nf[2] = { cosf(*heading), sinf(*heading) }, nr[2] = { nf[1], -nf[0] };
     float vf = vel[0]*nf[0]+vel[1]*nf[1], vl = vel[0]*nr[0]+vel[1]*nr[1];
-    if (vf >  PHYS_MAXSPD) vf =  PHYS_MAXSPD;
-    if (vf < -PHYS_MAXSPD*REVERSE_SPD_FRAC) vf = -PHYS_MAXSPD*REVERSE_SPD_FRAC;
+    if (vf >  top) vf =  top;
+    if (vf < -top*REVERSE_SPD_FRAC) vf = -top*REVERSE_SPD_FRAC;
     vl *= handbrake ? HANDBRAKE_GRIP : PHYS_GRIP;
     vel[0] = nf[0]*vf + nr[0]*vl; vel[1] = nf[1]*vf + nr[1]*vl;
     *speed = vf;                      /* forward speed, for HUD/collision */

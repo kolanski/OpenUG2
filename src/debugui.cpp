@@ -95,6 +95,16 @@ extern "C" void dbgui_frame(void) {
         ImGui::SliderFloat("z offset",   &g_dbg.wheel_z,    -1.0f, 1.0f);
         ImGui::SliderFloat("scale",      &g_dbg.wheel_scale, 0.3f, 2.0f);
     }
+    if (ImGui::CollapsingHeader("Vehicle Handling", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("live @ %.0f km/h", g_dbg.kmh);
+        ImGui::SliderFloat("acceleration", &g_dbg.tune_accel, 0.2f, 3.0f, "%.2fx");
+        ImGui::SliderFloat("braking",      &g_dbg.tune_brake, 0.2f, 3.0f, "%.2fx");
+        ImGui::SliderFloat("steering",     &g_dbg.tune_turn,  0.2f, 2.5f, "%.2fx");
+        ImGui::SliderFloat("top speed",    &g_dbg.tune_top,  60.0f, 320.0f, "%.0f km/h");
+        if (ImGui::Button("reset handling")) {
+            g_dbg.tune_accel=g_dbg.tune_brake=g_dbg.tune_turn=1.0f; g_dbg.tune_top=220.0f;
+        }
+    }
     if (ImGui::CollapsingHeader("Lighting")) {
         ImGui::SliderFloat("ambient",   &g_dbg.ambient,   0.0f, 1.0f);
         ImGui::SliderFloat("diffuse",   &g_dbg.diffuse,   0.0f, 1.5f);

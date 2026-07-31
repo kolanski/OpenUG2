@@ -40,6 +40,7 @@ DbgState g_dbg = {
     .insp_sel = -1,
     .neon_on = 1, .neon_col = { 0.15f, 0.45f, 1.0f }, .neon_str = 0.85f,
     .rim_paint = 1, .rim_color = { 0.85f, 0.88f, 0.92f },   /* silver by default */
+    .tune_accel = 1.0f, .tune_brake = 1.0f, .tune_turn = 1.0f, .tune_top = 220.0f,
     .ambient = 0.38f, .diffuse = 0.62f, .body_spec = 0.50f,   /* glossy paint */
     /* f(700m cull range) ~= 0.07 — far batches dissolve into the sky */
     .fog_density = 0.0023f, .fog_r = 0.06f, .fog_g = 0.07f, .fog_b = 0.11f,
@@ -735,6 +736,9 @@ int main(int argc, char **argv) {
         float steer = g_dbg.freecam ? 0.f
                     : (ks[SDL_SCANCODE_A]?1.f:0.f) - (ks[SDL_SCANCODE_D]?1.f:0.f);
         int handbrake = (race_state==1 && ks[SDL_SCANCODE_SPACE]);
+        /* push the ImGui handling sliders into the physics tune (stock when untouched) */
+        g_phys_tune.accel = g_dbg.tune_accel; g_phys_tune.brake = g_dbg.tune_brake;
+        g_phys_tune.turn = g_dbg.tune_turn;   g_phys_tune.top_kmh = g_dbg.tune_top;
         if (shot && aipath.n > 0) {   /* screenshot autopilot: follow the racing
                line (chasing an AI used to drift off small proxy regions into
                the empty void — black screenshots) */
@@ -1176,9 +1180,9 @@ int main(int argc, char **argv) {
                     glUniform1f(uUseTex, 0.0f);
                     if      (c == N2_CAR_LIGHT)      glUniform3f(uColor, 0.92f, 0.90f, 0.85f);  /* clear/chrome lens */
                     else if (c == N2_CAR_BRAKELIGHT) {
-                        /* lens glows hot while braking (S) and the car is still
-                           rolling forward; otherwise it sits at its unlit red. */
-                        int braking = (throttle < -0.1f && speed > 0.01f);
+                        /* lens glows hot while braking (S, rolling forward) or the
+                           handbrake (SPACE) is pulled; otherwise its unlit red. */
+                        int braking = (throttle < -0.1f && speed > 0.01f) || handbrake;
                         if (braking) glUniform3f(uColor, 1.0f, 0.16f, 0.10f);
                         else         glUniform3f(uColor, 0.60f, 0.02f, 0.02f);
                     }

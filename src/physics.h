@@ -20,6 +20,12 @@
 /* km/h for the HUD from a m/tick forward speed */
 #define PHYS_KMH(v)   ((v) * PHYS_TICKRATE * 3.6f)
 
+/* Live handling tuning (ImGui sliders). accel/brake/turn are multipliers on the
+ * constants above (1.0 = stock); top_kmh is a hard forward-speed cap. Defaults
+ * reproduce the tuned NFSU2 feel exactly, so phys_selftest still holds. */
+typedef struct { float accel, brake, turn, top_kmh; } PhysTune;
+extern PhysTune g_phys_tune;
+
 /* One tick of car kinematics: throttle in [-1..1] along the heading, steering
  * in [-1..1] rotates it, tyres scrub the sideways velocity (handbrake keeps
  * it, so the car slides), position integrates. Returns the post-grip lateral
