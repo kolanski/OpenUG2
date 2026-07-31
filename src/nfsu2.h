@@ -850,7 +850,10 @@ static int n2_nearest_wp(const N2Path *p, float x, float y) {
 static float n2_ground_z(N2Scene *s, float x, float y, float fallback) {
     float best = -1e30f; int found = 0;
     for (int m = 0; m < s->count; m++) {
-        if (s->meshes[m].cat == N2_OTHER) continue;   /* road + terrain only */
+        /* road + terrain ONLY: SKY (the skydome spans every XY up to Z~8000)
+           and GLOW must be excluded or the query returns a point on the dome
+           and launches the car kilometres into the air. */
+        if (s->meshes[m].cat != N2_ROAD && s->meshes[m].cat != N2_TERRAIN) continue;
         N2Mesh *me = &s->meshes[m];
         for (int t = 0; t + 2 < me->nidx; t += 3) {
             float *a = me->verts + me->idx[t]*5;

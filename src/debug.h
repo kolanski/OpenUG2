@@ -81,6 +81,10 @@ typedef struct {
     int  insp_cull;         /* 0 = no culling (engine default), 1 = cull back, 2 = cull front */
     int  insp_glass_depth;  /* 1 = glass pass writes depth (diagnostic) */
 
+    /* --- rim paint (recolor the OEM gold rim diffuse; silver by default) --- */
+    int   rim_paint;        /* 1 = tint toward rim_color, 0 = raw OEM texture */
+    float rim_color[3];     /* rim paint colour */
+
     /* --- neon underglow (a real customization, not a diagnostic) --- */
     int   neon_on;          /* 1 = project the underglow pool */
     float neon_col[3];      /* emission colour */

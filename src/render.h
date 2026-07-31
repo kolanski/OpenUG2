@@ -59,8 +59,9 @@ typedef struct {
                        instead of lighting/texture (toggle lives in the
                        ImGui Session panel, make debug only) */
           uFlipN,   /* 1 = negate the vertex normal (inspector diagnostic) */
-          uGloss;   /* specular pow() exponent: high = tight metallic-paint
+          uGloss,   /* specular pow() exponent: high = tight metallic-paint
                        highlight, low = broad plastic/trim sheen (cars only) */
+          uRimTint; /* 0 = raw rim texture, 1 = recolor toward uColor (rim paint) */
 } RProg;
 
 /* world-space sun direction (night scene key light) */
@@ -73,6 +74,7 @@ void mat_mul(const float *a, const float *b, float *o);
 void mat_persp(float fov, float aspect, float znear, float zfar, float *m);
 void mat_trans(float x, float y, float z, float *m);
 void mat_rotz(float a, float *m);
+void mat_car(const float *pos, float heading, const float *up, float rideh, float *m);
 void mat_lookat(const float *eye, const float *fwd, float *m);   /* up = world +Z */
 
 /* ---- GPU objects ---- */

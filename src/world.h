@@ -41,6 +41,13 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap);
  * road/terrain meshes whose bbox covers the point (grid lookup). */
 float world_ground_z(const N2Scene *s, float x, float y, float fallback);
 
+/* Unit up-normal of the ground triangle under (x,y); (0,0,1) if off-track. */
+void world_ground_normal(const N2Scene *s, float x, float y, float n[3]);
+
+/* Push the car circle (centre pos[3], radius r) out of any near-vertical
+   guardrail/fence face baked into the road/terrain. Returns 1 if it pushed. */
+int world_wall_push(const N2Scene *s, float *pos, float r);
+
 /* Decode the scripted-object entity DEFINITIONS (name + FNV-32 hash + local
  * OBB extents) from each loaded district's companion L4R*.BUN, deduped by
  * hash. Read-only inspector data — the companion carries no world placement

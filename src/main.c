@@ -39,6 +39,7 @@ DbgState g_dbg = {
     .wheel_z = -0.05f, .wheel_scale = 0.9f,
     .insp_sel = -1,
     .neon_on = 1, .neon_col = { 0.15f, 0.45f, 1.0f }, .neon_str = 0.85f,
+    .rim_paint = 1, .rim_color = { 0.85f, 0.88f, 0.92f },   /* silver by default */
     .ambient = 0.38f, .diffuse = 0.62f, .body_spec = 0.50f,   /* glossy paint */
     /* f(700m cull range) ~= 0.07 — far batches dissolve into the sky */
     .fog_density = 0.0023f, .fog_r = 0.06f, .fog_g = 0.07f, .fog_b = 0.11f,
@@ -153,6 +154,7 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
     if (*rimtex) { glDeleteTextures(1, rimtex); *rimtex = 0; }
     uint32_t tk = lib->count ? lib->meshes[0].texkey : 0;
     N2Tex rt; memset(&rt, 0, sizeof rt);
+    long ar=0, ag=0, ab=0, bmn=255, bmx=0;
     if (tk && wtdata && n2_load_car_tex_by_key(wtdata, wtlen, tk, &rt)) {
         *rimtex = upload_tex(&rt);
         /* rim sheets are atlases with UVs in [0,1]: clamp so REPEAT wrap +
@@ -160,11 +162,18 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
            the car body atlases above). */
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        long np = (long)rt.w * rt.h;
+        for (long p = 0; p < np; p++) { int b = rt.rgb[p*3+2];
+            ar += rt.rgb[p*3]; ag += rt.rgb[p*3+1]; ab += b;
+            if (b < bmn) bmn = b; if (b > bmx) bmx = b; }
+        if (np) { ar/=np; ag/=np; ab/=np; }
         free(rt.rgb); free(rt.alpha);
     }
-    printf("  rim diffuse: texkey %08x -> %s (%dx%d)\n", tk,
-           *rimtex ? "bound" : "UNRESOLVED, procedural fallback",
-           *rimtex ? rt.w : 0, *rimtex ? rt.h : 0);
+    /* channel telemetry: B min/max spanning 0..255 confirms the decode is NOT
+       truncating blue -- the low average is an authentic gold/bronze rim. */
+    printf("  rim diffuse: texkey %08x -> %s (%dx%d) avg RGB %ld,%ld,%ld  B[min %ld..max %ld]\n",
+           tk, *rimtex ? "bound" : "UNRESOLVED, procedural fallback",
+           *rimtex ? rt.w : 0, *rimtex ? rt.h : 0, ar, ag, ab, bmn, bmx);
     return 1;
 }
 
@@ -579,6 +588,7 @@ int main(int argc, char **argv) {
     float paint[3] = { 0.70f, 0.70f, 0.75f };
     if (!strcmp(carname, "MIATA")) { paint[0]=0.55f; paint[1]=0.10f; paint[2]=0.09f; }  /* reference showroom red */
     float carpos[3] = { spawn[0], spawn[1], spawn[2] };
+    float car_up[3] = { 0, 0, 1 };   /* chassis up, lerped toward the ground normal */
     if (shot && aipath.n > 0) {
         /* --shot skips the menu (and its Enter-key start-line snap), so the
            showcase density-spawn would leave the car parked off-circuit in
@@ -755,9 +765,19 @@ int main(int argc, char **argv) {
         float fwd[3] = { nf[0], nf[1], 0 };
         /* building collision: push the car out of any wall footprint it entered.*/
         if (race_state == 1 && collide_walls(carpos, vel, obst, nobst, 1.3f)) g_hit = 0.5f;
+        /* guardrail/fence collision: push out of near-vertical road/terrain faces */
+        if (race_state == 1 && world_wall_push(&scene, carpos, 1.3f)) {
+            vel[0]*=0.3f; vel[1]*=0.3f; g_hit = 0.5f;   /* rebound: bleed speed */
+        }
         /* sit on the road/terrain surface (smoothed to avoid jitter) */
         float gz = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
         carpos[2] += (gz - carpos[2]) * 0.35f;
+        /* chassis pitch/roll: ease the body up-vector toward the ground normal
+           (slow lerp so sharp mesh seams don't snap the car). */
+        { float gn[3]; world_ground_normal(&scene, carpos[0], carpos[1], gn);
+          for (int a = 0; a < 3; a++) car_up[a] += (gn[a] - car_up[a]) * 0.10f;
+          float l = sqrtf(car_up[0]*car_up[0]+car_up[1]*car_up[1]+car_up[2]*car_up[2]);
+          if (l > 1e-6f) { car_up[0]/=l; car_up[1]/=l; car_up[2]/=l; } }
 
         /* drifting? extend the tyre ribbons + puff smoke at the rear wheels */
         int drifting = (dmag > PHYS_MAXSPD*0.2f && speed > PHYS_MAXSPD*0.22f);
@@ -878,15 +898,18 @@ int main(int argc, char **argv) {
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPsky);
             glUniform1f(uUnlit, 1.0f);
             glDepthMask(GL_FALSE);
-            GLuint lastskytex = (GLuint)-1;
+            /* The unlit path outputs mix(uFogColor,uColor,fog) and never
+               samples the texture, so every sky batch is flat-shaded to
+               uColor. It MUST be set here: the loop used to set it only for
+               untextured batches, so a textured sky mesh (region D has one)
+               inherited whatever uColor the previous frame last left -- the
+               red brake-light/neon colour -- and, being camera-locked, drew a
+               fixed red block at the top of the frame. Pin it to the fog
+               colour so the dome always dissolves into the horizon. */
+            glUniform1f(uUseTex, 0.0f);
+            glUniform3f(uColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b);
             for (int k = 0; k < nsky; k++) {
-                N2Batch *b = &skybatch[k];
-                if (b->tex != lastskytex) {
-                    if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
-                    else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b); }
-                    lastskytex = b->tex;
-                }
-                draw_batch(b);
+                draw_batch(&skybatch[k]);
                 g_dbg.drawn++;
             }
             glDepthMask(GL_TRUE); glUniform1f(uUnlit, 0.0f);
@@ -1020,12 +1043,10 @@ int main(int argc, char **argv) {
             glUniform1f(uAlpha, 1.0f); glDepthMask(GL_TRUE); glDisable(GL_BLEND);
         }
 
-        /* car: solid-shaded, positioned + rotated to heading */
+        /* car: solid-shaded, positioned + banked to the road (up = car_up) */
         if (ncar) {
-            float T[16], Rz[16], Model[16], MVPc[16];
-            mat_trans(carpos[0], carpos[1], carpos[2] + 0.43f, T);
-            mat_rotz(heading, Rz);
-            mat_mul(T, Rz, Model);
+            float Model[16], MVPc[16];
+            mat_car(carpos, heading, car_up, 0.43f, Model);
             mat_mul(MVP, Model, MVPc);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
             /* normals stay model-space, so counter-rotate the sun into car
@@ -1236,33 +1257,38 @@ int main(int argc, char **argv) {
             /* procedural tyres at the 4 arches (the game rims render as urchins);
                the radial rim texture gives them a hub + spokes instead of a void */
             if (have_wheel && g_dbg.show_tires) {
-                glUniform1f(rp.uDecal, 0.0f); glUniform1f(uSpec, 0.4f);
-                glUniform1f(rp.uEnv, 0.3f);   /* alloy sheen on the rims */
-                glUniform1f(uUseTex, 1.0f);
-                /* PHYS_KMH(speed), not g_dbg.kmh: that mirror is only written
-                   at the end of the frame, so reading it here lags a frame.
-                   Below the blur threshold the geometric rim is drawn, so it
-                   gets its own diffuse out of WHEELS/TEXTURES.BIN (rimtex).
-                   Above it the mesh is swapped for the procedural disc, whose
-                   angular-averaged sheet is what sells the blur -- so the
-                   texture has to follow the mesh swap, not the other way. */
-                glBindTexture(GL_TEXTURE_2D,
-                              PHYS_KMH(speed) > WHEEL_BLUR_KMH ? texWheelBlur :
-                              (nwheelgm > 0 && rimtex) ? rimtex : texWheel);
+                glUniform1f(rp.uDecal, 0.0f);
+                /* Geometric rim below the blur threshold, else the procedural
+                   disc (its angular-averaged sheet sells the motion blur).
+                   The WHEELS/TEXTURES.BIN rim diffuse is AUTHENTIC (blue spans
+                   the full 0..255; the low average is just a gold/bronze rim,
+                   not a decode bug), so it is bound directly and shows the real
+                   manufacturer colour. uEnv=0 keeps the warm env sphere off it
+                   (that, not the texture, was the old green cast) and a strong
+                   specular adds the chrome highlight over the diffuse.
+                   uColor is ignored on the textured path (base = t.rgb).
+                   PHYS_KMH(speed), not g_dbg.kmh, which lags a frame here. */
+                int geo = nwheelgm > 0 && PHYS_KMH(speed) <= WHEEL_BLUR_KMH;
+                if (geo) {
+                    /* Rim paint: bind the authentic OEM diffuse and recolor it
+                       toward the chosen rim colour (silver default) via uRimTint,
+                       keeping the spoke detail. rim_paint=0 shows the raw gold. */
+                    glUniform1f(uUseTex, rimtex ? 1.0f : 0.0f);
+                    glUniform1f(rp.uEnv, 0.0f); glUniform1f(uSpec, 0.85f);
+                    glUniform3fv(uColor, 1, g_dbg.rim_color);
+                    glUniform1f(rp.uRimTint, rimtex && g_dbg.rim_paint ? 1.0f : 0.0f);
+                    if (rimtex) glBindTexture(GL_TEXTURE_2D, rimtex);
+                } else {
+                    glUniform1f(uUseTex, 1.0f); glUniform1f(rp.uEnv, 0.3f);
+                    glUniform1f(uSpec, 0.4f);
+                    glBindTexture(GL_TEXTURE_2D,
+                        PHYS_KMH(speed) > WHEEL_BLUR_KMH ? texWheelBlur : texWheel);
+                }
                 for (int k=0;k<4;k++){ float MVPw[16]; mat_mul(MVPc, wheelT[k], MVPw);
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPw);
-                    /* Real aftermarket rim on the same steering/rolling
-                       matrices. Above the blur threshold the spokes are real
-                       GEOMETRY, so swapping the texture (Phase 29) can no
-                       longer hide them -- at speed they alias into a strobe.
-                       So swap the whole mesh: geometric rim when slow enough
-                       to read the spokes, procedural disc (already carrying
-                       the angular-averaged texture) once it is spinning. */
-                    if (nwheelgm > 0 && PHYS_KMH(speed) <= WHEEL_BLUR_KMH)
-                        draw_gpumesh(&wheelgm[0]);
-                    else
-                        draw_gpumesh(&wheelmesh); }
+                    draw_gpumesh(geo ? &wheelgm[0] : &wheelmesh); }
                 g_dbg.drawn += 4;
+                glUniform1f(rp.uRimTint, 0.0f);   /* rim paint is rim-only */
                 glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
             }
             glUniform1f(uUseTex, 0.0f);
@@ -1270,9 +1296,8 @@ int main(int argc, char **argv) {
             glUniform1f(rp.uEnv, 0.35f);
             /* AI opponents — same body, each in its own colour */
             for (int k = 0; k < nai; k++) {
-                mat_trans(ais[k].pos[0], ais[k].pos[1], ais[k].pos[2] + 0.43f, T);
-                mat_rotz(ais[k].head, Rz);
-                mat_mul(T, Rz, Model);
+                float aup[3]; world_ground_normal(&scene, ais[k].pos[0], ais[k].pos[1], aup);
+                mat_car(ais[k].pos, ais[k].head, aup, 0.43f, Model);
                 mat_mul(MVP, Model, MVPc);
                 glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
                 { float ch=cosf(ais[k].head), sh=sinf(ais[k].head);
@@ -1656,6 +1681,16 @@ int main(int argc, char **argv) {
             free(px); free(fl);
             printf("frame avg: %.1f ms (vsync on), %d/%d world meshes drawn, %d draw calls\n",
                    (SDL_GetTicks()-t0)/(float)shotframe, ndrawn, nm, g_dbg.drawn);
+            printf("camera XYZ: (%.1f, %.1f, %.1f)  looking at car (%.1f, %.1f, %.1f)\n",
+                   cam[0], cam[1], cam[2], carpos[0], carpos[1], carpos[2]);
+            { float f[3]={cosf(heading),sinf(heading),0};   /* pitch/roll from car_up */
+              float d=f[0]*car_up[0]+f[1]*car_up[1]+f[2]*car_up[2];
+              f[0]-=d*car_up[0]; f[1]-=d*car_up[1]; f[2]-=d*car_up[2];
+              float fl2=sqrtf(f[0]*f[0]+f[1]*f[1]+f[2]*f[2]); if(fl2>1e-6f){f[0]/=fl2;f[1]/=fl2;f[2]/=fl2;}
+              float lft[3]={car_up[1]*f[2]-car_up[2]*f[1], car_up[2]*f[0]-car_up[0]*f[2], car_up[0]*f[1]-car_up[1]*f[0]};
+              printf("chassis: up(%.3f,%.3f,%.3f) pitch=%+.1fdeg roll=%+.1fdeg  (ground grade %.1fdeg)\n",
+                     car_up[0],car_up[1],car_up[2], asinf(f[2])*57.2958f, asinf(lft[2])*57.2958f,
+                     acosf(car_up[2]>1?1:car_up[2])*57.2958f); }
             printf("wrote %s (%dx%d) after driving to (%.0f,%.0f)\n", shot, W, H, carpos[0], carpos[1]);
             running = 0;
         }

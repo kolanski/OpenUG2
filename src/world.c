@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <math.h>
 
 #include "world.h"
 #include "resource.h"
@@ -262,7 +263,7 @@ static void grid_build(World *w) {
     const N2Scene *s = &w->scene;
     float x0=1e30f, y0=1e30f, x1=-1e30f, y1=-1e30f;
     for (int i = 0; i < s->count; i++) {
-        if (s->meshes[i].cat == N2_OTHER) continue;
+        if (s->meshes[i].cat != N2_ROAD && s->meshes[i].cat != N2_TERRAIN) continue;
         if (w->mbb[i][0]<x0)x0=w->mbb[i][0]; if (w->mbb[i][1]<y0)y0=w->mbb[i][1];
         if (w->mbb[i][2]>x1)x1=w->mbb[i][2]; if (w->mbb[i][3]>y1)y1=w->mbb[i][3];
     }
@@ -272,7 +273,7 @@ static void grid_build(World *w) {
     /* count pass, prefix sum, fill pass */
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < s->count; i++) {
-            if (s->meshes[i].cat == N2_OTHER) continue;
+            if (s->meshes[i].cat != N2_ROAD && s->meshes[i].cat != N2_TERRAIN) continue;
             int cx0=(int)((w->mbb[i][0]-x0)/GCELL), cy0=(int)((w->mbb[i][1]-y0)/GCELL);
             int cx1=(int)((w->mbb[i][2]-x0)/GCELL), cy1=(int)((w->mbb[i][3]-y0)/GCELL);
             for (int cy = cy0; cy <= cy1; cy++) for (int cx = cx0; cx <= cx1; cx++) {
@@ -362,4 +363,80 @@ float world_ground_z(const N2Scene *s, float x, float y, float fallback) {
     for (int k = g_grid.start[c]; k < g_grid.start[c+1] && sub.count < 512; k++)
         scratch[sub.count++] = s->meshes[g_grid.list[k]];
     return n2_ground_z(&sub, x, y, fallback);
+}
+
+/* Guardrail/fence collision (Phase 58). Rails are NOT separate meshes with a
+   boundary flag -- they are near-vertical triangles baked into large ROAD/
+   TERRAIN meshes (measured: 6 of 109 tris in one road chunk). So collide them
+   per-triangle: in the car's grid cell, any ground-mesh triangle whose face is
+   near-vertical (|Nz|<0.30 -- steep enough to be a wall, not the drivable ~10
+   deg tarmac whose Nz~0.98) is a rail. Treat its XY projection as a segment and
+   push the car circle (radius r) back out along the horizontal face normal if
+   it crosses, while the car's Z sits within the rail's height span. Returns 1
+   if it pushed. */
+static float seg_d2(float px,float py,float ax,float ay,float bx,float by,float *ox,float *oy){
+    float dx=bx-ax, dy=by-ay, L2=dx*dx+dy*dy;
+    float t = L2>1e-9f ? ((px-ax)*dx+(py-ay)*dy)/L2 : 0.0f;
+    if (t<0) t=0; else if (t>1) t=1;
+    *ox=ax+t*dx; *oy=ay+t*dy;
+    float ex=px-*ox, ey=py-*oy; return ex*ex+ey*ey;
+}
+int world_wall_push(const N2Scene *s, float *pos, float r) {
+    if (s->meshes != g_grid.meshes) return 0;
+    int cx = (int)((pos[0]-g_grid.x0)/GCELL), cy = (int)((pos[1]-g_grid.y0)/GCELL);
+    if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) return 0;
+    int c = cy*g_grid.gw + cx, pushed = 0;
+    for (int k = g_grid.start[c]; k < g_grid.start[c+1]; k++) {
+        const N2Mesh *m = &s->meshes[g_grid.list[k]];
+        for (int t = 0; t+2 < m->nidx; t += 3) {
+            const float *a=m->verts+m->idx[t]*5, *b=m->verts+m->idx[t+1]*5, *cc=m->verts+m->idx[t+2]*5;
+            float e1x=b[0]-a[0],e1y=b[1]-a[1],e1z=b[2]-a[2], e2x=cc[0]-a[0],e2y=cc[1]-a[1],e2z=cc[2]-a[2];
+            float nx=e1y*e2z-e1z*e2y, ny=e1z*e2x-e1x*e2z, nz=e1x*e2y-e1y*e2x;
+            float L=sqrtf(nx*nx+ny*ny+nz*nz); if (L<1e-6f) continue;
+            if (fabsf(nz/L) >= 0.30f) continue;                 /* not a wall face */
+            float zlo=a[2],zhi=a[2];                            /* rail height span */
+            if(b[2]<zlo)zlo=b[2]; if(cc[2]<zlo)zlo=cc[2]; if(b[2]>zhi)zhi=b[2]; if(cc[2]>zhi)zhi=cc[2];
+            if (pos[2] < zlo-0.5f || pos[2] > zhi+0.5f) continue;   /* car not at rail height */
+            /* nearest point on the tri's longest XY edge (its footprint line) */
+            float ox,oy, best=1e30f, bx=0,by=0;
+            float d0=seg_d2(pos[0],pos[1],a[0],a[1],b[0],b[1],&ox,&oy); if(d0<best){best=d0;bx=ox;by=oy;}
+            float d1=seg_d2(pos[0],pos[1],b[0],b[1],cc[0],cc[1],&ox,&oy); if(d1<best){best=d1;bx=ox;by=oy;}
+            float d2=seg_d2(pos[0],pos[1],cc[0],cc[1],a[0],a[1],&ox,&oy); if(d2<best){best=d2;bx=ox;by=oy;}
+            if (best >= r*r) continue;
+            float hx=pos[0]-bx, hy=pos[1]-by;
+            float hl = sqrtf(hx*hx+hy*hy); if (hl<1e-6f){ hx=nx; hy=ny; hl=sqrtf(hx*hx+hy*hy); if(hl<1e-6f)continue; }
+            pos[0] = bx + hx/hl*r; pos[1] = by + hy/hl*r;        /* shove back to r */
+            pushed = 1;
+        }
+    }
+    return pushed;
+}
+
+/* Unit up-normal of the highest ROAD/TERRAIN triangle under (x,y); (0,0,1) if
+   off any ground triangle. Drives the car's pitch/roll (Phase 58). */
+void world_ground_normal(const N2Scene *s, float x, float y, float n[3]) {
+    n[0]=0; n[1]=0; n[2]=1;
+    if (s->meshes != g_grid.meshes) return;
+    int cx = (int)((x - g_grid.x0) / GCELL), cy = (int)((y - g_grid.y0) / GCELL);
+    if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) return;
+    int c = cy*g_grid.gw + cx; float best = -1e30f;
+    for (int k = g_grid.start[c]; k < g_grid.start[c+1]; k++) {
+        const N2Mesh *m = &s->meshes[g_grid.list[k]];
+        for (int t = 0; t+2 < m->nidx; t += 3) {
+            const float *a=m->verts+m->idx[t]*5, *b=m->verts+m->idx[t+1]*5, *cc=m->verts+m->idx[t+2]*5;
+            float d = (b[1]-cc[1])*(a[0]-cc[0]) + (cc[0]-b[0])*(a[1]-cc[1]);
+            if (d > -1e-9f && d < 1e-9f) continue;
+            float u = ((b[1]-cc[1])*(x-cc[0]) + (cc[0]-b[0])*(y-cc[1])) / d;
+            float v = ((cc[1]-a[1])*(x-cc[0]) + (a[0]-cc[0])*(y-cc[1])) / d;
+            if (u < -0.01f || v < -0.01f || 1.0f-u-v < -0.01f) continue;
+            float z = u*a[2]+v*b[2]+(1.0f-u-v)*cc[2];
+            if (z <= best) continue;
+            best = z;
+            float e1x=b[0]-a[0],e1y=b[1]-a[1],e1z=b[2]-a[2], e2x=cc[0]-a[0],e2y=cc[1]-a[1],e2z=cc[2]-a[2];
+            float nx=e1y*e2z-e1z*e2y, ny=e1z*e2x-e1x*e2z, nz=e1x*e2y-e1y*e2x;
+            float len = sqrtf(nx*nx+ny*ny+nz*nz); if (len < 1e-9f) continue;
+            if (nz < 0) { nx=-nx; ny=-ny; nz=-nz; }
+            n[0]=nx/len; n[1]=ny/len; n[2]=nz/len;
+        }
+    }
 }

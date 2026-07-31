@@ -34,6 +34,7 @@ static const char *FS =
     "uniform vec3 uFogColor; uniform float uFogDensity;\n"
     "uniform vec3 uCamPos; uniform float uEnv; uniform float uUVCheck;\n"
     "uniform float uGloss; uniform float uFlipN;\n"
+    "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
     "void main(){\n"
@@ -71,6 +72,12 @@ static const char *FS =
        texture RGB shows only where its alpha says so, paint elsewhere */
     "  vec4 t = texture2D(uTex,vUV);\n"
     "  vec3 base = uUseTex>0.5 ? (uDecal>0.5 ? mix(uColor,t.rgb,t.a) : t.rgb) : uColor;\n"
+    /* Rim paint: recolor the diffuse toward uColor while KEEPING its detail.
+       Luminance drives the shade, uColor picks the metal, so a gold OEM sheet
+       becomes any painted colour (silver by default) with spokes/shadows
+       intact. uRimTint 0 = raw OEM texture, 1 = fully painted. */
+    "  if(uRimTint>0.001){ float y=dot(t.rgb, vec3(0.299,0.587,0.114));\n"
+    "    base = mix(base, uColor*(0.25+1.5*y), uRimTint); }\n"
     /* cheap view-angle cavity darkening (cars only, uSpec>0 — the world
        batches always set uSpec=0): panel gaps/creases have no texture data
        to show them (verified: body meshes carry no diffuse map at all), so
@@ -127,6 +134,19 @@ void mat_trans(float x,float y,float z,float *m){
     float r[16]={1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1}; memcpy(m,r,sizeof r); }
 void mat_rotz(float a, float *m){ float c=cosf(a),s=sinf(a);
     float r[16]={c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1}; memcpy(m,r,sizeof r); }
+/* Car model matrix: local +X = forward (heading), +Z = up (the ground normal),
+   translated to pos + rideh along up. Forward is projected onto the plane
+   perpendicular to up so the chassis banks with the road instead of staying
+   level. up must be unit; a flat up=(0,0,1) reproduces mat_trans*mat_rotz. */
+void mat_car(const float *pos, float heading, const float *up, float rideh, float *m){
+    float f[3]={cosf(heading),sinf(heading),0};
+    float d=f[0]*up[0]+f[1]*up[1]+f[2]*up[2];
+    f[0]-=d*up[0]; f[1]-=d*up[1]; f[2]-=d*up[2]; vnorm(f);   /* forward in the plane */
+    float l[3]={up[1]*f[2]-up[2]*f[1], up[2]*f[0]-up[0]*f[2], up[0]*f[1]-up[1]*f[0]}; /* left = up x fwd */
+    float r[16]={ f[0],f[1],f[2],0,  l[0],l[1],l[2],0,  up[0],up[1],up[2],0,
+        pos[0]+up[0]*rideh, pos[1]+up[1]*rideh, pos[2]+up[2]*rideh, 1 };
+    memcpy(m,r,sizeof r);
+}
 /* right-handed lookAt, column-major, up = world +Z */
 void mat_lookat(const float *eye, const float *fwd, float *m) {
     float f[3]={fwd[0],fwd[1],fwd[2]}; vnorm(f);
@@ -209,8 +229,9 @@ RProg render_program(void) {
     r.uLight   = glGetUniformLocation(r.prog, "uLight");
     r.uGloss   = glGetUniformLocation(r.prog, "uGloss");
     r.uFlipN   = glGetUniformLocation(r.prog, "uFlipN");
+    r.uRimTint = glGetUniformLocation(r.prog, "uRimTint");
     glUniform1f(r.uAlpha, 1.0f); glUniform1f(r.uSoft, 0.0f); glUniform1f(r.uSpec, 0.0f);
-    glUniform1f(r.uDecal, 0.0f);
+    glUniform1f(r.uDecal, 0.0f); glUniform1f(r.uRimTint, 0.0f);
     glUniform3f(r.uFogColor, 0.06f, 0.07f, 0.11f); glUniform1f(r.uFogDensity, 0.0f);
     glUniform3f(r.uCamPos, 0, 0, 0); glUniform1f(r.uEnv, 0.0f);
     glUniform1f(r.uUVCheck, 0.0f);

@@ -128,6 +128,19 @@ extern "C" void dbgui_frame(void) {
         ImGui::TextDisabled("re-streams GEOMETRY_<BRAND>.BIN and rebuilds the rim VBO/IBO");
     } else ImGui::TextDisabled("wheel library not loaded");
     ImGui::Separator();
+    if (ImGui::CollapsingHeader("Rim Paint Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("paint rims (off = raw OEM texture)", (bool *)&g_dbg.rim_paint);
+        ImGui::ColorEdit3("rim colour", g_dbg.rim_color);
+        if (ImGui::Button("Chrome/Silver")) {
+            g_dbg.rim_paint = 1; g_dbg.rim_color[0]=0.85f; g_dbg.rim_color[1]=0.88f; g_dbg.rim_color[2]=0.92f;
+        } ImGui::SameLine();
+        if (ImGui::Button("OEM Gold")) g_dbg.rim_paint = 0;          /* raw texture */
+        ImGui::SameLine();
+        if (ImGui::Button("Gunmetal")) {
+            g_dbg.rim_paint = 1; g_dbg.rim_color[0]=0.30f; g_dbg.rim_color[1]=0.32f; g_dbg.rim_color[2]=0.36f;
+        }
+    }
+    ImGui::Separator();
     if (ImGui::CollapsingHeader("Neon Underglow", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("neon on", (bool *)&g_dbg.neon_on);
         ImGui::ColorEdit3("neon colour", g_dbg.neon_col);
