@@ -36,7 +36,9 @@
 DbgState g_dbg = {
     .freecam = 0, .speed = 0.6f,
     .wheel_frontf = 0.62f, .wheel_rearf = 0.58f, .wheel_trackf = 0.76f,
-    .wheel_z = -0.05f, .wheel_scale = 0.9f,
+    /* wheel_z 0 = hub at the body's model origin, which is exactly where every
+       car's stock N2_CAR_TIRE hub centre sits (measured Z = 0.000). */
+    .wheel_z = 0.0f, .wheel_scale = 1.0f,
     .insp_sel = -1,
     .neon_on = 1, .neon_col = { 0.15f, 0.45f, 1.0f }, .neon_str = 0.85f,
     .rim_paint = 1, .rim_color = { 0.85f, 0.88f, 0.92f },   /* silver by default */
@@ -349,6 +351,7 @@ int main(int argc, char **argv) {
     for (int k=0;k<4;k++){ float I[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}; memcpy(wheelT[k],I,sizeof(I)); }
     float carbb[6] = {0,0,0,0,0,0};              /* body AABB min/max, for wheel placement */
     float carWheelR = 0.0f;                       /* car's stock wheel radius (rim fit) */
+    N2CarProfile carprof; memset(&carprof, 0, sizeof carprof);   /* per-car dimensions */
     N2CarConfig carcfg = { 0, 0, 0, 0 };         /* active customization profile (K cycles kits) */
     float spawn[3] = { cx, cy, cz }, heading0 = 0.0f;
     if (cdata) {
@@ -376,7 +379,20 @@ int main(int argc, char **argv) {
         float wR = 0.33f, wHW = 0.11f;
         if (ntv) { wR = 0.25f*((tb1[0]-tb0[0])+(tb1[2]-tb0[2]));   /* mean disc radius */
                    wHW = 0.5f*(tb1[1]-tb0[1]); if (wHW<0.04f) wHW=0.04f; }
-        carWheelR = wR;                            /* aftermarket rims fit to this */
+        /* Build this car's dimension profile from its OWN geometry, and drive
+           the wheel/ride numbers from it instead of any absolute constant. */
+        n2_car_profile(&car, carname, g_dbg.wheel_frontf, g_dbg.wheel_rearf,
+                       g_dbg.wheel_trackf, n2_car_brake_radius(cdata, 0, clen),
+                       &carprof);
+        wR = carprof.wheel_r; wHW = 0.5f * carprof.wheel_w;
+        if (wHW < 0.04f) wHW = 0.04f;
+        carWheelR = carprof.wheel_r;               /* aftermarket rims fit to this */
+        printf("car profile %-12s wheel R %.3f W %.3f%s  hubZ %+.3f  ride %.3f  "
+               "wheelbase %.2f  track %.2f  clearance %.3f\n",
+               carprof.name, carprof.wheel_r, carprof.wheel_w,
+               carprof.has_tire ? "" : " (no tyre mesh: derived from body length)",
+               carprof.hub_z, carprof.ride, carprof.wheelbase, carprof.track_f,
+               carprof.clearance);
         wheelmesh = make_wheel(wR, wHW); have_wheel = 1;
         /* decode + upload each distinct texture actually bound by a mesh */
         for (int i = 0; i < ncar; i++) {
@@ -1050,7 +1066,19 @@ int main(int argc, char **argv) {
         /* car: solid-shaded, positioned + banked to the road (up = car_up) */
         if (ncar) {
             float Model[16], MVPc[16];
-            mat_car(carpos, heading, car_up, 0.43f, Model);
+            /* Ride height = this car's OWN wheel radius. Measured across every
+               car: the stock N2_CAR_TIRE hub centre sits at model Z = 0.000, so
+               the body origin must ride exactly one wheel radius above the road
+               for the tyre to touch and the hub to land inside the arch. The old
+               fixed 0.43 was wrong for every vehicle (TT floated +0.053 m, 350Z
+               +0.042, Hummer sank -0.049) -- that mismatch is what read as the
+               chassis hovering above dislocated wheels.
+               The wheel mesh is additionally scaled by wheel_scale in its own
+               matrix, so the effective radius is carWheelR*wheel_scale -- ride
+               tracks that product, keeping the car flush at any slider value. */
+            float ride = carprof.ride
+                       * (g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f);
+            mat_car(carpos, heading, car_up, ride, Model);
             mat_mul(MVP, Model, MVPc);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
             /* normals stay model-space, so counter-rotate the sun into car
@@ -1058,16 +1086,23 @@ int main(int argc, char **argv) {
                The camera goes into model space the same way, for the
                shader's reflection vector. */
             { float ch=cosf(heading), sh=sinf(heading);
-              float dx=cam[0]-carpos[0], dy=cam[1]-carpos[1], dz=cam[2]-(carpos[2]+0.43f);
+              float dx=cam[0]-carpos[0], dy=cam[1]-carpos[1], dz=cam[2]-(carpos[2]+ride);
               glUniform3f(uLight, ch*N2_SUN_X + sh*N2_SUN_Y,
                                  -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
               glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
             /* rebuild the 4 wheel placements from the (live-tunable) fractions;
                the discs spin with road speed (visible via the radial rim tex) */
             { static float wang = 0.0f;
-              float wR = g_dbg.wheel_scale > 0.05f ? 0.33f*g_dbg.wheel_scale : 0.33f;
-              wang += speed / wR * (1.0f/60.0f);          /* w = v/r, integrated */
-              if (wang > 6.2831853f) wang -= 6.2831853f;
+              /* rolling radius = this car's profile radius times the user scale,
+                 so w=v/r and the RPM readout are correct per vehicle (a Hummer
+                 rolls slower than a compact at the same speed). */
+              float wR = carprof.wheel_r
+                       * (g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f);
+              /* w = v/r per tick: speed is m/tick and this runs once per tick, so
+                 the angle step is exactly speed/wR rad (the earlier *1/60 made the
+                 tread crawl ~60x too slow -- ~3 rad/s instead of ~205 at 220 km/h). */
+              wang += speed / wR;
+              wang = fmodf(wang, 6.2831853f);
               float c = cosf(wang), sn = sinf(wang);
               /* visual steer: ease the raw -1/0/1 key state toward a ~28 deg
                  lock so the front wheels swing smoothly instead of snapping.
@@ -1077,8 +1112,17 @@ int main(int argc, char **argv) {
               static float vsteer = 0.0f;
               vsteer += (steer*0.50f - vsteer) * 0.25f;
               float sc = cosf(vsteer), ss = sinf(vsteer);
-              float fr=carbb[3]*g_dbg.wheel_frontf, rr=carbb[0]*g_dbg.wheel_rearf,
-                    tr=carbb[4]*g_dbg.wheel_trackf, s=g_dbg.wheel_scale, wz=g_dbg.wheel_z;
+              /* telemetry: wheel RPM from w=v/r (rad/s -> RPM) and steer angle */
+              g_dbg.wheel_rpm = fabsf(speed / wR) * 60.0f * 9.5493f;
+              g_dbg.steer_deg = vsteer * 57.2958f;
+              g_dbg.wheel_radius = wR;
+              /* Axle lines + track from this car's profile (its own measured body
+                 extents scaled by the live sliders), and hub Z from its measured
+                 hub_z -- no shared constant anywhere in the placement. */
+              float fr=carprof.body[1]*g_dbg.wheel_frontf,
+                    rr=carprof.body[0]*g_dbg.wheel_rearf,
+                    tr=carprof.body[3]*g_dbg.wheel_trackf,
+                    s=g_dbg.wheel_scale, wz=carprof.hub_z + g_dbg.wheel_z;
               float wp[4][2]={{fr,tr},{fr,-tr},{rr,tr},{rr,-tr}};
               for(int k=0;k<4;k++){ float sy=(k&1)?-s:s;
                   /* rear axle: plain scale * rotY(wang) */
@@ -1301,12 +1345,12 @@ int main(int argc, char **argv) {
             /* AI opponents — same body, each in its own colour */
             for (int k = 0; k < nai; k++) {
                 float aup[3]; world_ground_normal(&scene, ais[k].pos[0], ais[k].pos[1], aup);
-                mat_car(ais[k].pos, ais[k].head, aup, 0.43f, Model);
+                mat_car(ais[k].pos, ais[k].head, aup, ride, Model);   /* AI: same per-car ride */
                 mat_mul(MVP, Model, MVPc);
                 glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
                 { float ch=cosf(ais[k].head), sh=sinf(ais[k].head);
                   float dx=cam[0]-ais[k].pos[0], dy=cam[1]-ais[k].pos[1];
-                  float dz=cam[2]-(ais[k].pos[2]+0.43f);
+                  float dz=cam[2]-(ais[k].pos[2]+ride);
                   glUniform3f(uLight, ch*N2_SUN_X + sh*N2_SUN_Y,
                                      -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
                   glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
@@ -1695,6 +1739,16 @@ int main(int argc, char **argv) {
               printf("chassis: up(%.3f,%.3f,%.3f) pitch=%+.1fdeg roll=%+.1fdeg  (ground grade %.1fdeg)\n",
                      car_up[0],car_up[1],car_up[2], asinf(f[2])*57.2958f, asinf(lft[2])*57.2958f,
                      acosf(car_up[2]>1?1:car_up[2])*57.2958f); }
+            printf("wheels: radius %.3f m, %.0f RPM, steer %+.1f deg, %.0f km/h\n",
+                   g_dbg.wheel_radius, g_dbg.wheel_rpm, g_dbg.steer_deg, g_dbg.kmh);
+            {   float sc = g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f;
+                float rd = carprof.ride * sc;
+                printf("profile %-11s R %.3f%s  ride %.3f  hubZ %+.3f  wheelbase %.2f"
+                       "  track %.2f  tyre bottom %+.3f (0=flush)  clearance %.3f\n",
+                       carprof.name, carprof.wheel_r, carprof.has_tire ? "" : "*",
+                       rd, carprof.hub_z, carprof.wheelbase, carprof.track_f,
+                       rd + carprof.hub_z + g_dbg.wheel_z - g_dbg.wheel_radius,
+                       rd + carprof.body[4]); }
             printf("wrote %s (%dx%d) after driving to (%.0f,%.0f)\n", shot, W, H, carpos[0], carpos[1]);
             running = 0;
         }

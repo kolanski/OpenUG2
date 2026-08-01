@@ -872,6 +872,153 @@ static float n2_ground_z(N2Scene *s, float x, float y, float fallback) {
     return found ? best : fallback;
 }
 
+/* ---- per-car dimension profile (Phase 63) ----------------------------------
+ * Everything the loaded car's own geometry states about its running gear, so no
+ * absolute constant is ever applied to a vehicle.
+ *
+ * WHAT THE DATA ACTUALLY HAS (audited across all 31 shipped cars):
+ *   - N2_CAR_TIRE mesh  -> EXACT wheel radius, width, and hub Z.  Hub Z measures
+ *     0.000 on every car (max |dev| 0.019 on AMBULANCE): the wheel is modelled
+ *     at the body's model origin, so ride height == wheel radius.
+ *   - Body AABB         -> EXACT length / width / height.
+ *
+ * WHAT IT DOES NOT HAVE (verified, do not go looking again):
+ *   - No WHEEL_FRONT_LEFT / _REAR_RIGHT dummy nodes. Cars ship ONE wheel part
+ *     (<CAR>_KIT00_FRONT_WHEEL_A/B/C = LOD tiers), no per-corner variants.
+ *   - FRONT_BRAKE and REAR_BRAKE exist but are ALSO modelled at the origin
+ *     (measured centres (+0.010,-0.005,0.000) and (-0.007,-0.006,0.000) on TT),
+ *     so they carry no axle position either.
+ *   => wheelbase and track width are NOT stored anywhere in GEOMETRY.BIN. They
+ *      are derived below from this car's own measured body extents. That is a
+ *      derivation, not a reading -- flagged so nobody mistakes it for ground
+ *      truth. The arch-cutout geometry was tried as a source and rejected: the
+ *      detector also fires on cabin floor/interior openings (TT gave 12 "arch"
+ *      runs, not 2), so it is not reliable enough to place wheels with.
+ *
+ * 2 of 31 cars (IMPREZAWRX, LANCEREVO8) ship no tyre mesh at all; they fall back
+ * to the fleet-median radius/body-length ratio applied to THEIR OWN body length,
+ * so even the fallback scales with the individual car. */
+typedef struct {
+    char  name[32];
+    int   has_tire;      /* 0 = radius came from the body-length ratio, not a tyre */
+    float wheel_r;       /* EXACT from the tyre mesh (or car-derived if !has_tire) */
+    float wheel_w;       /* EXACT tyre width */
+    float hub_z;         /* EXACT hub centre Z in model space (0.000 fleet-wide) */
+    float body[6];       /* EXACT body AABB: x0,x1,y0,y1,z0,z1 */
+    float ride;          /* = wheel_r: hub sits at model origin, tyre flush */
+    float wheelbase;     /* DERIVED from body length */
+    float track_f;       /* DERIVED from body width */
+    float track_r;       /* DERIVED from body width */
+    float clearance;     /* EXACT once ride is known: ride + body z0 */
+} N2CarProfile;
+
+/* Fallback ratios, used ONLY by the 2 of 31 cars that ship no tyre mesh.
+ * Data-first audit for those two (IMPREZAWRX, LANCEREVO8), all verified:
+ *   - no FRONT_WHEEL part of any kind in their GEOMETRY.BIN;
+ *   - their "base" dirs CARS/IMPREZA and CARS/LANCER hold ONLY VINYLS.BIN --
+ *     no geometry, so there is nothing to inherit a radius from;
+ *   - their PARTS_ANIMATIONS.bin holds only ZAM_ door/hood/trunk animations.
+ * So no wheel radius exists for them anywhere in the game files, and a
+ * derivation is unavoidable. The best available signal is each car's OWN brake
+ * disc (it physically sits inside the rim): median wheelR/brakeR = 2.087 over
+ * the 27 cars shipping both (spread 1.83..2.85, the high end being SUVs).
+ * Result is then clamped so the car's own body cannot clip the road. */
+#define N2_R_PER_BRAKE 2.087f
+#define N2_R_PER_LEN   0.0726f   /* last resort: no tyre AND no brake disc */
+
+/* Radius of a car's brake disc, measured in its own X-Z plane from the raw
+ * GEOMETRY.BIN (the walker drops brake parts into N2_CAR_MECH, so the name is
+ * only available here). 0 if the car ships none. Feeds the tyre-less fallback. */
+static float n2_car_brake_radius(const unsigned char *d, long beg, long end) {
+    long o = beg;
+    while (o + 8 <= end) {
+        uint32_t m = n2_u32(d+o), s = n2_u32(d+o+4); long ds = o+8;
+        if (m == 0x80134010u) {
+            N2Leaf mt[4]; int nm = 0; char nm2[128]; nm2[0] = 0;
+            n2_find_leaves(d, ds, ds+s, 0x00134011u, mt, &nm, 4);
+            for (int k = 0; k < nm && !nm2[0]; k++) {
+                const unsigned char *q = d + mt[k].off; long sz = mt[k].size;
+                for (long i = 0; i + 5 < sz; i++) {
+                    if (q[i] >= 'A' && q[i] <= 'Z') { long j = i;
+                        while (j < sz && (q[j]=='_' || (q[j]>='A'&&q[j]<='Z') || (q[j]>='0'&&q[j]<='9'))) j++;
+                        if (j-i >= 5) { int L = (int)(j-i); if (L > 127) L = 127;
+                            memcpy(nm2, q+i, L); nm2[L] = 0; break; }
+                        i = j; }
+                }
+            }
+            if (nm2[0] && strstr(nm2, "BRAKE") && !strstr(nm2, "BRAKELIGHT")) {
+                N2Leaf v[64]; int nv = 0;
+                n2_find_leaves(d, ds, ds+s, 0x00134B01u, v, &nv, 64);
+                if (nv > 0) {
+                    const unsigned char *vb = d + v[0].off; int vl = (int)v[0].size;
+                    int pad = n2_skip_filler(vb, vl), body = vl - pad;
+                    if (body > 0 && body % 36 == 0) {
+                        int n = body/36; const unsigned char *rec = vb + pad;
+                        float x0=1e30f,x1=-1e30f,z0=1e30f,z1=-1e30f;
+                        for (int i = 0; i < n; i++) { float x,z;
+                            memcpy(&x, rec+i*36, 4); memcpy(&z, rec+i*36+8, 4);
+                            if(x<x0)x0=x; if(x>x1)x1=x; if(z<z0)z0=z; if(z>z1)z1=z; }
+                        return 0.25f*((x1-x0)+(z1-z0));
+                    }
+                }
+            }
+        } else if (m && (m>>28) == 8) {
+            float r = n2_car_brake_radius(d, ds, ds+s);
+            if (r > 0.0f) return r;
+        }
+        o = ds + s;
+    }
+    return 0.0f;
+}
+
+static void n2_car_profile(const N2Scene *s, const char *name,
+                           float frontf, float rearf, float trackf,
+                           float brake_r, N2CarProfile *p) {
+    memset(p, 0, sizeof *p);
+    snprintf(p->name, sizeof p->name, "%s", name ? name : "?");
+    float b0[3] = { 1e30f, 1e30f, 1e30f }, b1[3] = { -1e30f, -1e30f, -1e30f };
+    float t0[3] = { 1e30f, 1e30f, 1e30f }, t1[3] = { -1e30f, -1e30f, -1e30f };
+    int ntv = 0;
+    for (int i = 0; i < s->count; i++) {
+        int tire = s->meshes[i].cat == N2_CAR_TIRE;
+        for (int q = 0; q < s->meshes[i].nverts; q++) {
+            const float *v = s->meshes[i].verts + q*5;
+            for (int a = 0; a < 3; a++) {
+                if (tire) { if (v[a] < t0[a]) t0[a] = v[a]; if (v[a] > t1[a]) t1[a] = v[a]; }
+                else      { if (v[a] < b0[a]) b0[a] = v[a]; if (v[a] > b1[a]) b1[a] = v[a]; }
+            }
+            if (tire) ntv++;
+        }
+    }
+    if (b0[0] > b1[0]) { b0[0]=b0[1]=b0[2]=0; b1[0]=b1[1]=b1[2]=0; }
+    p->body[0]=b0[0]; p->body[1]=b1[0];
+    p->body[2]=b0[1]; p->body[3]=b1[1];
+    p->body[4]=b0[2]; p->body[5]=b1[2];
+    if (ntv) {                                  /* exact, from this car's tyre */
+        p->has_tire = 1;
+        p->wheel_r  = 0.25f * ((t1[0]-t0[0]) + (t1[2]-t0[2]));
+        p->wheel_w  = t1[1]-t0[1];
+        p->hub_z    = 0.5f * (t0[2]+t1[2]);
+    } else {                                    /* car-derived, never absolute */
+        p->has_tire = 0;
+        /* prefer this car's own brake disc; else its own body length */
+        p->wheel_r  = brake_r > 0.01f ? brake_r * N2_R_PER_BRAKE
+                                      : (b1[0]-b0[0]) * N2_R_PER_LEN;
+        /* hard no-clip guarantee from the car's OWN body: ride == wheel_r, and
+           clearance = ride + body z0, so r must exceed -z0 or the shell scrapes
+           the road. 2 cm margin keeps the sills clear of camber. */
+        float rmin = -b0[2] + 0.02f;
+        if (p->wheel_r < rmin) p->wheel_r = rmin;
+        p->wheel_w  = p->wheel_r * 0.62f;       /* fleet-median width/radius */
+        p->hub_z    = 0.0f;
+    }
+    p->ride      = p->wheel_r;                  /* hub at origin => flush tyre */
+    p->wheelbase = (b1[0]*frontf) - (b0[0]*rearf);
+    p->track_f   = 2.0f * b1[1] * trackf;
+    p->track_r   = p->track_f;
+    p->clearance = p->ride + b0[2];
+}
+
 /* ---- DXT1 / BC1 decode ---- */
 static void n2_rgb565(uint16_t c, unsigned char *o) {
     int r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;

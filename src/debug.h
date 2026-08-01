@@ -84,6 +84,9 @@ typedef struct {
     /* --- live handling tuner (multipliers; top in km/h) --- */
     float tune_accel, tune_brake, tune_turn, tune_top;
 
+    /* --- wheel kinematics telemetry (engine writes, panel displays) --- */
+    float wheel_rpm, steer_deg, wheel_radius;
+
     /* --- rim paint (recolor the OEM gold rim diffuse; silver by default) --- */
     int   rim_paint;        /* 1 = tint toward rim_color, 0 = raw OEM texture */
     float rim_color[3];     /* rim paint colour */
