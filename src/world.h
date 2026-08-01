@@ -10,28 +10,29 @@
 #include "debug.h"   /* ScriptedDef, for world_scripted_defs */
 
 #define WORLD_MAXREG 16
-#define WORLD_MAXZONE 48
+#define WORLD_MAXDIST 24
 
-/* A logical city zone, derived entirely from shipped data (Phase 66).
+/* A district = one connected component of the drivable nav graph (Phase 68).
  *
- * DATA AUDIT (do not repeat it): the five district names the game shows --
- * "City Core", "Beacon Hill", "Jackson Heights", "Coal Harbor West/East" --
- * exist ONLY as UI strings in the LANGUAGES .bin files (by "World Map").
- * They are NOT bound to any coordinate anywhere: searched every .BUN/.BIN in
- * TRACKS, GLOBAL, FRONTEND and SDATA, plus all three JDLZ archives after
- * decompressing them (FrontB, GlobalB, InGameCommon .lzc) -- zero hits.
- * GLOBALB's only "Jackson" is the parts brand "Jackson Racing". So the district
- * bounds live in speed2.exe, which is SafeDisc-encrypted (see docs/FORMATS.md).
+ * Replaces the old bbox zones, which were unusable: 3D mesh bounds overlap, so
+ * one building could span several "districts". Districts are now derived from
+ * road connectivity, which is what a player actually experiences.
  *
- * What the data DOES carry is the artists' own area code in every mesh's asset
- * name: TRN_[AREA]_... / PAN_[AREA]_... (SH, UC, CN, CS, IP, ...). Those codes
- * are real, and the meshes carrying them have real world coordinates, so zone
- * bounds are measured from the geometry rather than invented. */
+ * DATA AUDIT first (Data-First): the nav node's +8 u32 is NOT a region code.
+ * It is two u16s (bits 7..15 never set; the high half is usually 0xffff, the
+ * same no-link sentinel as the other slots). Over all 18064 nodes the low u16
+ * takes 113 values and EVERY value spans nearly the whole city (value 0:
+ * X[-2986..2520] Y[-2274..3116]), where a geographic id would be compact. It
+ * is constant in runs and flips at segment boundaries, i.e. a per-segment road
+ * id/class. And the five district NAMES the game shows are UI-only strings
+ * (the LANGUAGES files), bound to no coordinates anywhere. Hence topology, not lookup. */
 typedef struct {
-    char  tok[24];      /* area code straight out of the asset names */
-    float bb[4];        /* measured XY bounds: x0, x1, y0, y1 */
-    int   n;            /* meshes contributing */
-} WZone;
+    char  tok[4];   /* 2-letter area code straight out of the TRN_ asset names */
+    int   n;        /* nav nodes fused into this district */
+    float bb[4];    /* x0, x1, y0, y1 of those nodes */
+    float cx, cy;   /* node centroid */
+    float medz;     /* median terrain elevation (separates the hill districts) */
+} WDistrict;
 
 typedef struct {
     char name[64];
@@ -47,7 +48,8 @@ typedef struct {
     unsigned char *master; long masterlen; N2Tpk mastertpk;  /* single-region mode */
     N2Tex grass; int have_grass;                             /* terrain fallback */
     float (*mbb)[4];   /* per-mesh XY bbox (x0,y0,x1,y1) for culling + ground grid */
-    WZone zone[WORLD_MAXZONE]; int nzone;   /* logical city zones (see WZone) */
+    WDistrict dist[WORLD_MAXDIST]; int ndist;  /* connected road components */
+    int *navcomp;                             /* district index per nav node, -1 = none */
     /* AI/GPS navigation graph: the real drivable road network (see world_load_nav) */
     float *nav;        /* nnav * 2 floats: world X,Y of each node */
     int    nnav;
@@ -65,13 +67,12 @@ typedef struct {
  * Returns the node count. */
 int world_load_nav(World *w, const char *troot);
 
-/* Build the zone table from the loaded scene's asset names. Called by
- * world_load; safe to call again. Returns the zone count. */
-int world_build_zones(World *w);
+/* Flood-fill the nav graph into connected drivable components, largest first.
+ * Returns the district count. */
+int world_build_districts(World *w);
 
-/* Index of the zone containing (x,y), or -1. Smallest matching zone wins so a
- * nested area beats the sprawling one it sits inside. */
-int world_zone_at(const World *w, float x, float y);
+/* District of the nav node nearest (x,y) within maxdist, else -1. */
+int world_district_at(const World *w, float x, float y, float maxdist);
 
 /* Load trackname ("ALL" = every STREAM*.BUN under troot, else one region)
  * into w->scene. Builds per-mesh bounds and the ground grid. Returns the

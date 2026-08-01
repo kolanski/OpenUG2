@@ -90,6 +90,9 @@ typedef struct {
     /* --- navigation graph for the ImGui minimap (main.c owns the arrays) --- */
     const float *nav; int nnav;          /* node XY pairs */
     const int *navedge; int nnavedge;    /* node-index pairs */
+    const int *navcomp;                  /* district (component) index per node */
+    int   ndist;                         /* fused districts (area codes) */
+    char  dist_tok[8][4];                /* their 2-letter codes, for the legend */
     float navbb[4];                      /* x0,x1,y0,y1 */
 
     /* --- current city zone (engine writes each frame) --- */

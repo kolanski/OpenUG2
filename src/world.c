@@ -220,14 +220,16 @@ int world_load(World *w, const char *troot, const char *trackname) {
     }
     grid_build(w);
     world_load_nav(w, troot);
-    world_build_zones(w);
-    printf("city zones: %d (area codes from the asset names; the game's own\n"
-           "  district NAMES are UI-only strings with no coords in the data)\n",
-           w->nzone);
-    for (int i = 0; i < w->nzone; i++)
-        printf("  %-14s meshes %5d  X[%8.0f..%8.0f] Y[%8.0f..%8.0f]\n",
-               w->zone[i].tok, w->zone[i].n, w->zone[i].bb[0], w->zone[i].bb[1],
-               w->zone[i].bb[2], w->zone[i].bb[3]);
+    world_build_districts(w);
+    printf("districts: %d area codes fused onto %d nav nodes\n"
+           "  (nearest TRN_ terrain mesh per node; codes are the artists' own)\n",
+           w->ndist, w->nnav);
+    for (int i = 0; i < w->ndist; i++)
+        printf("  %-3s nodes %5d  centroid (%8.1f,%8.1f)  medianZ %7.1f  "
+               "X[%7.0f..%7.0f] Y[%7.0f..%7.0f]\n",
+               w->dist[i].tok, w->dist[i].n, w->dist[i].cx, w->dist[i].cy,
+               w->dist[i].medz, w->dist[i].bb[0], w->dist[i].bb[1],
+               w->dist[i].bb[2], w->dist[i].bb[3]);
     return nm;
 }
 
@@ -432,58 +434,137 @@ int world_load_nav(World *w, const char *troot) {
     return w->nnav;
 }
 
-/* ---- logical city zones, measured from the shipped asset names ---- */
-#define ZONE_MIN_MESHES 40   /* below this a token is a landmark, not a district */
+/* ---- topological districts (Phase 68) -------------------------------------
+   The old bbox zones are GONE: 3D mesh bounds overlap wildly, so a building
+   spanning two areas made world_zone_at() chaotic. Districts now come from the
+   nav graph's own connectivity.
 
-int world_build_zones(World *w) {
-    w->nzone = 0;
-    for (int i = 0; i < w->scene.count; i++) {
-        const char *nm = w->scene.meshes[i].sname;
-        /* Only the ground layers tile the city, so only they define an area;
-           props/buildings sit inside whatever terrain they stand on. */
-        if (strncmp(nm, "TRN_", 4) && strncmp(nm, "PAN_", 4)) continue;
-        const char *a = strchr(nm, '_'); if (!a) continue; a++;
-        char tok[24]; int j = 0;
-        while (a[j] && a[j] != '_' && j < (int)sizeof tok - 1) { tok[j] = a[j]; j++; }
-        tok[j] = 0;
-        /* Area codes in this data are always TWO letters (SH, UC, CN, CS, IP,
-           SI, VL). Longer second fields are SURFACE types, not places -- other
-           districts name their terrain TRN_GRASS_/TRN_CONCRETE_/TRN_ROADDRAG_,
-           which would otherwise show up as bogus "districts". */
-        if (j != 2 || !isalpha((unsigned char)tok[0]) || !isalpha((unsigned char)tok[1]))
-            continue;
-        const float *bb = w->mbb[i];            /* x0, y0, x1, y1 */
-        int k = 0;
-        for (; k < w->nzone; k++) if (!strcmp(w->zone[k].tok, tok)) break;
-        if (k == w->nzone) {
-            if (w->nzone >= WORLD_MAXZONE) continue;
-            snprintf(w->zone[k].tok, sizeof w->zone[k].tok, "%s", tok);
-            w->zone[k].bb[0] = bb[0]; w->zone[k].bb[1] = bb[2];
-            w->zone[k].bb[2] = bb[1]; w->zone[k].bb[3] = bb[3];
-            w->zone[k].n = 0; w->nzone++;
-        }
-        if (bb[0] < w->zone[k].bb[0]) w->zone[k].bb[0] = bb[0];
-        if (bb[2] > w->zone[k].bb[1]) w->zone[k].bb[1] = bb[2];
-        if (bb[1] < w->zone[k].bb[2]) w->zone[k].bb[2] = bb[1];
-        if (bb[3] > w->zone[k].bb[3]) w->zone[k].bb[3] = bb[3];
-        w->zone[k].n++;
-    }
-    int keep = 0;                                /* drop one-off landmark tokens */
-    for (int i = 0; i < w->nzone; i++)
-        if (w->zone[i].n >= ZONE_MIN_MESHES) w->zone[keep++] = w->zone[i];
-    w->nzone = keep;
-    return w->nzone;
+   FLAGS AUDIT (why this is topological and not read from the data): the 24-byte
+   node's +8 u32 is NOT a district id. It is two u16s -- bits 7..15 are never
+   set, and the high half is frequently 0xffff, the same "no link" sentinel the
+   other slots use. Censused over all 18064 nodes: the low u16 takes 113 values
+   (0..112), and EVERY one of them spans essentially the whole city (e.g. value
+   0: X[-2986..2520] Y[-2274..3116], a 5507 x 5390 span vs the map's own
+   ~5000 x 5300). A geographic id would be compact, so it is not one. It is
+   constant in runs and changes at segment boundaries (16,16,16,...,4,4,4), i.e.
+   a per-segment road id/class. So there is no baked district code to read, and
+   grouping by drivable connectivity is the correct fallback. */
+/* Nearest-neighbour semantic transfer (Phase 69): give every nav node the area
+   code of the TRN_ terrain mesh it sits on.
+
+   WHY THIS AND NOT BBOXES: 3D mesh bounds overlap, so "which box is the car in"
+   was ambiguous (Phase 66). A nav node is a POINT, and a point has exactly one
+   NEAREST terrain chunk, so the assignment is unique and stable.
+
+   The 5 area codes are the artists' own, straight out of the asset names
+   (TRN_SH_/TRN_UC_/TRN_CN_/TRN_CS_/TRN_IP_) -- not invented, not clustered. */
+#define TRN_CELL 128.0f
+
+static int wd_slot(World *w, const char *tok) {
+    for (int i = 0; i < w->ndist; i++) if (!strcmp(w->dist[i].tok, tok)) return i;
+    if (w->ndist >= WORLD_MAXDIST) return -1;
+    WDistrict *d = &w->dist[w->ndist];
+    snprintf(d->tok, sizeof d->tok, "%s", tok);
+    d->n = 0; d->cx = d->cy = 0; d->medz = 0;
+    d->bb[0] = d->bb[2] = 1e30f; d->bb[1] = d->bb[3] = -1e30f;
+    return w->ndist++;
+}
+static int cmp_f(const void *a, const void *b) {
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : (x > y);
 }
 
-int world_zone_at(const World *w, float x, float y) {
-    int best = -1; float bestarea = 1e30f;
-    for (int i = 0; i < w->nzone; i++) {
-        const float *b = w->zone[i].bb;
-        if (x < b[0] || x > b[1] || y < b[2] || y > b[3]) continue;
-        float area = (b[1]-b[0]) * (b[3]-b[2]);   /* smallest match wins */
-        if (area < bestarea) { bestarea = area; best = i; }
+int world_build_districts(World *w) {
+    w->ndist = 0;
+    if (w->nnav <= 0) return 0;
+
+    int cap = 4096, nt = 0;
+    float *tc = (float *)malloc((size_t)cap * 3 * sizeof(float));   /* x, y, z */
+    int   *ta = (int *)malloc((size_t)cap * sizeof(int));           /* district slot */
+    for (int i = 0; i < w->scene.count; i++) {
+        const char *nm = w->scene.meshes[i].sname;
+        if (strncmp(nm, "TRN_", 4)) continue;
+        const char *a = nm + 4;
+        if (!isalpha((unsigned char)a[0]) || !isalpha((unsigned char)a[1]) || a[2] != '_') continue;
+        char tok[4]; tok[0]=a[0]; tok[1]=a[1]; tok[2]=0; tok[3]=0;
+        int k = wd_slot(w, tok); if (k < 0) continue;
+        float bb[6]; n2_mesh_bbox(&w->scene.meshes[i], bb);
+        if (nt == cap) { cap *= 2;
+            tc = (float *)realloc(tc, (size_t)cap*3*sizeof(float));
+            ta = (int *)realloc(ta, (size_t)cap*sizeof(int)); }
+        tc[nt*3] = (bb[0]+bb[1])*0.5f; tc[nt*3+1] = (bb[2]+bb[3])*0.5f;
+        tc[nt*3+2] = (bb[4]+bb[5])*0.5f; ta[nt] = k; nt++;
     }
-    return best;
+    if (!nt) { free(tc); free(ta); return 0; }
+
+    float gx0=1e30f, gy0=1e30f, gx1=-1e30f, gy1=-1e30f;
+    for (int i = 0; i < nt; i++) {
+        if (tc[i*3] < gx0) gx0 = tc[i*3];
+        if (tc[i*3] > gx1) gx1 = tc[i*3];
+        if (tc[i*3+1] < gy0) gy0 = tc[i*3+1];
+        if (tc[i*3+1] > gy1) gy1 = tc[i*3+1];
+    }
+    int gw = (int)((gx1-gx0)/TRN_CELL) + 1, gh = (int)((gy1-gy0)/TRN_CELL) + 1;
+    if (gw < 1) gw = 1;
+    if (gh < 1) gh = 1;
+    int *head = (int *)malloc((size_t)gw*gh*sizeof(int));
+    int *nxt  = (int *)malloc((size_t)nt*sizeof(int));
+    for (int i = 0; i < gw*gh; i++) head[i] = -1;
+    for (int i = 0; i < nt; i++) {
+        int cx = (int)((tc[i*3]-gx0)/TRN_CELL), cy = (int)((tc[i*3+1]-gy0)/TRN_CELL);
+        if (cx < 0) cx = 0;
+        if (cx >= gw) cx = gw-1;
+        if (cy < 0) cy = 0;
+        if (cy >= gh) cy = gh-1;
+        nxt[i] = head[cy*gw+cx]; head[cy*gw+cx] = i;
+    }
+
+    w->navcomp = (int *)malloc((size_t)w->nnav * sizeof(int));
+    float *zs = (float *)malloc((size_t)nt * sizeof(float));
+    for (int i = 0; i < w->nnav; i++) {
+        float x = w->nav[i*2], y = w->nav[i*2+1];
+        int cx = (int)((x-gx0)/TRN_CELL), cy = (int)((y-gy0)/TRN_CELL);
+        int best = -1; float bd = 1e30f;
+        for (int ring = 0; ring <= 10 && best < 0; ring++) {
+            for (int dy = -ring; dy <= ring; dy++) for (int dx = -ring; dx <= ring; dx++) {
+                if (ring && abs(dx) != ring && abs(dy) != ring) continue;
+                int ax = cx+dx, ay = cy+dy;
+                if (ax < 0 || ay < 0 || ax >= gw || ay >= gh) continue;
+                for (int j = head[ay*gw+ax]; j >= 0; j = nxt[j]) {
+                    float ddx = tc[j*3]-x, ddy = tc[j*3+1]-y;
+                    float dd = ddx*ddx + ddy*ddy;
+                    if (dd < bd) { bd = dd; best = j; }
+                }
+            }
+        }
+        int k = best >= 0 ? ta[best] : -1;
+        w->navcomp[i] = k;
+        if (k < 0) continue;
+        WDistrict *d = &w->dist[k];
+        d->n++; d->cx += x; d->cy += y;
+        if (x < d->bb[0]) d->bb[0] = x;
+        if (x > d->bb[1]) d->bb[1] = x;
+        if (y < d->bb[2]) d->bb[2] = y;
+        if (y > d->bb[3]) d->bb[3] = y;
+    }
+    for (int k = 0; k < w->ndist; k++) {
+        if (w->dist[k].n) { w->dist[k].cx /= w->dist[k].n; w->dist[k].cy /= w->dist[k].n; }
+        int nzs = 0;
+        for (int i = 0; i < nt; i++) if (ta[i] == k) zs[nzs++] = tc[i*3+2];
+        if (nzs) { qsort(zs, (size_t)nzs, sizeof(float), cmp_f); w->dist[k].medz = zs[nzs/2]; }
+    }
+    free(tc); free(ta); free(head); free(nxt); free(zs);
+    return w->ndist;
+}
+
+int world_district_at(const World *w, float x, float y, float maxdist) {
+    int best = -1; float bd = maxdist*maxdist;
+    for (int i = 0; i < w->nnav; i++) {
+        float dx = w->nav[i*2]-x, dy = w->nav[i*2+1]-y;
+        float d2 = dx*dx + dy*dy;
+        if (d2 < bd) { bd = d2; best = i; }
+    }
+    return best >= 0 ? w->navcomp[best] : -1;
 }
 
 float world_ground_z(const N2Scene *s, float x, float y, float fallback) {

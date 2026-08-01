@@ -216,7 +216,7 @@ extern "C" void dbgui_frame(void) {
        in world XY. Independent of the 3D geometry viewer. ---- */
     ImGui::SetNextWindowSize(ImVec2(420, 460), ImGuiCond_FirstUseEver);
     ImGui::Begin("Minimap / Navigation Graph");
-    ImGui::Text("%d nodes, %d edges", g_dbg.nnav, g_dbg.nnavedge);
+    ImGui::Text("%d nodes, %d edges, %d districts", g_dbg.nnav, g_dbg.nnavedge, g_dbg.ndist);
     ImGui::SameLine();
     ImGui::TextDisabled("district %s", g_dbg.zone_name[0] ? g_dbg.zone_name : "-");
     if (g_dbg.nnav > 1) {
@@ -232,11 +232,37 @@ extern "C" void dbgui_frame(void) {
         /* world -> screen; world +Y is north, screen +Y is down, so flip Y */
         #define MAPX(X) (p0.x + ((X)-x0)/span*side)
         #define MAPY(Y) (p0.y + side - ((Y)-y0)/span*side)
-        for (int e = 0; e < g_dbg.nnavedge; e++) {
-            int a = g_dbg.navedge[e*2], b = g_dbg.navedge[e*2+1];
-            dl->AddLine(ImVec2(MAPX(g_dbg.nav[a*2]), MAPY(g_dbg.nav[a*2+1])),
-                        ImVec2(MAPX(g_dbg.nav[b*2]), MAPY(g_dbg.nav[b*2+1])),
-                        IM_COL32(90,190,255,190), 1.0f);
+        /* Colour each edge by its fused district. Drawn as POLYLINES, not
+           independent lines: ImGui uses 16-bit indices, and 15895 separate
+           AddLine calls blew past the 65536-vertex limit (assert in
+           AddDrawListToDrawDataEx). Chaining consecutive edges roughly halves
+           the vertex count and keeps the whole graph under the cap. */
+        static const ImU32 DC[8] = {
+            IM_COL32( 90,190,255,200), IM_COL32(255,150, 60,200),
+            IM_COL32(120,255,120,200), IM_COL32(255, 90,200,200),
+            IM_COL32(255,230, 80,200), IM_COL32(160,140,255,200),
+            IM_COL32( 60,255,230,200), IM_COL32(255,120,120,200) };
+        static ImVec2 chain[4096];
+        int nchain = 0, curd = -2;
+        for (int e = 0; e <= g_dbg.nnavedge; e++) {
+            int a = -1, b = -1, dcur = -1;
+            if (e < g_dbg.nnavedge) {
+                a = g_dbg.navedge[e*2]; b = g_dbg.navedge[e*2+1];
+                dcur = g_dbg.navcomp ? g_dbg.navcomp[a] : 0;
+            }
+            int cont = (e < g_dbg.nnavedge) && nchain > 0 && dcur == curd &&
+                       a == g_dbg.navedge[(e-1)*2+1] && nchain < 4095;
+            if (!cont) {
+                if (nchain > 1)
+                    dl->AddPolyline(chain, nchain,
+                                    curd >= 0 ? DC[curd & 7] : IM_COL32(130,130,130,160),
+                                    0, 1.0f);
+                nchain = 0;
+                if (e >= g_dbg.nnavedge) break;
+                curd = dcur;
+                chain[nchain++] = ImVec2(MAPX(g_dbg.nav[a*2]), MAPY(g_dbg.nav[a*2+1]));
+            }
+            chain[nchain++] = ImVec2(MAPX(g_dbg.nav[b*2]), MAPY(g_dbg.nav[b*2+1]));
         }
         /* player */
         float px = MAPX(g_dbg.car[0]), py = MAPY(g_dbg.car[1]);
@@ -245,6 +271,10 @@ extern "C" void dbgui_frame(void) {
         float hy = py - sinf(g_dbg.heading)*11.0f;   /* Y flipped */
         dl->AddLine(ImVec2(px,py), ImVec2(hx,hy), IM_COL32(255,220,90,255), 2.0f);
         ImGui::Dummy(ImVec2(side, side));
+        for (int i = 0; i < g_dbg.ndist && i < 8; i++) {
+            if (i) ImGui::SameLine();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(DC[i & 7]), "%s", g_dbg.dist_tok[i]);
+        }
         ImGui::TextDisabled("X[%.0f..%.0f] Y[%.0f..%.0f]  car (%.0f, %.0f)",
                             x0, x1, y0, y1, g_dbg.car[0], g_dbg.car[1]);
         #undef MAPX

@@ -1659,20 +1659,26 @@ int main(int argc, char **argv) {
 
         g_dbg.nav = world.nav; g_dbg.nnav = world.nnav;
         g_dbg.navedge = world.navedge; g_dbg.nnavedge = world.nnavedge;
+        g_dbg.navcomp = world.navcomp; g_dbg.ndist = world.ndist;
+        for (int i = 0; i < world.ndist && i < 8; i++)
+            snprintf(g_dbg.dist_tok[i], 4, "%s", world.dist[i].tok);
         for (int i = 0; i < 4; i++) g_dbg.navbb[i] = world.navbb[i];
         /* live district tracking: log every boundary crossing */
         {   static int lastzone = -2;
-            int zi = world_zone_at(&world, carpos[0], carpos[1]);
-            const char *zn = zi >= 0 ? world.zone[zi].tok : "-";
+            int zi = world_district_at(&world, carpos[0], carpos[1], 150.0f);
+            static char zbuf[24];
+            if (zi >= 0 && zi < world.ndist) snprintf(zbuf, sizeof zbuf, "%s", world.dist[zi].tok);
+            else snprintf(zbuf, sizeof zbuf, "-");
+            const char *zn = zbuf;
             if (zi != lastzone) {
                 if (lastzone != -2)
                     printf("Transition: %s -> %s   at (%.0f, %.0f)\n",
-                           lastzone >= 0 ? world.zone[lastzone].tok : "-", zn,
+                           (lastzone >= 0 && lastzone < world.ndist) ? world.dist[lastzone].tok : "-", zn,
                            carpos[0], carpos[1]);
                 lastzone = zi;
             }
             snprintf(g_dbg.zone_name, sizeof g_dbg.zone_name, "%s", zn);
-            g_dbg.zone_count = world.nzone;
+            g_dbg.zone_count = world.ndist;
         }
 #ifdef DEBUG_UI     /* debug readouts + ImGui overlay, drawn on top of everything */
         g_dbg.cam[0]=cam[0]; g_dbg.cam[1]=cam[1]; g_dbg.cam[2]=cam[2];
