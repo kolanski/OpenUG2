@@ -87,6 +87,20 @@ typedef struct {
     /* --- wheel kinematics telemetry (engine writes, panel displays) --- */
     float wheel_rpm, steer_deg, wheel_radius;
 
+    /* --- navigation graph for the ImGui minimap (main.c owns the arrays) --- */
+    const float *nav; int nnav;          /* node XY pairs */
+    const int *navedge; int nnavedge;    /* node-index pairs */
+    float navbb[4];                      /* x0,x1,y0,y1 */
+
+    /* --- current city zone (engine writes each frame) --- */
+    char  zone_name[24];        /* area code the car is inside, "" if none */
+    int   zone_count;           /* zones parsed for this region set */
+
+    /* --- scenery semantics (engine writes each frame; panel displays) --- */
+    int   scen_count[8];        /* mesh count per N2_SC_* class */
+    int   scen_near_n;          /* named chunks near the car (<=12) */
+    char  scen_near[12][40];    /* "NAME  [CLASS]  d=..m" rows */
+
     /* --- rim paint (recolor the OEM gold rim diffuse; silver by default) --- */
     int   rim_paint;        /* 1 = tint toward rim_color, 0 = raw OEM texture */
     float rim_color[3];     /* rim paint colour */

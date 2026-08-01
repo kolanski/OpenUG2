@@ -38,6 +38,9 @@ typedef struct {
                           KIT00_FRONT_BUMPER and KIT05_FRONT_BUMPER — the stock
                           part and its aftermarket replacement — collide. Drives
                           the kit override in n2_car_apply_config. */
+    unsigned char scen; /* track meshes: N2_SC_* semantic class from the asset
+                           name in this object's own 0x134011 chunk */
+    char sname[32];     /* track meshes: that asset name (e.g. XO_StreetLightC_1a_00) */
 } N2Mesh;
 
 /* Active customization profile.
@@ -300,6 +303,55 @@ static int n2_obj_matrix(const unsigned char *d, long beg, long end, float *m) {
 /* Walk to every 0x80134010 mesh, classify it, extract its vtx/idx pairs. `keys`
  * is the set of texture keys resolvable for this region (local TPK + shared
  * pack), used to pick each mesh's diffuse slot. */
+/* Scenery semantics (Phase 65). EVERY track mesh object carries its own asset
+ * name in its 0x134011 material chunk -- verified: 10735 of 10735 objects in
+ * STREAML4RA are named. So each mesh gets an EXACT name, read straight from its
+ * own chunk. (A spatial join against the 0x80034100 solid bboxes was tried and
+ * rejected: those bboxes are huge overlapping chunk regions, so 9507 of 10475
+ * meshes were claimed by >1 solid -- avg 5.2 -- which would mislabel collisions.)
+ * Prefix census for L4RA: TRN 4248, XB 2405, XO 1458, XS 759, XW 739, XT 454,
+ * ZPM 166, PAN 51, UC 43, XV 32. */
+enum { N2_SC_NONE = 0, N2_SC_TERRAIN, N2_SC_BUILDING, N2_SC_PROP,
+       N2_SC_TREE, N2_SC_WALL, N2_SC_STRUCT, N2_SC_OTHER };
+
+static int n2_scen_class(const char *nm) {
+    if (!nm || !nm[0]) return N2_SC_NONE;
+    if (!strncmp(nm, "TRN", 3) || !strncmp(nm, "PAN", 3)) return N2_SC_TERRAIN;
+    if (!strncmp(nm, "XB",  2)) return N2_SC_BUILDING;   /* buildings/barriers */
+    if (!strncmp(nm, "XO",  2)) return N2_SC_PROP;       /* poles, cans, barrels */
+    if (!strncmp(nm, "XT",  2)) return N2_SC_TREE;
+    if (!strncmp(nm, "XW",  2)) return N2_SC_WALL;       /* walls / fences */
+    if (!strncmp(nm, "XS",  2) || !strncmp(nm, "XV", 2)) return N2_SC_STRUCT;
+    return N2_SC_OTHER;
+}
+static const char *n2_scen_name(int sc) {
+    static const char *n[] = { "-", "TERRAIN", "BUILDING", "PROP",
+                               "TREE", "WALL", "STRUCT", "OTHER" };
+    return (sc >= 0 && sc <= N2_SC_OTHER) ? n[sc] : "?";
+}
+
+/* Asset name of a track mesh object, from its own 0x134011 chunk. */
+static void n2_mesh_name(const unsigned char *d, long beg, long end,
+                         char *out, int cap) {
+    out[0] = 0;
+    N2Leaf mt[4]; int nm = 0;
+    n2_find_leaves(d, beg, end, 0x00134011u, mt, &nm, 4);
+    for (int k = 0; k < nm; k++) {
+        const unsigned char *p = d + mt[k].off; long s = mt[k].size;
+        for (long i = 0; i + 4 < s; i++) {
+            int ch = p[i];
+            if ((ch>='A'&&ch<='Z') || (ch>='a'&&ch<='z')) {
+                long j = i;
+                while (j < s && (p[j]=='_' || (p[j]>='A'&&p[j]<='Z') ||
+                                 (p[j]>='a'&&p[j]<='z') || (p[j]>='0'&&p[j]<='9'))) j++;
+                if (j - i >= 5) { int L = (int)(j-i); if (L > cap-1) L = cap-1;
+                    memcpy(out, p+i, L); out[L] = 0; return; }
+                i = j;
+            }
+        }
+    }
+}
+
 static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *scene,
                            const uint32_t *keys, int nkeys) {
     long o = beg;
@@ -308,6 +360,8 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
         long ds = o + 8;
         if (magic == 0x80134010u) {
             int cat = n2_mesh_category(d, ds, ds + size);
+            char anm[40]; n2_mesh_name(d, ds, ds + size, anm, sizeof anm);
+            int sc = n2_scen_class(anm);
             uint32_t tk = n2_mesh_texkey_cat(d, ds, ds + size, cat, keys, nkeys);
             float objm[16]; n2_obj_matrix(d, ds, ds + size, objm);   /* world placement */
             N2Leaf vtx[64], idx[64]; int nv = 0, ni = 0;
@@ -318,8 +372,15 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                depth-write off) so its absurd span must skip the size-safety
                cull that still guards every other category. */
             int cull = (cat != N2_SKY);
-            for (int k = 0; k < pairs; k++)
+            for (int k = 0; k < pairs; k++) {
+                int before = scene->count;
                 n2_add_pair(d, vtx[k], idx[k], cat, scene, 24, 16, cull, tk, objm, 0, -1);
+                for (int m2 = before; m2 < scene->count; m2++) {   /* tag the new mesh */
+                    scene->meshes[m2].scen = (unsigned char)sc;
+                    snprintf(scene->meshes[m2].sname, sizeof scene->meshes[m2].sname,
+                             "%.31s", anm);
+                }
+            }
         } else if (magic != 0 && (magic >> 28) == 8) {
             n2_walk_meshes(d, ds, ds + size, scene, keys, nkeys);
         }

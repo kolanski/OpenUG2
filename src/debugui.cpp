@@ -161,6 +161,20 @@ extern "C" void dbgui_frame(void) {
         ImGui::Text("circuit: %d/%d   |   %d track meshes", g_dbg.sel_circuit+1, g_dbg.n_circuits, g_dbg.track_meshes);
         ImGui::Checkbox("Show UV Checker", (bool *)&g_dbg.show_uv_checker);
         ImGui::Separator();
+        if (ImGui::CollapsingHeader("Scenery Semantics (asset names, 0x134011)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            static const char *scn[] = { "-","TERRAIN","BUILDING","PROP","TREE","WALL","STRUCT","OTHER" };
+            int named = 0, tot = 0;
+            for (int i = 0; i < 8; i++) { tot += g_dbg.scen_count[i]; if (i) named += g_dbg.scen_count[i]; }
+            ImGui::Text("%d/%d meshes named (%.1f%%)", named, tot, tot ? 100.0f*named/tot : 0.0f);
+            for (int i = 1; i < 8; i++) if (g_dbg.scen_count[i]) {
+                ImGui::SameLine(); ImGui::TextDisabled("%s %d", scn[i], g_dbg.scen_count[i]); }
+            ImGui::Separator();
+            ImGui::Text("nearby world chunks (<=60 m):");
+            ImGui::BeginChild("scnear", ImVec2(0, 150), true);
+            for (int i = 0; i < g_dbg.scen_near_n; i++) ImGui::Text("%s", g_dbg.scen_near[i]);
+            if (!g_dbg.scen_near_n) ImGui::TextDisabled("(none in range)");
+            ImGui::EndChild();
+        }
         if (ImGui::CollapsingHeader("Entity Definitions (0x39200, read-only)", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Text("%d ZCV_/ZCS_ defs from L4R*.BUN  [defs only, no placement]", g_dbg.scripted_count);
             ImGui::BeginChild("entdefs", ImVec2(0, 300), true);
@@ -180,6 +194,9 @@ extern "C" void dbgui_frame(void) {
         ImGui::Text("draw calls (meshes): %d   car %d   track %d",
                     g_dbg.drawn, g_dbg.car_meshes, g_dbg.track_meshes);
         ImGui::Separator();
+        ImGui::Text("district: %-10s  (%d zones parsed)",
+                    g_dbg.zone_name[0] ? g_dbg.zone_name : "-", g_dbg.zone_count);
+        ImGui::Separator();
         ImGui::Text("camera XYZ  %.1f  %.1f  %.1f", g_dbg.cam[0], g_dbg.cam[1], g_dbg.cam[2]);
         ImGui::Text("car XYZ     %.1f  %.1f  %.1f", g_dbg.car[0], g_dbg.car[1], g_dbg.car[2]);
         ImGui::Text("heading %.2f rad   %.0f km/h", g_dbg.heading, g_dbg.kmh);
@@ -192,6 +209,47 @@ extern "C" void dbgui_frame(void) {
 
     ImGui::EndTabBar();
     }
+    ImGui::End();
+
+    /* ---- Minimap / Navigation Graph: the real drivable road network parsed
+       from the per-region ROUTES path files (chunk 0x34148), drawn top-down
+       in world XY. Independent of the 3D geometry viewer. ---- */
+    ImGui::SetNextWindowSize(ImVec2(420, 460), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Minimap / Navigation Graph");
+    ImGui::Text("%d nodes, %d edges", g_dbg.nnav, g_dbg.nnavedge);
+    ImGui::SameLine();
+    ImGui::TextDisabled("district %s", g_dbg.zone_name[0] ? g_dbg.zone_name : "-");
+    if (g_dbg.nnav > 1) {
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        float side = avail.x < avail.y ? avail.x : avail.y;
+        if (side < 80.0f) side = 80.0f;
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p0, ImVec2(p0.x+side, p0.y+side), IM_COL32(12,14,20,255));
+        float x0=g_dbg.navbb[0], x1=g_dbg.navbb[1], y0=g_dbg.navbb[2], y1=g_dbg.navbb[3];
+        float w = x1-x0, h = y1-y0, span = w > h ? w : h;
+        if (span < 1.0f) span = 1.0f;
+        /* world -> screen; world +Y is north, screen +Y is down, so flip Y */
+        #define MAPX(X) (p0.x + ((X)-x0)/span*side)
+        #define MAPY(Y) (p0.y + side - ((Y)-y0)/span*side)
+        for (int e = 0; e < g_dbg.nnavedge; e++) {
+            int a = g_dbg.navedge[e*2], b = g_dbg.navedge[e*2+1];
+            dl->AddLine(ImVec2(MAPX(g_dbg.nav[a*2]), MAPY(g_dbg.nav[a*2+1])),
+                        ImVec2(MAPX(g_dbg.nav[b*2]), MAPY(g_dbg.nav[b*2+1])),
+                        IM_COL32(90,190,255,190), 1.0f);
+        }
+        /* player */
+        float px = MAPX(g_dbg.car[0]), py = MAPY(g_dbg.car[1]);
+        dl->AddCircleFilled(ImVec2(px, py), 4.0f, IM_COL32(255,80,60,255));
+        float hx = px + cosf(g_dbg.heading)*11.0f;
+        float hy = py - sinf(g_dbg.heading)*11.0f;   /* Y flipped */
+        dl->AddLine(ImVec2(px,py), ImVec2(hx,hy), IM_COL32(255,220,90,255), 2.0f);
+        ImGui::Dummy(ImVec2(side, side));
+        ImGui::TextDisabled("X[%.0f..%.0f] Y[%.0f..%.0f]  car (%.0f, %.0f)",
+                            x0, x1, y0, y1, g_dbg.car[0], g_dbg.car[1]);
+        #undef MAPX
+        #undef MAPY
+    } else ImGui::TextDisabled("no navigation data loaded");
     ImGui::End();
 }
 

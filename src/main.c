@@ -229,6 +229,21 @@ int main(int argc, char **argv) {
         else if (scene.meshes[i].cat == N2_TERRAIN) nterr++;
     }
     printf("categories: road=%d terrain=%d other=%d\n", nroad, nterr, nm-nroad-nterr);
+    /* scenery semantics from each mesh's own asset name (0x134011) */
+    {   int sc[8] = {0}, named = 0;
+        for (int i = 0; i < nm; i++) { int c2 = scene.meshes[i].scen;
+            if (c2 < 8) sc[c2]++; if (c2) named++; }
+        printf("scenery: %d/%d named (%.1f%%)", named, nm, nm ? 100.0*named/nm : 0.0);
+        for (int c2 = 1; c2 <= N2_SC_OTHER; c2++)
+            if (sc[c2]) printf("  %s=%d", n2_scen_name(c2), sc[c2]);
+        printf("\n");
+        for (int i = 0, shown = 0; i < nm && shown < 3; i++)
+            if (scene.meshes[i].scen == N2_SC_PROP) { float bb[6];
+                n2_mesh_bbox(&scene.meshes[i], bb); shown++;
+                printf("  join sample: %-26s [%s]  bbox X[%.1f..%.1f] Y[%.1f..%.1f] Z[%.1f..%.1f]\n",
+                       scene.meshes[i].sname, n2_scen_name(scene.meshes[i].scen),
+                       bb[0],bb[1],bb[2],bb[3],bb[4],bb[5]); }
+    }
 
     /* scene centroid + extent for the camera */
     float cx=0,cy=0,cz=0; long cnt=0;
@@ -1642,6 +1657,23 @@ int main(int argc, char **argv) {
         }
         glEnable(GL_DEPTH_TEST);
 
+        g_dbg.nav = world.nav; g_dbg.nnav = world.nnav;
+        g_dbg.navedge = world.navedge; g_dbg.nnavedge = world.nnavedge;
+        for (int i = 0; i < 4; i++) g_dbg.navbb[i] = world.navbb[i];
+        /* live district tracking: log every boundary crossing */
+        {   static int lastzone = -2;
+            int zi = world_zone_at(&world, carpos[0], carpos[1]);
+            const char *zn = zi >= 0 ? world.zone[zi].tok : "-";
+            if (zi != lastzone) {
+                if (lastzone != -2)
+                    printf("Transition: %s -> %s   at (%.0f, %.0f)\n",
+                           lastzone >= 0 ? world.zone[lastzone].tok : "-", zn,
+                           carpos[0], carpos[1]);
+                lastzone = zi;
+            }
+            snprintf(g_dbg.zone_name, sizeof g_dbg.zone_name, "%s", zn);
+            g_dbg.zone_count = world.nzone;
+        }
 #ifdef DEBUG_UI     /* debug readouts + ImGui overlay, drawn on top of everything */
         g_dbg.cam[0]=cam[0]; g_dbg.cam[1]=cam[1]; g_dbg.cam[2]=cam[2];
         g_dbg.car[0]=carpos[0]; g_dbg.car[1]=carpos[1]; g_dbg.car[2]=carpos[2];
@@ -1658,6 +1690,24 @@ int main(int argc, char **argv) {
             g_dbg.insp_count = ni; g_dbg.insp_cat = icat; g_dbg.insp_verts = ivts;
         }
         g_dbg.scripted = sdefs; g_dbg.scripted_count = nsd;
+        /* scenery semantics: class census + the named chunks nearest the car */
+        {   for (int i = 0; i < 8; i++) g_dbg.scen_count[i] = 0;
+            for (int i = 0; i < nm; i++) {
+                int sc = scene.meshes[i].scen; if (sc < 8) g_dbg.scen_count[sc]++; }
+            int nn = 0;
+            for (int i = 0; i < nm && nn < 12; i++) {
+                if (!scene.meshes[i].scen || !scene.meshes[i].sname[0]) continue;
+                float *bb = world.mbb[i];
+                float dx = carpos[0]<bb[0]?bb[0]-carpos[0]:(carpos[0]>bb[2]?carpos[0]-bb[2]:0);
+                float dy = carpos[1]<bb[1]?bb[1]-carpos[1]:(carpos[1]>bb[3]?carpos[1]-bb[3]:0);
+                float dd = sqrtf(dx*dx+dy*dy);
+                if (dd > 60.0f) continue;
+                snprintf(g_dbg.scen_near[nn], sizeof g_dbg.scen_near[0], "%-24s %-8s %4.0fm",
+                         scene.meshes[i].sname, n2_scen_name(scene.meshes[i].scen), dd);
+                nn++;
+            }
+            g_dbg.scen_near_n = nn;
+        }
         g_dbg.wheel_brands = wheel_brands;
         g_dbg.wheel_brand_n = n_wheel_brands;
         if (g_dbg.wheel_style < 1) g_dbg.wheel_style = wheel_style;

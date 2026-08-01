@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <ctype.h>
 #include <math.h>
 
 #include "world.h"
@@ -218,6 +219,15 @@ int world_load(World *w, const char *troot, const char *trackname) {
         w->mbb[i][0]=x0; w->mbb[i][1]=y0; w->mbb[i][2]=x1; w->mbb[i][3]=y1;
     }
     grid_build(w);
+    world_load_nav(w, troot);
+    world_build_zones(w);
+    printf("city zones: %d (area codes from the asset names; the game's own\n"
+           "  district NAMES are UI-only strings with no coords in the data)\n",
+           w->nzone);
+    for (int i = 0; i < w->nzone; i++)
+        printf("  %-14s meshes %5d  X[%8.0f..%8.0f] Y[%8.0f..%8.0f]\n",
+               w->zone[i].tok, w->zone[i].n, w->zone[i].bb[0], w->zone[i].bb[1],
+               w->zone[i].bb[2], w->zone[i].bb[3]);
     return nm;
 }
 
@@ -349,6 +359,131 @@ int world_scripted_defs(const World *w, const char *troot,
         free(d);
     }
     return n;
+}
+
+/* ---- AI / GPS navigation graph (Phase 67) --------------------------------
+   The real drivable road network, as opposed to rendering bounds. Source is
+   TRACKS/ROUTES<REGION>/Paths*.bin (355 files across the 8 regions); each holds
+   a 0x80034147 container whose 0x34148 leaf is an array of 24-byte nodes.
+   Measured record layout:
+     +0  float X          +12 u16 link  +16 u16 link
+     +4  float Y          +14 u16 link  (0xffff = no link)
+     +8  u32 flags        +20 float cumulative distance along the segment
+   A file concatenates SEVERAL segments (the distance field restarts and the
+   XY jumps), so consecutive records are only joined into an edge when they sit
+   within NAV_LINK_MAX. Measured spacing over 5043 sampled nodes: 20-60 m 2945,
+   5-20 m 1024, 60-200 m 462, >200 m 581 -- so real road steps are well under
+   120 m and the big jumps are segment breaks. */
+#define NAV_LINK_MAX 120.0f
+
+int world_load_nav(World *w, const char *troot) {
+    int cap = 4096, ecap = 4096;
+    w->nav = (float *)malloc((size_t)cap * 2 * sizeof(float));
+    w->navedge = (int *)malloc((size_t)ecap * 2 * sizeof(int));
+    w->nnav = w->nnavedge = 0;
+    w->navbb[0] = w->navbb[2] = 1e30f; w->navbb[1] = w->navbb[3] = -1e30f;
+
+    for (int r = 0; r < w->nreg; r++) {
+        const char *rn = w->rgn[r].name;
+        const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
+        for (int fi = 0; fi < 4000; fi++) {          /* Paths<id>.bin ids are sparse */
+            char p[1024];
+            snprintf(p, sizeof p, "%s/ROUTES%s/Paths%04d.bin", troot, stem, 4000 + fi);
+            long len = 0; unsigned char *d = n2_read_file(p, &len);
+            if (!d) continue;
+            N2Leaf leaf[8]; int nl = 0;
+            n2_find_leaves(d, 0, len, 0x00034148u, leaf, &nl, 8);
+            for (int L = 0; L < nl; L++) {
+                int n = (int)leaf[L].size / 24, prev = -1;
+                for (int i = 0; i < n; i++) {
+                    float x, y;
+                    memcpy(&x, d + leaf[L].off + i*24,     4);
+                    memcpy(&y, d + leaf[L].off + i*24 + 4, 4);
+                    if (!(x == x && y == y) || x < -1e5f || x > 1e5f ||
+                        y < -1e5f || y > 1e5f) { prev = -1; continue; }
+                    if (w->nnav == cap) { cap *= 2;
+                        w->nav = (float *)realloc(w->nav, (size_t)cap*2*sizeof(float)); }
+                    int id = w->nnav++;
+                    w->nav[id*2] = x; w->nav[id*2+1] = y;
+                    if (x < w->navbb[0]) w->navbb[0] = x;
+                    if (x > w->navbb[1]) w->navbb[1] = x;
+                    if (y < w->navbb[2]) w->navbb[2] = y;
+                    if (y > w->navbb[3]) w->navbb[3] = y;
+                    if (prev >= 0) {
+                        float dx = x - w->nav[prev*2], dy = y - w->nav[prev*2+1];
+                        if (dx*dx + dy*dy <= NAV_LINK_MAX*NAV_LINK_MAX) {
+                            if (w->nnavedge == ecap) { ecap *= 2;
+                                w->navedge = (int *)realloc(w->navedge, (size_t)ecap*2*sizeof(int)); }
+                            w->navedge[w->nnavedge*2]   = prev;
+                            w->navedge[w->nnavedge*2+1] = id;
+                            w->nnavedge++;
+                        }
+                    }
+                    prev = id;
+                }
+            }
+            free(d);
+        }
+    }
+    printf("nav graph: %d nodes, %d edges from TRACKS/ROUTES*/Paths*.bin (chunk 0x34148)\n",
+           w->nnav, w->nnavedge);
+    if (w->nnav) printf("  extent X[%.0f..%.0f] Y[%.0f..%.0f]\n",
+                        w->navbb[0], w->navbb[1], w->navbb[2], w->navbb[3]);
+    return w->nnav;
+}
+
+/* ---- logical city zones, measured from the shipped asset names ---- */
+#define ZONE_MIN_MESHES 40   /* below this a token is a landmark, not a district */
+
+int world_build_zones(World *w) {
+    w->nzone = 0;
+    for (int i = 0; i < w->scene.count; i++) {
+        const char *nm = w->scene.meshes[i].sname;
+        /* Only the ground layers tile the city, so only they define an area;
+           props/buildings sit inside whatever terrain they stand on. */
+        if (strncmp(nm, "TRN_", 4) && strncmp(nm, "PAN_", 4)) continue;
+        const char *a = strchr(nm, '_'); if (!a) continue; a++;
+        char tok[24]; int j = 0;
+        while (a[j] && a[j] != '_' && j < (int)sizeof tok - 1) { tok[j] = a[j]; j++; }
+        tok[j] = 0;
+        /* Area codes in this data are always TWO letters (SH, UC, CN, CS, IP,
+           SI, VL). Longer second fields are SURFACE types, not places -- other
+           districts name their terrain TRN_GRASS_/TRN_CONCRETE_/TRN_ROADDRAG_,
+           which would otherwise show up as bogus "districts". */
+        if (j != 2 || !isalpha((unsigned char)tok[0]) || !isalpha((unsigned char)tok[1]))
+            continue;
+        const float *bb = w->mbb[i];            /* x0, y0, x1, y1 */
+        int k = 0;
+        for (; k < w->nzone; k++) if (!strcmp(w->zone[k].tok, tok)) break;
+        if (k == w->nzone) {
+            if (w->nzone >= WORLD_MAXZONE) continue;
+            snprintf(w->zone[k].tok, sizeof w->zone[k].tok, "%s", tok);
+            w->zone[k].bb[0] = bb[0]; w->zone[k].bb[1] = bb[2];
+            w->zone[k].bb[2] = bb[1]; w->zone[k].bb[3] = bb[3];
+            w->zone[k].n = 0; w->nzone++;
+        }
+        if (bb[0] < w->zone[k].bb[0]) w->zone[k].bb[0] = bb[0];
+        if (bb[2] > w->zone[k].bb[1]) w->zone[k].bb[1] = bb[2];
+        if (bb[1] < w->zone[k].bb[2]) w->zone[k].bb[2] = bb[1];
+        if (bb[3] > w->zone[k].bb[3]) w->zone[k].bb[3] = bb[3];
+        w->zone[k].n++;
+    }
+    int keep = 0;                                /* drop one-off landmark tokens */
+    for (int i = 0; i < w->nzone; i++)
+        if (w->zone[i].n >= ZONE_MIN_MESHES) w->zone[keep++] = w->zone[i];
+    w->nzone = keep;
+    return w->nzone;
+}
+
+int world_zone_at(const World *w, float x, float y) {
+    int best = -1; float bestarea = 1e30f;
+    for (int i = 0; i < w->nzone; i++) {
+        const float *b = w->zone[i].bb;
+        if (x < b[0] || x > b[1] || y < b[2] || y > b[3]) continue;
+        float area = (b[1]-b[0]) * (b[3]-b[2]);   /* smallest match wins */
+        if (area < bestarea) { bestarea = area; best = i; }
+    }
+    return best;
 }
 
 float world_ground_z(const N2Scene *s, float x, float y, float fallback) {

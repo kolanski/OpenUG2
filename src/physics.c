@@ -105,10 +105,36 @@ void collide_walls_selftest(void) {
 #define WALL_MIN_HEIGHT 2.5f    /* z-extent below this = flat prop, not a wall */
 #define WALL_MAX_SPAN   300.0f  /* skip oversized shells (sky domes etc.) */
 
+/* Which scenery stops a car (Phase 65). Each mesh now carries its asset-name
+ * class, so the decision is semantic instead of a pure height guess:
+ *   BUILDING / WALL / STRUCT -> always a solid, immovable boundary
+ *   TREE / TERRAIN           -> never a wall here (ground is the query's job)
+ *   PROP  -> MEASURED, not assumed: the XO_ prefix mixes 1x1x1.5 m boxes
+ *            (XO_IP_WBOX) with 24x29x36 m office blocks (XO_INDUSTRIALOFFICESA)
+ *            and 7x8x26 m tower containers, so the prefix alone cannot decide.
+ *            Height bands over L4RA's 939 props: <2 m 254, 2-4 274, 4-8 353,
+ *            8-16 359, 16-32 166, >32 60. Street furniture is distinguished by a
+ *            SMALL FOOTPRINT (poles/cans/boxes are thin), not by being short --
+ *            a streetlight is 8 m tall but ~1 m wide. So a prop is solid when
+ *            its shorter horizontal span reaches PROP_SOLID_SPAN; thinner props
+ *            stay out of the AABB set for a future knock-down/rebound pass.
+ * Unnamed meshes keep the old N2_OTHER height heuristic. */
+#define PROP_SOLID_SPAN 3.0f
+static int scen_is_wall(int sc) {
+    return sc == N2_SC_BUILDING || sc == N2_SC_WALL || sc == N2_SC_STRUCT;
+}
 int phys_collect_walls(const N2Scene *s, float (*obst)[4], int max) {
     int nobst = 0;
     for (int i = 0; i < s->count && nobst < max; i++) {
-        if (s->meshes[i].cat != N2_OTHER || s->meshes[i].nverts < 3) continue;
+        int sc = s->meshes[i].scen;
+        int prop_check = 0;
+        if (sc != N2_SC_NONE) {                 /* named: decide semantically */
+            if (sc == N2_SC_TERRAIN) continue;              /* ground, never a wall */
+            /* props, trees and unclassified: let measured size decide, so a tree
+               cluster or a big container still blocks but a trunk/pole does not */
+            if (!scen_is_wall(sc)) prop_check = 1;
+        } else if (s->meshes[i].cat != N2_OTHER) continue;   /* unnamed fallback */
+        if (s->meshes[i].nverts < 3) continue;
         float ox0=1e30f,oy0=1e30f,oz0=1e30f, ox1=-1e30f,oy1=-1e30f,oz1=-1e30f;
         for (int v=0;v<s->meshes[i].nverts;v++){ float *p=s->meshes[i].verts+v*5;
             if(p[0]<ox0)ox0=p[0]; if(p[0]>ox1)ox1=p[0];
@@ -116,6 +142,10 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int max) {
             if(p[2]<oz0)oz0=p[2]; if(p[2]>oz1)oz1=p[2]; }
         if (oz1-oz0 < WALL_MIN_HEIGHT) continue;             /* flat: not a wall */
         if (ox1-ox0 > WALL_MAX_SPAN || oy1-oy0 > WALL_MAX_SPAN) continue;
+        if (prop_check) {   /* thin street furniture: leave it drivable-through */
+            float sx = ox1-ox0, sy = oy1-oy0, smin = sx < sy ? sx : sy;
+            if (smin < PROP_SOLID_SPAN) continue;
+        }
         obst[nobst][0]=ox0; obst[nobst][1]=oy0; obst[nobst][2]=ox1; obst[nobst][3]=oy1;
         nobst++;
     }
