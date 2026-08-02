@@ -905,11 +905,22 @@ static int n2_nearest_wp(const N2Path *p, float x, float y) {
     return best;
 }
 
-/* Ground height at (x,y): highest road/terrain triangle surface under the
- * point (barycentric z), or `fallback` if none covers it. Brute force over
- * track triangles — fine for ~10k tris/frame. */
-static float n2_ground_z(N2Scene *s, float x, float y, float fallback) {
-    float best = -1e30f; int found = 0;
+/* Ground height at (x,y): the road/terrain triangle surface under the point
+ * (barycentric z), or `fallback` if none covers it. Brute force over track
+ * triangles — fine for ~10k tris/frame.
+ *
+ * Layer selection (Phase 73): when `refz` is a real reference height (a car's
+ * current Z), pick the covering surface NEAREST it, not the globally highest.
+ * "Highest wins" teleports a car driving under an overpass — or past a mesh
+ * whose roof/hillside also covers the XY — straight up onto that upper deck
+ * (measured: a 19.4 m single-frame pop on the L4RA lap). Nearest-to-reference
+ * keeps the car on the surface it is actually on: a ramp climb still tracks
+ * because Z rises continuously, but a deck 15 m overhead is no longer chosen.
+ * Pass refz = N2_GROUND_HIGHEST to get the old highest-wins behaviour. */
+#define N2_GROUND_HIGHEST 1e30f
+static float n2_ground_z_ref(N2Scene *s, float x, float y, float fallback, float refz) {
+    float best = 0.0f, bestkey = 1e30f; int found = 0;
+    int highest = (refz >= N2_GROUND_HIGHEST);
     for (int m = 0; m < s->count; m++) {
         /* road + terrain ONLY: SKY (the skydome spans every XY up to Z~8000)
            and GLOW must be excluded or the query returns a point on the dome
@@ -927,10 +938,19 @@ static float n2_ground_z(N2Scene *s, float x, float y, float fallback) {
             float w = 1.0f - u - v;
             if (u < -0.01f || v < -0.01f || w < -0.01f) continue;
             float z = u*a[2] + v*b[2] + w*c[2];
-            if (z > best) { best = z; found = 1; }
+            /* key: highest-wins uses -z (smaller = higher); reference mode uses
+               distance to refz, but bias UP-steps so a surface far above the car
+               never beats a road just below it (a curb lip vs the overpass). */
+            float key;
+            if (highest) key = -z;
+            else { float dz = z - refz; key = dz >= 0 ? dz*3.0f : -dz; }
+            if (!found || key < bestkey) { bestkey = key; best = z; found = 1; }
         }
     }
     return found ? best : fallback;
+}
+static float n2_ground_z(N2Scene *s, float x, float y, float fallback) {
+    return n2_ground_z_ref(s, x, y, fallback, N2_GROUND_HIGHEST);
 }
 
 /* ---- per-car dimension profile (Phase 63) ----------------------------------

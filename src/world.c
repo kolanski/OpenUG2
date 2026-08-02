@@ -206,6 +206,24 @@ int world_load(World *w, const char *troot, const char *trackname) {
     /* strip coplanar duplicates before anything downstream sees the scene */
     world_dedup(w);
 
+    /* Terrain/road de-fighting (Phase 73.5). The paved ROAD strips and the
+       TERRAIN base sheet are DISTINCT meshes (different textures + bboxes, so
+       world_dedup rightly keeps both) that the artists laid coplanar: the road
+       sits exactly on the ground plane it covers. At equal Z the depth test
+       picks per-pixel between asphalt and terrain — the shimmering "in and out
+       of water" stripes. Push terrain down a hair so ROAD always wins where they
+       overlap; the ground query reads these same verts and prefers the nearest
+       surface, so on open terrain the car still sits on the (5 cm lower) ground
+       and on a road it sits on the road — no gameplay change, fight gone.
+       ponytail: a flat world-space bias, not glPolygonOffset — the fight is on
+       the near ground the camera looks straight at, where 5 cm is many depth
+       units; distant coplanar ground fades into fog before it can shimmer. */
+    for (int i = 0; i < w->scene.count; i++) {
+        N2Mesh *m = &w->scene.meshes[i];
+        if (m->cat != N2_TERRAIN) continue;
+        for (int v = 0; v < m->nverts; v++) m->verts[v*5+2] -= 0.05f;
+    }
+
     /* per-mesh XY bounds — the draw cull and the ground grid both key off it */
     int nm = w->scene.count;
     w->mbb = (float (*)[4])malloc((size_t)nm * 4 * sizeof(float));
@@ -1008,8 +1026,13 @@ int world_district_at(const World *w, float x, float y, float maxdist) {
 }
 
 float world_ground_z(const N2Scene *s, float x, float y, float fallback) {
+    /* `fallback` is the caller's current Z at every callsite, so it doubles as
+       the layer reference: pick the surface nearest it, not the highest deck
+       overhead (Phase 73). A sentinel fallback (|z| huge) means "no reference". */
+    float refz = (fallback > -2000.0f && fallback < 4000.0f) ? fallback
+                                                             : N2_GROUND_HIGHEST;
     if (s->meshes != g_grid.meshes)                        /* not the loaded world */
-        return n2_ground_z((N2Scene *)s, x, y, fallback);
+        return n2_ground_z_ref((N2Scene *)s, x, y, fallback, refz);
     int cx = (int)((x - g_grid.x0) / GCELL), cy = (int)((y - g_grid.y0) / GCELL);
     if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) return fallback;
     /* borrow the cell's meshes into a scratch scene and reuse the exact scan */
@@ -1018,7 +1041,7 @@ float world_ground_z(const N2Scene *s, float x, float y, float fallback) {
     int c = cy*g_grid.gw + cx;
     for (int k = g_grid.start[c]; k < g_grid.start[c+1] && sub.count < 512; k++)
         scratch[sub.count++] = s->meshes[g_grid.list[k]];
-    return n2_ground_z(&sub, x, y, fallback);
+    return n2_ground_z_ref(&sub, x, y, fallback, refz);
 }
 
 /* Guardrail/fence collision (Phase 58). Rails are NOT separate meshes with a

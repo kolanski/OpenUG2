@@ -992,7 +992,13 @@ int main(int argc, char **argv) {
                 heading = atan2f(dy, dx);
                 speed = step * 60.0f;
             }
-            carpos[2] = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
+            /* clamp Z to the nearest road/terrain surface, but ease into it so a
+               gap in an elevated deck descends smoothly instead of teleporting */
+            { float gz = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
+              float dz = gz - carpos[2];
+              float lim = 1.5f;                       /* max Z change per frame */
+              if (dz >  lim) dz =  lim; if (dz < -lim) dz = -lim;
+              carpos[2] += dz; }
             world_race_update(&world, carpos[0], carpos[1]);
         }
         else if (shot && aipath.n > 0) {   /* screenshot autopilot: follow the racing
