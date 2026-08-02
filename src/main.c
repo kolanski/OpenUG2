@@ -36,6 +36,7 @@
  * normal build behaves exactly as before; `make debug` adds an ImGui panel. */
 DbgState g_dbg = {
     .freecam = 0, .speed = 0.6f,
+    .race_maxlaps_want = 2,
     .wheel_frontf = 0.62f, .wheel_rearf = 0.58f, .wheel_trackf = 0.76f,
     /* wheel_z 0 = hub at the body's model origin, which is exactly where every
        car's stock N2_CAR_TIRE hub centre sits (measured Z = 0.000). */
@@ -206,10 +207,14 @@ int main(int argc, char **argv) {
     const char *carname = "HUMMER", *trackname = "ALL";
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
+    int shotframes = 40;     /* --frames N: how long --shot drives before the grab */
+    int want_laps = 2;       /* --laps N: race distance for --event */
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--shot")    && i+1 < argc) shot      = argv[++i];
         else if (!strcmp(argv[i], "--car")     && i+1 < argc) carname   = argv[++i];
         else if (!strcmp(argv[i], "--event")   && i+1 < argc) want_event_id = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--frames")  && i+1 < argc) shotframes = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--laps")    && i+1 < argc) want_laps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--track")   && i+1 < argc) trackname = argv[++i];
         else if (!strcmp(argv[i], "--circuit") && i+1 < argc) { circuit = argv[++i]; explicit_circuit = 1; }
         else dataroot = argv[i];
@@ -441,11 +446,52 @@ int main(int argc, char **argv) {
             }
         }
         world_set_mode(&world, MODE_FREEROAM, -1);
+
+        /* Checkpoint self-check (Phase 72): drive a virtual car through the
+           first gates in order, then try one out of sequence. Proves the state
+           machine advances ONLY on an in-order, correctly-directed crossing. */
+        {   int gn = world_race_start(&world, troot, ei, 2);
+            WRace *R = &world.race;
+            printf("-- checkpoint trace, event %d (%d gates) --\n", world.ev[ei].id, gn);
+            for (int k = 0; k < 4 && k < gn; k++) {
+                const WGate *g = &R->gate[R->next];
+                /* approach the armed gate head-on and drive through it */
+                float bx = g->x - g->dx*12.0f, by = g->y - g->dy*12.0f;
+                float fx = g->x + g->dx*12.0f, fy = g->y + g->dy*12.0f;
+                int before = R->next;
+                world_race_update(&world, bx, by);
+                world_race_update(&world, fx, fy);
+                printf("   gate %d at (%8.1f,%8.1f) dir (%5.2f,%5.2f) -> next=%d lap=%d cleared=%d\n",
+                       before, g->x, g->y, g->dx, g->dy, R->next, R->lap, R->cleared);
+                assert(R->next == (before + 1) % gn);
+            }
+            {   /* out of sequence: jump ahead and cross a gate that is NOT armed */
+                int armed = R->next, skip = (armed + 3) % gn;
+                const WGate *g = &R->gate[skip];
+                world_race_update(&world, g->x - g->dx*12.0f, g->y - g->dy*12.0f);
+                world_race_update(&world, g->x + g->dx*12.0f, g->y + g->dy*12.0f);
+                printf("   OUT OF SEQUENCE: crossed gate %d while %d armed -> next=%d (unchanged)\n",
+                       skip, armed, R->next);
+                assert(R->next == armed);
+            }
+            {   /* wrong way: cross the armed gate against the direction of travel */
+                const WGate *g = &R->gate[R->next];
+                int armed = R->next;
+                world_race_update(&world, g->x + g->dx*12.0f, g->y + g->dy*12.0f);
+                world_race_update(&world, g->x - g->dx*12.0f, g->y - g->dy*12.0f);
+                printf("   WRONG WAY: crossed gate %d backwards -> next=%d (unchanged)\n",
+                       armed, R->next);
+                assert(R->next == armed);
+            }
+            world_race_stop(&world);
+            world_set_mode(&world, MODE_FREEROAM, -1);
+        }
+
         if (want_event_id) {
             int wi = -1;
             for (int i = 0; i < world.nev; i++) if (world.ev[i].id == want_event_id) wi = i;
             if (wi < 0) fprintf(stderr, "--event %d: no such race event\n", want_event_id);
-            else world_set_mode(&world, MODE_RACE_EVENT, wi);
+            else world_race_start(&world, troot, wi, want_laps);
         }
         printf("\n");
     }
@@ -743,6 +789,24 @@ int main(int argc, char **argv) {
         int nx = (start_idx+1) % aipath.n;
         heading0 = atan2f(aipath.xy[nx*2+1]-carpos[1], aipath.xy[nx*2]-carpos[0]);
     }
+    /* an armed race wins: start on its own grid, facing through the start line */
+    if (world.race.active && world.race.ngrid > 0) {
+        /* Keep the grid slot's ACROSS-track offset (that part is shipped data)
+           but force the along-track position behind the start line — the raw
+           slot can sit a couple of metres past gate 0 once the gate is snapped
+           to the nearest racing-line node, and a car that starts past the line
+           can never cross it. */
+        const WGate *g0 = &world.race.gate[0];
+        float rx = world.race.grid[0][0] - g0->x, ry = world.race.grid[0][1] - g0->y;
+        float lat = -rx*g0->dy + ry*g0->dx;
+        carpos[0] = g0->x + (-g0->dy)*lat - g0->dx*15.0f;
+        carpos[1] = g0->y + ( g0->dx)*lat - g0->dy*15.0f;
+        carpos[2] = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
+        heading0 = atan2f(g0->dy, g0->dx);
+        printf("race start: grid slot 0 (%.1f, %.1f) -> lined up at (%.1f, %.1f), "
+               "15 m behind the start line\n", world.race.grid[0][0],
+               world.race.grid[0][1], carpos[0], carpos[1]);
+    }
     float heading = heading0, speed = 0.0f, vel[2] = {0,0};
     float cam[3] = { spawn[0], spawn[1], spawn[2]+5 };
     float fc[3] = { spawn[0]-6, spawn[1], spawn[2]+3 };   /* freecam eye */
@@ -883,7 +947,55 @@ int main(int argc, char **argv) {
         /* push the ImGui handling sliders into the physics tune (stock when untouched) */
         g_phys_tune.accel = g_dbg.tune_accel; g_phys_tune.brake = g_dbg.tune_brake;
         g_phys_tune.turn = g_dbg.tune_turn;   g_phys_tune.top_kmh = g_dbg.tune_top;
-        if (shot && aipath.n > 0) {   /* screenshot autopilot: follow the racing
+        /* Race autopilot (--shot only): walk the car along the corridor-masked
+           A* route to the armed gate so a headless run drives the real course
+           and the checkpoint logic sees real positions. Kinematic on purpose —
+           the same role as the --circuit demo autopilot below, and the physics
+           drive is separately pinned on this track (the default --circuit start
+           snap lands the car inside geometry, so collide_walls holds it at
+           0 km/h; pre-existing, not the race system). */
+        static int rpath[8192]; static int rpn = 0, rp_gate = -1, rp_at = 0;
+        int race_auto = shot && world.race.active && !world.race.finished;
+        if (race_auto) {
+            if (rp_gate != world.race.next) {
+                int s = world_nav_nearest(&world, carpos[0], carpos[1]);
+                rpn = world_route(&world, s, world.race.gate[world.race.next].node,
+                                  rpath, 8192, NULL);
+                rp_gate = world.race.next; rp_at = 0;
+            }
+            const WGate *ng = &world.race.gate[world.race.next];
+            float gdx = ng->x - carpos[0], gdy = ng->y - carpos[1];
+            float gnear = gdx*gdx + gdy*gdy;
+            float dx, dy;
+            if (gnear < 9.0f*9.0f) {
+                /* almost on the gate: drive straight through on the current
+                   heading. The approach direction IS the crossing direction, so
+                   this always punches across the line — no stalling on the node
+                   and no limit-cycle between closely-spaced gates. */
+                dx = cosf(heading); dy = sinf(heading);
+            } else {
+                float tx = ng->x, ty = ng->y;
+                if (rpn > 1) {                     /* follow the A* route in */
+                    if (rp_at < rpn - 1) {
+                        float ax = world.nav[rpath[rp_at]*2]   - carpos[0];
+                        float ay = world.nav[rpath[rp_at]*2+1] - carpos[1];
+                        if (ax*ax + ay*ay < 64.0f) rp_at++;
+                    }
+                    tx = world.nav[rpath[rp_at]*2]; ty = world.nav[rpath[rp_at]*2+1];
+                }
+                dx = tx - carpos[0]; dy = ty - carpos[1];
+            }
+            float d = sqrtf(dx*dx + dy*dy);
+            if (d > 1e-3f) {
+                float step = 1.2f;                 /* ~72 m/s at 60 Hz */
+                carpos[0] += dx/d*step; carpos[1] += dy/d*step;
+                heading = atan2f(dy, dx);
+                speed = step * 60.0f;
+            }
+            carpos[2] = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
+            world_race_update(&world, carpos[0], carpos[1]);
+        }
+        else if (shot && aipath.n > 0) {   /* screenshot autopilot: follow the racing
                line (chasing an AI used to drift off small proxy regions into
                the empty void — black screenshots) */
             int nearest = 0; float bd = 1e30f;
@@ -900,7 +1012,8 @@ int main(int argc, char **argv) {
             if (da> 0.06f) da= 0.06f; if (da<-0.06f) da=-0.06f;
             heading += da;
         }
-        float dmag = phys_car_step(carpos, vel, &heading, &speed,
+        float dmag = race_auto ? speed/60.0f
+                   : phys_car_step(carpos, vel, &heading, &speed,
                                    throttle, steer, handbrake);
         float nf[2] = { cosf(heading), sinf(heading) }, nr[2] = { nf[1], -nf[0] };
         /* engine note: 6-speed virtual gearbox drives RPM + load; shifts cut
@@ -912,15 +1025,17 @@ int main(int argc, char **argv) {
           g_road_vol = sp*sp*0.35f; }   /* tyre/wind roar rises with speed */
         float fwd[3] = { nf[0], nf[1], 0 };
         /* building collision: push the car out of any wall footprint it entered.*/
-        if (race_state == 1 && collide_walls(carpos, vel, obst, nobst, 1.3f)) g_hit = 0.5f;
+        if (race_state == 1 && !race_auto && collide_walls(carpos, vel, obst, nobst, 1.3f)) g_hit = 0.5f;
         /* guardrail/fence collision: push out of near-vertical road/terrain faces */
-        if (race_state == 1 && world_wall_push(&scene, carpos, 1.3f)) {
+        if (race_state == 1 && !race_auto && world_wall_push(&scene, carpos, 1.3f)) {
             vel[0]*=0.3f; vel[1]*=0.3f; g_hit = 0.5f;   /* rebound: bleed speed */
         }
         /* race blockades: only solid while a race event is active (Phase 71) */
-        if (race_state == 1 && world_barrier_push(&world, carpos, 1.3f)) {
+        if (race_state == 1 && !race_auto && world_barrier_push(&world, carpos, 1.3f)) {
             vel[0]*=0.2f; vel[1]*=0.2f; g_hit = 0.5f;
         }
+        /* checkpoint / lap tracking, after the pushes so it sees the final XY */
+        if (race_state == 1 && !race_auto) world_race_update(&world, carpos[0], carpos[1]);
         /* sit on the road/terrain surface (smoothed to avoid jitter) */
         float gz = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
         carpos[2] += (gz - carpos[2]) * 0.35f;
@@ -1787,11 +1902,19 @@ int main(int argc, char **argv) {
         g_dbg.mode = world.mode; g_dbg.active_ev = world.active_ev;
         g_dbg.masked_links = world.nmasked;
         g_dbg.navopen = world.mode == MODE_RACE_EVENT ? world.navopen : NULL;
+        g_dbg.race = &world.race;
         if (g_dbg.mode_request) {
             g_dbg.mode_request = 0;
+            world_race_stop(&world);
             world_set_mode(&world, g_dbg.want_mode, g_dbg.want_event);
             g_dbg.gps_n = 0;             /* the old route may cross a new barrier */
         }
+        if (g_dbg.race_start_request) {
+            g_dbg.race_start_request = 0;
+            if (world.active_ev >= 0)
+                world_race_start(&world, troot, world.active_ev, g_dbg.race_maxlaps_want);
+        }
+        if (g_dbg.race_stop_request) { g_dbg.race_stop_request = 0; world_race_stop(&world); }
         /* GPS: solve a fresh route whenever the panel asks for a destination */
         {   static int gpath[8192];
             if (g_dbg.gps_request) {
@@ -1920,7 +2043,7 @@ int main(int argc, char **argv) {
         if (g_dbg.want_track >= 0 && g_dbg.want_track < ntrack)
             relaunch(selfexe, dataroot, carname, tracklist[g_dbg.want_track]);
 #endif
-        if (shot && ++shotframe >= 40) {
+        if (shot && ++shotframe >= shotframes) {
             unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
             for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);

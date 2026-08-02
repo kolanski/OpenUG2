@@ -206,7 +206,7 @@ pts[0]`, verified on every record. Census over the shipped regions: **105 events
 `ROUTESL4RR` carry only `PathsFreeRoam.bin`: those regions are isolated arenas
 with no AI route network.
 
-### `0x34146` — track position markers (`TrackPosMarkers*.bin`)
+### `0x34146` — start grids (`TrackPosMarkers*.bin`)
 
 8-byte `0x11` filler, then **48-byte records**:
 
@@ -216,8 +216,26 @@ with no AI route network.
 +32 u32 hash  +36 u32 track id (4000 = freeroam) +40 char[4] tag  +44 u32 0
 ```
 
-18 markers per race event, 32 for freeroam (id 4000) — start/finish and
-checkpoint anchors, not barriers.
+18 records per race event, 32 for freeroam (id 4000). **CORRECTION (Phase 72):
+these are NOT checkpoints.** Re-measured for event 4001, all 18 sit inside a
+~15 × 30 m patch around (−400, 255): two 4-wide × 2-deep **starting grids** (one
+per race direction, matching the `F`/`B` route split) plus a couple of lone
+markers. They are spawn slots, not course anchors — the Phase 71 note calling
+them "checkpoint anchors" was wrong.
+
+### Checkpoint gates & laps — derived, not stored (Phase 72)
+
+There is no shipped checkpoint list. The **course order** is the event's own
+`0x3414c` outline polygon (already decoded above): its vertices are ordered
+around the lap, and each lands **2–23 m** from a racing-line node (measured over
+all 17 of event 4001's). The engine (`world_race_start` in `src/world.c`) turns
+each outline vertex into a **checkpoint gate**: snap it to the nearest racing-
+line node so it sits on the road, then square a line to the direction of travel
+taken from its outline neighbours. Gate 0 (the closing/first vertex) is the
+start/finish; it lands 8 m from the `0x34146` start grid, so both decodes agree
+on where the line is. Only the single armed gate scores, and only on a forward
+crossing (previous→current position straddles the line), so corner-cutting and
+reversing both fail to advance. Event 4001: 16 gates, 2 laps.
 
 ### Race barriers — no barrier chunk exists (**measured, Phase 71**)
 

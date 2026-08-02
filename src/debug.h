@@ -42,6 +42,32 @@ typedef struct {
 
 enum { MODE_FREEROAM = 0, MODE_RACE_EVENT = 1 };
 
+#define WORLD_MAXGATE 40
+#define WORLD_MAXGRID 24
+
+/* One checkpoint gate: a line the car must cross, centred on the racing line
+ * and square to the direction of travel. Gate 0 is the start/finish. */
+typedef struct {
+    float x, y;        /* gate centre, on the racing line */
+    float dx, dy;      /* unit direction of travel through the gate */
+    float half;        /* half-width, metres (the gate spans +-half across dx,dy) */
+    int   node;        /* the racing-line node it was snapped to */
+} WGate;
+
+/* Live race progression for the active event. */
+typedef struct {
+    int   active;                    /* 1 = a race is being tracked */
+    int   ev;                        /* index into World.ev */
+    int   lap, maxlaps;              /* lap 0 = not yet over the start line */
+    int   next;                      /* the ONLY armed gate; nothing else counts */
+    int   cleared;                   /* checkpoints cleared on the current lap */
+    int   finished;
+    int   ngate;
+    WGate gate[WORLD_MAXGATE];
+    float grid[WORLD_MAXGRID][2]; int ngrid;  /* start-grid slots (chunk 0x34146) */
+    float px, py; int havep;         /* previous car XY: gates are crossed, not touched */
+} WRace;
+
 typedef struct {
     /* --- freecam (works in every build; toggle with F) --- */
     int   freecam;
@@ -136,6 +162,9 @@ typedef struct {
     int   active_ev;                     /* index into ev[], -1 = freeroam */
     int   masked_links;                  /* directed CSR links the barriers disabled */
     int   want_mode, want_event, mode_request;
+    const WRace *race;                   /* live checkpoint/lap state (world.race) */
+    int   race_maxlaps_want;             /* panel writes, engine picks up on start */
+    int   race_start_request, race_stop_request;
 
     /* --- current city zone (engine writes each frame) --- */
     char  zone_name[24];        /* area code the car is inside, "" if none */

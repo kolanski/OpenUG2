@@ -73,6 +73,7 @@ typedef struct {
     int    mode;       /* MODE_FREEROAM / MODE_RACE_EVENT */
     int    active_ev;  /* index into ev[], -1 in freeroam */
     int    nmasked;    /* directed CSR links disabled by the active barriers */
+    WRace  race;       /* checkpoint / lap tracking (Phase 72) */
 } World;
 
 /* Load the navigation graph for the loaded regions from TRACKS/ROUTES<REGION>/
@@ -129,6 +130,33 @@ int world_load_events(World *w, const char *troot);
  * the neon blockades represent, derived from the event's shipped route network
  * rather than from hand-placed coordinates. Returns the barrier count. */
 int world_set_mode(World *w, int mode, int evidx);
+
+/* Arm a race on event evidx: switch to MODE_RACE_EVENT, build the checkpoint
+ * gates, load the start grid, and reset the lap counters (Phase 72).
+ *
+ * DATA-FIRST, and a CORRECTION to the Phase 71 note: chunk 0x34146
+ * (TrackPosMarkers) is NOT a checkpoint list. Measured for event 4001, its 18
+ * records all sit inside a 15 x 30 m patch around (-400, 255) — two 4-wide,
+ * 2-deep STARTING GRIDS (one per race direction, matching Routes<id>F/B.bin)
+ * plus one lone marker each. They are spawn slots, not course anchors.
+ *
+ * The course order comes from the event's own 0x3414c outline polygon, whose
+ * vertices are ordered around the lap and land 2-23 m from a racing-line node
+ * (measured over all 17 of event 4001's). Each vertex is snapped to its nearest
+ * node so the gate sits on the road, and squared to the direction of travel
+ * taken from its polygon neighbours. Cross-check: outline vertex 0 is 8 m from
+ * the 0x34146 start grid, so both decodes agree on where the start line is.
+ *
+ * Returns the gate count (gate 0 = start/finish, 1.. = checkpoints). */
+int world_race_start(World *w, const char *troot, int evidx, int maxlaps);
+
+/* Feed the car's XY once per frame. Only the single armed gate can be cleared,
+ * and only by CROSSING it (previous position -> current position segment test),
+ * so corner-cutting and standing on a gate both fail to score. Returns 1 on the
+ * frame a gate is cleared. */
+int world_race_update(World *w, float x, float y);
+
+void world_race_stop(World *w);
 
 /* Push the car circle (centre pos[3], radius r) back inside the corridor if it
  * has crossed an active race barrier. No-op in freeroam. Returns 1 if it pushed. */

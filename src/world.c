@@ -678,6 +678,142 @@ int world_barrier_push(const World *w, float *pos, float r) {
     return hit;
 }
 
+/* ---- race state: checkpoint gates and laps (Phase 72) ---------------------
+   See world.h for where the course order comes from and for the retraction of
+   the Phase 71 "0x34146 = checkpoints" note. */
+#define GATE_HALF 22.0f   /* ponytail: fixed gate width. The route data carries no
+                             road width; 22 m clears the widest measured snap error
+                             (23 m) plus a lane either side, and only ONE gate is
+                             ever armed so a wide gate cannot mis-fire on a parallel
+                             street. Derive per-gate widths from the road mesh if a
+                             track ever needs a tighter box. */
+
+/* Start-grid slots for one event, from TrackPosMarkers (chunk 0x34146):
+   8-byte 0x11 filler, then 48-byte records — +16 f32 X, +20 f32 Y, +24 f32 Z,
+   +36 u32 track id. Returns the number written. */
+static int race_load_grid(const World *w, const char *troot, int evid,
+                          float (*out)[2], int cap) {
+    int n = 0;
+    for (int r = 0; r < w->nreg && n < cap; r++) {
+        const char *rn = w->rgn[r].name;
+        const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
+        char p[1024];
+        snprintf(p, sizeof p, "%s/ROUTES%s/TrackPosMarkersAll.bin", troot, stem);
+        long len = 0; unsigned char *d = n2_read_file(p, &len);
+        if (!d) continue;
+        N2Leaf leaf[4]; int nl = 0;
+        n2_find_leaves(d, 0, len, 0x00034146u, leaf, &nl, 4);
+        for (int L = 0; L < nl; L++) {
+            /* the leaf opens with an 8-byte 0x11 filler run before the records */
+            long off = leaf[L].off + 8, end = leaf[L].off + leaf[L].size;
+            for (; off + 48 <= end && n < cap; off += 48) {
+                unsigned tid;
+                memcpy(&tid, d + off + 36, 4);
+                if ((int)tid != evid) continue;
+                memcpy(&out[n][0], d + off + 16, 4);
+                memcpy(&out[n][1], d + off + 20, 4);
+                n++;
+            }
+        }
+        free(d);
+    }
+    return n;
+}
+
+int world_race_start(World *w, const char *troot, int evidx, int maxlaps) {
+    WRace *R = &w->race;
+    memset(R, 0, sizeof *R);
+    if (evidx < 0 || evidx >= w->nev) return 0;
+    world_set_mode(w, MODE_RACE_EVENT, evidx);
+    const WEvent *e = &w->ev[evidx];
+    R->ev = evidx; R->maxlaps = maxlaps > 0 ? maxlaps : 2;
+
+    /* the outline closes (pts[n-1] == pts[0]), so the last vertex is a repeat */
+    int np = e->npoly > 1 && e->circuit ? e->npoly - 1 : e->npoly;
+    if (np > WORLD_MAXGATE) np = WORLD_MAXGATE;
+    for (int k = 0; k < np; k++) {
+        /* snap to the nearest node of THIS event's racing line so the gate sits
+           on the road rather than on the decimated outline corner */
+        int best = -1; float bd = 1e30f;
+        for (int i = e->node0; i < e->node1; i++) {
+            float dx = w->nav[i*2] - e->poly[k][0], dy = w->nav[i*2+1] - e->poly[k][1];
+            float d2 = dx*dx + dy*dy;
+            if (d2 < bd) { bd = d2; best = i; }
+        }
+        WGate *g = &R->gate[R->ngate];
+        g->node = best;
+        g->x = best >= 0 ? w->nav[best*2]   : e->poly[k][0];
+        g->y = best >= 0 ? w->nav[best*2+1] : e->poly[k][1];
+        /* direction of travel: central difference along the ordered outline */
+        int kp = (k - 1 + np) % np, kn = (k + 1) % np;
+        if (!e->circuit) { if (k == 0) kp = 0; if (k == np-1) kn = np-1; }
+        float dx = e->poly[kn][0] - e->poly[kp][0];
+        float dy = e->poly[kn][1] - e->poly[kp][1];
+        float d = sqrtf(dx*dx + dy*dy);
+        if (d < 1e-3f) { dx = 1; dy = 0; d = 1; }
+        g->dx = dx/d; g->dy = dy/d; g->half = GATE_HALF;
+        R->ngate++;
+    }
+    R->ngrid = race_load_grid(w, troot, e->id, R->grid, WORLD_MAXGRID);
+    R->active = R->ngate > 0;
+    R->next = 0; R->lap = 0; R->cleared = 0; R->havep = 0;
+    printf("race armed: event %d (%s), %d gates from the 0x3414c outline, "
+           "%d start-grid slots (0x34146), %d lap(s)\n",
+           e->id, e->circuit ? "circuit" : "sprint", R->ngate, R->ngrid, R->maxlaps);
+    return R->ngate;
+}
+
+void world_race_stop(World *w) { w->race.active = 0; }
+
+/* Do segments AB and CD properly straddle each other? */
+static int seg_cross(float ax, float ay, float bx, float by,
+                     float cx, float cy, float dx, float dy) {
+    float d1 = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax);
+    float d2 = (bx-ax)*(dy-ay) - (by-ay)*(dx-ax);
+    float d3 = (dx-cx)*(ay-cy) - (dy-cy)*(ax-cx);
+    float d4 = (dx-cx)*(by-cy) - (dy-cy)*(bx-cx);
+    return ((d1 > 0) != (d2 > 0)) && ((d3 > 0) != (d4 > 0));
+}
+
+int world_race_update(World *w, float x, float y) {
+    WRace *R = &w->race;
+    if (!R->active || R->finished) return 0;
+    if (!R->havep) { R->px = x; R->py = y; R->havep = 1; return 0; }
+    float px = R->px, py = R->py;
+    R->px = x; R->py = y;
+    if (px == x && py == y) return 0;
+
+    const WGate *g = &R->gate[R->next];
+    /* the gate line: centre +- half across the direction of travel */
+    float ax = g->x - (-g->dy)*g->half, ay = g->y - (g->dx)*g->half;
+    float bx = g->x + (-g->dy)*g->half, by = g->y + (g->dx)*g->half;
+    if (!seg_cross(px, py, x, y, ax, ay, bx, by)) return 0;
+    /* and only in the direction of travel, so reversing back out un-scores nothing */
+    if ((x-px)*g->dx + (y-py)*g->dy <= 0.0f) return 0;
+
+    const WEvent *e = &w->ev[R->ev];
+    int was = R->next;
+    if (was == 0) {
+        if (R->lap == 0) { R->lap = 1; printf("race: start line crossed, lap 1/%d\n", R->maxlaps); }
+        else {
+            printf("race: LAP %d complete (%d/%d checkpoints)\n",
+                   R->lap, R->cleared, R->ngate - 1);
+            R->lap++;
+            if (R->lap > R->maxlaps) { R->finished = 1; R->lap = R->maxlaps;
+                printf("race: FINISHED event %d after %d lap(s)\n", e->id, R->maxlaps); }
+        }
+        R->cleared = 0;
+    } else {
+        R->cleared++;
+        printf("race: checkpoint %d/%d cleared at (%.1f, %.1f)  lap %d/%d\n",
+               was, R->ngate - 1, g->x, g->y, R->lap, R->maxlaps);
+    }
+    if (e->circuit) R->next = (was + 1) % R->ngate;
+    else if (was + 1 < R->ngate) R->next = was + 1;
+    else { R->finished = 1; printf("race: FINISHED sprint %d\n", e->id); }
+    return 1;
+}
+
 int world_nav_nearest(const World *w, float x, float y) {
     int best = -1; float bd = 1e30f;
     for (int i = 0; i < w->nnav; i++) {

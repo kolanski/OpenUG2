@@ -214,7 +214,7 @@ extern "C" void dbgui_frame(void) {
     /* ---- Minimap / Navigation Graph: the real drivable road network parsed
        from the per-region ROUTES path files (chunk 0x34148), drawn top-down
        in world XY. Independent of the 3D geometry viewer. ---- */
-    ImGui::SetNextWindowSize(ImVec2(440, 720), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(430, 588), ImGuiCond_FirstUseEver);
     ImGui::Begin("Minimap / Navigation Graph");
     ImGui::Text("%d nodes, %d edges, %d districts", g_dbg.nnav, g_dbg.nnavedge, g_dbg.ndist);
     ImGui::SameLine();
@@ -224,7 +224,7 @@ extern "C" void dbgui_frame(void) {
         ImVec2 avail = ImGui::GetContentRegionAvail();
         float side = avail.x < avail.y ? avail.x : avail.y;
         if (side < 80.0f) side = 80.0f;
-        if (side > 380.0f) side = 380.0f;   /* leave room for the track manager below */
+        if (side > 300.0f) side = 300.0f;   /* leave room for the track manager below */
         ImDrawList *dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(p0, ImVec2(p0.x+side, p0.y+side), IM_COL32(12,14,20,255));
         float x0=g_dbg.navbb[0], x1=g_dbg.navbb[1], y0=g_dbg.navbb[2], y1=g_dbg.navbb[3];
@@ -280,6 +280,27 @@ extern "C" void dbgui_frame(void) {
                 dl->AddLine(ImVec2(px-tx, py+ty), ImVec2(px+tx, py-ty),
                             IM_COL32(255,50,50,255), 3.0f);
             }
+        }
+        /* checkpoint gates: armed one bright yellow, cleared grey, pending dim */
+        if (g_dbg.race && g_dbg.race->active) {
+            const WRace *R = g_dbg.race;
+            for (int i = 0; i < R->ngate; i++) {
+                const WGate &g = R->gate[i];
+                /* the gate spans across the direction of travel; world +Y is up */
+                float cx = MAPX(g.x), cy = MAPY(g.y);
+                float ax = MAPX(g.x - (-g.dy)*g.half), ay = MAPY(g.y - g.dx*g.half);
+                float bx = MAPX(g.x + (-g.dy)*g.half), by = MAPY(g.y + g.dx*g.half);
+                int cleared = R->next == 0 ? i > 0 : i < R->next;
+                ImU32 col = i == R->next   ? IM_COL32(255,225, 60,255)   /* armed  */
+                          : i == 0         ? IM_COL32(255,255,255,200)   /* s/f    */
+                          : cleared        ? IM_COL32(130,130,130,190)   /* done   */
+                                           : IM_COL32( 90, 90,110,150);  /* pending*/
+                dl->AddLine(ImVec2(ax,ay), ImVec2(bx,by), col, i == R->next ? 3.0f : 1.5f);
+                if (i == R->next) dl->AddCircle(ImVec2(cx,cy), 6.0f, col, 0, 2.0f);
+            }
+            for (int i = 0; i < R->ngrid; i++)
+                dl->AddCircleFilled(ImVec2(MAPX(R->grid[i][0]), MAPY(R->grid[i][1])),
+                                    2.0f, IM_COL32(120,200,255,220));
         }
         /* GPS route overlay */
         if (g_dbg.gps_path && g_dbg.gps_n > 1) {
@@ -343,6 +364,28 @@ extern "C" void dbgui_frame(void) {
                 e.id, e.reg, e.circuit ? "CIRCUIT" : "SPRINT", e.len100m,
                 g_dbg.bar_count, g_dbg.masked_links);
         }
+        /* --- live race HUD (Phase 72) --- */
+        if (g_dbg.race && g_dbg.race->active) {
+            const WRace *R = g_dbg.race;
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.0f,0.88f,0.25f,1.0f),
+                "Lap: %d/%d      Checkpoints Cleared: %d/%d",
+                R->lap > 0 ? R->lap : 1, R->maxlaps, R->cleared, R->ngate - 1);
+            ImGui::Text("next gate: %s%d of %d   |   %d start-grid slots",
+                        R->next == 0 ? "START/FINISH #" : "checkpoint #",
+                        R->next, R->ngate - 1, R->ngrid);
+            if (R->finished) ImGui::TextColored(ImVec4(0.4f,1.0f,0.5f,1.0f), "RACE FINISHED");
+            if (ImGui::Button("Stop race")) g_dbg.race_stop_request = 1;
+            ImGui::SameLine();
+            if (ImGui::Button("Restart")) g_dbg.race_start_request = 1;
+        } else if (g_dbg.mode == MODE_RACE_EVENT) {
+            ImGui::Separator();
+            if (ImGui::Button("Start race")) g_dbg.race_start_request = 1;
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(110);
+            ImGui::SliderInt("laps", &g_dbg.race_maxlaps_want, 1, 8);
+        }
+
         if (ImGui::BeginListBox("##events", ImVec2(-1, 180))) {
             for (int i = 0; i < g_dbg.ev_count; i++) {
                 const WEvent &e = g_dbg.ev[i];
