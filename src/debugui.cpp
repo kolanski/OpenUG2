@@ -214,7 +214,7 @@ extern "C" void dbgui_frame(void) {
     /* ---- Minimap / Navigation Graph: the real drivable road network parsed
        from the per-region ROUTES path files (chunk 0x34148), drawn top-down
        in world XY. Independent of the 3D geometry viewer. ---- */
-    ImGui::SetNextWindowSize(ImVec2(420, 460), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(440, 720), ImGuiCond_FirstUseEver);
     ImGui::Begin("Minimap / Navigation Graph");
     ImGui::Text("%d nodes, %d edges, %d districts", g_dbg.nnav, g_dbg.nnavedge, g_dbg.ndist);
     ImGui::SameLine();
@@ -224,6 +224,7 @@ extern "C" void dbgui_frame(void) {
         ImVec2 avail = ImGui::GetContentRegionAvail();
         float side = avail.x < avail.y ? avail.x : avail.y;
         if (side < 80.0f) side = 80.0f;
+        if (side > 380.0f) side = 380.0f;   /* leave room for the track manager below */
         ImDrawList *dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(p0, ImVec2(p0.x+side, p0.y+side), IM_COL32(12,14,20,255));
         float x0=g_dbg.navbb[0], x1=g_dbg.navbb[1], y0=g_dbg.navbb[2], y1=g_dbg.navbb[3];
@@ -264,6 +265,42 @@ extern "C" void dbgui_frame(void) {
             }
             chain[nchain++] = ImVec2(MAPX(g_dbg.nav[b*2]), MAPY(g_dbg.nav[b*2+1]));
         }
+        /* active race event: outline polygon + one tick per closed road */
+        if (g_dbg.mode == MODE_RACE_EVENT && g_dbg.active_ev >= 0 && g_dbg.ev) {
+            const WEvent &e = g_dbg.ev[g_dbg.active_ev];
+            ImVec2 op[WORLD_EVPOLY];
+            for (int i = 0; i < e.npoly; i++)
+                op[i] = ImVec2(MAPX(e.poly[i][0]), MAPY(e.poly[i][1]));
+            dl->AddPolyline(op, e.npoly, IM_COL32(255,255,255,230), 0, 2.5f);
+            for (int i = 0; i < g_dbg.bar_count; i++) {
+                const WBarrier &b = g_dbg.bar[i];
+                /* the blockade sits across the closed road: perpendicular to it */
+                float px = MAPX(b.x), py = MAPY(b.y);
+                float tx = -b.dy * 6.0f, ty = b.dx * 6.0f;   /* screen +Y is down */
+                dl->AddLine(ImVec2(px-tx, py+ty), ImVec2(px+tx, py-ty),
+                            IM_COL32(255,50,50,255), 3.0f);
+            }
+        }
+        /* GPS route overlay */
+        if (g_dbg.gps_path && g_dbg.gps_n > 1) {
+            static ImVec2 rp[8192];
+            int rn = g_dbg.gps_n < 8192 ? g_dbg.gps_n : 8191;
+            for (int i = 0; i < rn; i++) {
+                int nd = g_dbg.gps_path[i];
+                rp[i] = ImVec2(MAPX(g_dbg.nav[nd*2]), MAPY(g_dbg.nav[nd*2+1]));
+            }
+            dl->AddPolyline(rp, rn, IM_COL32(80,255,170,255), 0, 3.0f);
+            dl->AddCircleFilled(rp[rn-1], 5.0f, IM_COL32(80,255,170,255));
+        }
+        /* right-click inside the map sets the GPS destination */
+        {   ImVec2 mp = ImGui::GetIO().MousePos;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
+                mp.x >= p0.x && mp.x <= p0.x+side && mp.y >= p0.y && mp.y <= p0.y+side) {
+                g_dbg.gps_want_x = x0 + (mp.x - p0.x) / side * span;
+                g_dbg.gps_want_y = y0 + (p0.y + side - mp.y) / side * span;
+                g_dbg.gps_request = 1;
+            }
+        }
         /* player */
         float px = MAPX(g_dbg.car[0]), py = MAPY(g_dbg.car[1]);
         dl->AddCircleFilled(ImVec2(px, py), 4.0f, IM_COL32(255,80,60,255));
@@ -274,12 +311,53 @@ extern "C" void dbgui_frame(void) {
         for (int i = 0; i < g_dbg.ndist && i < 8; i++) {
             if (i) ImGui::SameLine();
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(DC[i & 7]), "%s", g_dbg.dist_tok[i]);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s = %s", g_dbg.dist_tok[i], g_dbg.dist_name[i]);
         }
         ImGui::TextDisabled("X[%.0f..%.0f] Y[%.0f..%.0f]  car (%.0f, %.0f)",
                             x0, x1, y0, y1, g_dbg.car[0], g_dbg.car[1]);
+        if (g_dbg.gps_n > 1)
+            ImGui::Text("GPS: %d nodes, %.0f m, %d ms", g_dbg.gps_n, g_dbg.gps_dist, g_dbg.gps_ms);
+        else ImGui::TextDisabled("right-click the map to set a GPS destination");
         #undef MAPX
         #undef MAPY
     } else ImGui::TextDisabled("no navigation data loaded");
+
+    /* ---- Race & Track Manager: the engine's Freeroam / Race-event split.
+       Events come from the shipped 0x3414c catalog; picking one masks the A*
+       graph to that event's corridor and makes its road closures solid. ---- */
+    if (ImGui::CollapsingHeader("Race & Track Manager", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int mode = g_dbg.mode;
+        if (ImGui::RadioButton("Freeroam Mode", mode == MODE_FREEROAM)) {
+            g_dbg.want_mode = MODE_FREEROAM; g_dbg.want_event = -1; g_dbg.mode_request = 1;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled(mode == MODE_RACE_EVENT
+            ? "race event active" : "whole city drivable, no barriers");
+
+        ImGui::Text("%d race events parsed (chunk 0x3414c)", g_dbg.ev_count);
+        if (mode == MODE_RACE_EVENT && g_dbg.active_ev >= 0) {
+            const WEvent &e = g_dbg.ev[g_dbg.active_ev];
+            ImGui::TextColored(ImVec4(1.0f,0.85f,0.3f,1.0f),
+                "event %d  %s  %s  ~%d00 m  |  %d barriers, %d links masked",
+                e.id, e.reg, e.circuit ? "CIRCUIT" : "SPRINT", e.len100m,
+                g_dbg.bar_count, g_dbg.masked_links);
+        }
+        if (ImGui::BeginListBox("##events", ImVec2(-1, 180))) {
+            for (int i = 0; i < g_dbg.ev_count; i++) {
+                const WEvent &e = g_dbg.ev[i];
+                char lbl[96];
+                snprintf(lbl, sizeof lbl, "%d  %-4s  %-7s  ~%d00 m  (%d nodes)",
+                         e.id, e.reg, e.circuit ? "circuit" : "sprint",
+                         e.len100m, e.node1 - e.node0);
+                if (ImGui::Selectable(lbl, mode == MODE_RACE_EVENT && i == g_dbg.active_ev)) {
+                    g_dbg.want_mode = MODE_RACE_EVENT; g_dbg.want_event = i;
+                    g_dbg.mode_request = 1;
+                }
+            }
+            ImGui::EndListBox();
+        }
+    }
     ImGui::End();
 }
 

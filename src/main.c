@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <assert.h>
 #include <unistd.h>   /* execvp: menu track-switch re-launches the process */
 #include <SDL.h>
 
@@ -204,9 +205,11 @@ int main(int argc, char **argv) {
     const char *dataroot = ".", *shot = NULL;
     const char *carname = "HUMMER", *trackname = "ALL";
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
+    int want_event_id = 0;   /* --event <id>: boot straight into a race event */
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--shot")    && i+1 < argc) shot      = argv[++i];
         else if (!strcmp(argv[i], "--car")     && i+1 < argc) carname   = argv[++i];
+        else if (!strcmp(argv[i], "--event")   && i+1 < argc) want_event_id = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--track")   && i+1 < argc) trackname = argv[++i];
         else if (!strcmp(argv[i], "--circuit") && i+1 < argc) { circuit = argv[++i]; explicit_circuit = 1; }
         else dataroot = argv[i];
@@ -336,6 +339,116 @@ int main(int argc, char **argv) {
     static uint32_t tmapkey[2048]; static GLuint tmaptex[2048];
     int ntmap = world_bind_textures(&world, tmapkey, tmaptex, 2048);
     printf("track textures bound: %d distinct\n", ntmap);
+
+    /* GPS self-check: route across the city so a broken graph is loud at load. */
+    if (world.nnav > 0 && world.ndist >= 2) {
+        int a = -1, b = -1;
+        for (int i = 0; i < world.ndist; i++) {
+            if (!strcmp(world.dist[i].tok, "UC")) a = i;
+            if (!strcmp(world.dist[i].tok, "IP")) b = i;
+        }
+        if (a < 0) a = 0;
+        if (b < 0) b = world.ndist - 1;
+        int s0 = world_nav_nearest(&world, world.dist[a].cx, world.dist[a].cy);
+        int g0 = world_nav_nearest(&world, world.dist[b].cx, world.dist[b].cy);
+        static int path[8192]; float dist = 0;
+        uint32_t t0 = SDL_GetTicks();
+        int n = world_route(&world, s0, g0, path, 8192, &dist);
+        uint32_t t1 = SDL_GetTicks();
+        printf("GPS test %s (%s) -> %s (%s): %d nodes, %.0f m, %u ms\n",
+               world.dist[a].tok, world_district_name(world.dist[a].tok),
+               world.dist[b].tok, world_district_name(world.dist[b].tok),
+               n, dist, t1 - t0);
+    }
+
+    /* Race & Track Manager self-check (Phase 71): take the first shipped
+       circuit, mask the graph to it, and prove the barriers actually cut the
+       A* graph — the same query must succeed in freeroam and be refused (or
+       re-routed inside the corridor) once the road is closed. */
+    if (world.nev > 0 && world.nnav > 0) {
+        int ei = 0;
+        for (int i = 0; i < world.nev; i++) if (world.ev[i].circuit) { ei = i; break; }
+        printf("\n-- race event catalog (%d events) --\n", world.nev);
+        for (int i = 0; i < world.nev; i++)
+            printf("  %d %-5s %-7s ~%d00 m  %2d-pt outline  nav nodes %d\n",
+                   world.ev[i].id, world.ev[i].reg,
+                   world.ev[i].circuit ? "circuit" : "sprint", world.ev[i].len100m,
+                   world.ev[i].npoly, world.ev[i].node1 - world.ev[i].node0);
+
+        world_set_mode(&world, MODE_RACE_EVENT, ei);
+        for (int i = 0; i < world.nbar && i < 8; i++)
+            printf("  barrier %2d at (%8.1f,%8.1f) out (%5.2f,%5.2f)  closes node %d -> %d\n",
+                   i, world.bar[i].x, world.bar[i].y,
+                   world.bar[i].dx, world.bar[i].dy, world.bar[i].a, world.bar[i].b);
+        if (world.nbar > 8) printf("  ... %d more\n", world.nbar - 8);
+
+        if (world.nbar > 0) {
+            static int rp[8192]; float rd = 0;
+            int s0 = world.bar[0].a, g0 = world.bar[0].b;   /* straddle a barrier */
+            world.mode = MODE_FREEROAM;
+            int nf = world_route(&world, s0, g0, rp, 8192, &rd);
+            printf("A* across barrier 0 (node %d -> %d)  FREEROAM: %d nodes, %.0f m\n",
+                   s0, g0, nf, rd);
+            world.mode = MODE_RACE_EVENT;
+            float rd2 = 0;
+            int nr = world_route(&world, s0, g0, rp, 8192, &rd2);
+            printf("A* across barrier 0 (node %d -> %d)  RACE %d : %d nodes, %.0f m%s\n",
+                   s0, g0, world.ev[ei].id, nr, rd2,
+                   nr ? " (re-routed inside the corridor)" : " (blocked - outside the race)");
+            assert(nf > 0 && nr != nf);   /* the mask must change the answer */
+
+            /* Second query: both endpoints ON the circuit, so race mode cannot
+               refuse it — it must find the way round inside the corridor. Sample
+               goals along the lap and report the biggest detour the mask forces;
+               most pairs are already on-corridor in freeroam, so a fixed pair
+               proves nothing. 32 A* runs at ~1 ms is free at load time. */
+            const WEvent *e = &world.ev[ei];
+            int span = e->node1 - e->node0, a2 = world.bar[0].a;
+            int bestg = -1; float bestf = 0, bestr = 0; int bnf = 0, bnr = 0;
+            for (int k = 1; k < 16; k++) {
+                int b2 = e->node0 + span * k / 16;
+                float df = 0, dr = 0;
+                /* the corridor mask is already built; world_route only consults
+                   it in race mode, so flipping the flag is the whole A/B */
+                world.mode = MODE_FREEROAM;
+                int naf = world_route(&world, a2, b2, rp, 8192, &df);
+                world.mode = MODE_RACE_EVENT;
+                int nar = world_route(&world, a2, b2, rp, 8192, &dr);
+                if (naf && nar && dr - df > bestr - bestf) {
+                    bestg = b2; bestf = df; bestr = dr; bnf = naf; bnr = nar;
+                }
+            }
+            printf("A* on-circuit (node %d -> %d)  FREEROAM: %d nodes %.0f m  |  "
+                   "RACE %d: %d nodes %.0f m  (+%.0f m round the closures)\n",
+                   a2, bestg, bnf, bestf, e->id, bnr, bestr, bestr - bestf);
+            assert(bestg >= 0 && bestr >= bestf);  /* corridor route exists, never shorter */
+
+            /* Collision masking: a car sitting just past barrier 0 must be
+               pushed back to the corridor side, and must be untouched once the
+               race ends. Same check the physics step runs every frame. */
+            {   const WBarrier *b0 = &world.bar[0];
+                float p[3] = { b0->x + b0->dx * 0.5f, b0->y + b0->dy * 0.5f, 0 };
+                float before = (p[0]-b0->x)*b0->dx + (p[1]-b0->y)*b0->dy;
+                int pushed = world_barrier_push(&world, p, 1.3f);
+                float after  = (p[0]-b0->x)*b0->dx + (p[1]-b0->y)*b0->dy;
+                printf("barrier collision: car at s=%+.2f m -> %s s=%+.2f m\n",
+                       before, pushed ? "pushed back to" : "left at", after);
+                assert(pushed && after < before);
+                world.mode = MODE_FREEROAM;                  /* race over */
+                float q[3] = { b0->x + b0->dx * 0.5f, b0->y + b0->dy * 0.5f, 0 };
+                assert(!world_barrier_push(&world, q, 1.3f));  /* barrier is gone */
+                world.mode = MODE_RACE_EVENT;
+            }
+        }
+        world_set_mode(&world, MODE_FREEROAM, -1);
+        if (want_event_id) {
+            int wi = -1;
+            for (int i = 0; i < world.nev; i++) if (world.ev[i].id == want_event_id) wi = i;
+            if (wi < 0) fprintf(stderr, "--event %d: no such race event\n", want_event_id);
+            else world_set_mode(&world, MODE_RACE_EVENT, wi);
+        }
+        printf("\n");
+    }
 
     /* Scripted-object entity DEFINITIONS from the district companion L4R*.BUN.
        Read-only decode for the inspector; the data has no world placement or
@@ -803,6 +916,10 @@ int main(int argc, char **argv) {
         /* guardrail/fence collision: push out of near-vertical road/terrain faces */
         if (race_state == 1 && world_wall_push(&scene, carpos, 1.3f)) {
             vel[0]*=0.3f; vel[1]*=0.3f; g_hit = 0.5f;   /* rebound: bleed speed */
+        }
+        /* race blockades: only solid while a race event is active (Phase 71) */
+        if (race_state == 1 && world_barrier_push(&world, carpos, 1.3f)) {
+            vel[0]*=0.2f; vel[1]*=0.2f; g_hit = 0.5f;
         }
         /* sit on the road/terrain surface (smoothed to avoid jitter) */
         float gz = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
@@ -1660,8 +1777,34 @@ int main(int argc, char **argv) {
         g_dbg.nav = world.nav; g_dbg.nnav = world.nnav;
         g_dbg.navedge = world.navedge; g_dbg.nnavedge = world.nnavedge;
         g_dbg.navcomp = world.navcomp; g_dbg.ndist = world.ndist;
-        for (int i = 0; i < world.ndist && i < 8; i++)
+        for (int i = 0; i < world.ndist && i < 8; i++) {
             snprintf(g_dbg.dist_tok[i], 4, "%s", world.dist[i].tok);
+            snprintf(g_dbg.dist_name[i], 24, "%s", world_district_name(world.dist[i].tok));
+        }
+        /* Race & Track Manager: mirror the catalog, apply panel mode switches */
+        g_dbg.ev = world.ev;  g_dbg.ev_count  = world.nev;
+        g_dbg.bar = world.bar; g_dbg.bar_count = world.nbar;
+        g_dbg.mode = world.mode; g_dbg.active_ev = world.active_ev;
+        g_dbg.masked_links = world.nmasked;
+        g_dbg.navopen = world.mode == MODE_RACE_EVENT ? world.navopen : NULL;
+        if (g_dbg.mode_request) {
+            g_dbg.mode_request = 0;
+            world_set_mode(&world, g_dbg.want_mode, g_dbg.want_event);
+            g_dbg.gps_n = 0;             /* the old route may cross a new barrier */
+        }
+        /* GPS: solve a fresh route whenever the panel asks for a destination */
+        {   static int gpath[8192];
+            if (g_dbg.gps_request) {
+                g_dbg.gps_request = 0;
+                int s0 = world_nav_nearest(&world, carpos[0], carpos[1]);
+                int g0 = world_nav_nearest(&world, g_dbg.gps_want_x, g_dbg.gps_want_y);
+                float gd = 0; uint32_t ta = SDL_GetTicks();
+                int gn = world_route(&world, s0, g0, gpath, 8192, &gd);
+                g_dbg.gps_ms = (int)(SDL_GetTicks() - ta);
+                g_dbg.gps_path = gpath; g_dbg.gps_n = gn; g_dbg.gps_dist = gd;
+                printf("GPS route: %d nodes, %.0f m, %d ms\n", gn, gd, g_dbg.gps_ms);
+            }
+        }
         for (int i = 0; i < 4; i++) g_dbg.navbb[i] = world.navbb[i];
         /* live district tracking: log every boundary crossing */
         {   static int lastzone = -2;

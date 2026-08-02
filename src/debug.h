@@ -16,6 +16,32 @@ typedef struct {
     float w, l, h;         /* local OBB extents (X, Y, Z) */
 } ScriptedDef;
 
+#define WORLD_EVPOLY 33
+
+/* One shipped race event (Phase 71), decoded from the 0x3414c leaf that every
+ * per-event TRACKS/ROUTES<REG>/Paths<id>.bin carries and PathsFreeRoam.bin does
+ * NOT — that absence is the game's own Freeroam/Race split (see world.h). */
+typedef struct {
+    int   id;                       /* 4001.. — also the Paths<id>.bin number */
+    char  reg[8];                   /* owning region stem, e.g. "L4RA" */
+    int   circuit;                  /* 1 = closed lap circuit, 0 = point-to-point sprint */
+    int   npoly;                    /* valid outline points; poly[npoly-1] == poly[0] */
+    int   len100m;                  /* coarse course-length hint, units of 100 m */
+    float poly[WORLD_EVPOLY][2];    /* closed track-outline polygon, world XY */
+    float bb[4];                    /* x0,x1,y0,y1 of the outline */
+    int   node0, node1;             /* [node0,node1) = this event's nav nodes */
+} WEvent;
+
+/* A road closed off by the active race event: the point where a drivable link
+ * leaves the race corridor, plus the outward direction along that link. */
+typedef struct {
+    float x, y;      /* midpoint of the severed link */
+    float dx, dy;    /* unit vector pointing OUT of the corridor */
+    int   a, b;      /* the nav nodes it separated (a inside, b outside) */
+} WBarrier;
+
+enum { MODE_FREEROAM = 0, MODE_RACE_EVENT = 1 };
+
 typedef struct {
     /* --- freecam (works in every build; toggle with F) --- */
     int   freecam;
@@ -93,7 +119,23 @@ typedef struct {
     const int *navcomp;                  /* district (component) index per node */
     int   ndist;                         /* fused districts (area codes) */
     char  dist_tok[8][4];                /* their 2-letter codes, for the legend */
+    char  dist_name[8][24];              /* canonical UI names (external truth) */
+    /* GPS: panel writes gps_want_x/y on right-click, main.c solves and fills
+       gps_path/gps_n/gps_dist/gps_ms for the panel to draw. */
+    float gps_want_x, gps_want_y; int gps_request;
+    const int *gps_path; int gps_n; float gps_dist; int gps_ms;
     float navbb[4];                      /* x0,x1,y0,y1 */
+
+    /* --- Race & Track Manager (Phase 71): engine writes the catalog + the
+       active mask, the panel writes want_mode/want_event and main.c applies
+       them through world_set_mode(). --- */
+    const WEvent *ev; int ev_count;      /* shipped race events (world.ev) */
+    const WBarrier *bar; int bar_count;  /* barriers of the active event */
+    const char *navopen;                 /* per-node corridor mask, NULL in freeroam */
+    int   mode;                          /* MODE_FREEROAM / MODE_RACE_EVENT */
+    int   active_ev;                     /* index into ev[], -1 = freeroam */
+    int   masked_links;                  /* directed CSR links the barriers disabled */
+    int   want_mode, want_event, mode_request;
 
     /* --- current city zone (engine writes each frame) --- */
     char  zone_name[24];        /* area code the car is inside, "" if none */

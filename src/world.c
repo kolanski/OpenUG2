@@ -10,6 +10,7 @@
 #include "resource.h"
 
 static void grid_build(World *w);
+static void nav_build_adj(World *w);
 
 /* ---- load-time duplicate stripper (Phase 48) ----
    The 8 STREAM*.BUN bundles are overlapping per-race supersets, not adjacent
@@ -219,7 +220,10 @@ int world_load(World *w, const char *troot, const char *trackname) {
         w->mbb[i][0]=x0; w->mbb[i][1]=y0; w->mbb[i][2]=x1; w->mbb[i][3]=y1;
     }
     grid_build(w);
+    world_load_events(w, troot);   /* before the nav load: it tags nodes per event */
     world_load_nav(w, troot);
+    nav_build_adj(w);
+    world_set_mode(w, MODE_FREEROAM, -1);
     world_build_districts(w);
     printf("districts: %d area codes fused onto %d nav nodes\n"
            "  (nearest TRN_ terrain mesh per node; codes are the artists' own)\n",
@@ -378,6 +382,72 @@ int world_scripted_defs(const World *w, const char *troot,
    120 m and the big jumps are segment breaks. */
 #define NAV_LINK_MAX 120.0f
 
+/* ---- race event catalog (Phase 71) ---------------------------------------
+   See world.h for the record layout and for why this, and not a barrier prop
+   list, is the authentic Freeroam/Race split.
+
+   AUDIT TRAIL (what was looked at before settling on this): a full recursive
+   chunk census of TRACKS/L4R*.BUN, GLOBAL/InGame{FreeRoam,Race,Drift,Drag}.bun,
+   and every TRACKS/ROUTES<REG> Paths/Routes/TrackPosMarkers file turns up NO barrier /
+   blockade instance chunk anywhere -- in particular 0x0003410B does not exist in
+   any shipped file. What the data DOES ship per event is a route network
+   restricted to the roads that event uses: Routes4001F.bin references only the
+   6 route sectors TrackRoutesA21/A30..A34, where RoutesFreeRoam.bin references
+   all 20 (A10..A44). The closure is expressed as omission, so the barrier
+   positions are exactly the links where the freeroam graph leaves the event
+   corridor -- computed below, never typed in. */
+int world_load_events(World *w, const char *troot) {
+    w->nev = 0; w->mode = MODE_FREEROAM; w->active_ev = -1;
+    for (int r = 0; r < w->nreg; r++) {
+        const char *rn = w->rgn[r].name;
+        const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
+        unsigned char *d = NULL; long len = 0;
+        for (int fi = 0; fi < 4000 && !d; fi++) {   /* first Paths file that exists */
+            char p[1024];
+            snprintf(p, sizeof p, "%s/ROUTES%s/Paths%04d.bin", troot, stem, 4000 + fi);
+            d = n2_read_file(p, &len);
+        }
+        if (!d) continue;
+        N2Leaf leaf[4]; int nl = 0;
+        n2_find_leaves(d, 0, len, 0x0003414cu, leaf, &nl, 4);
+        for (int L = 0; L < nl; L++) {
+            int n = (int)leaf[L].size / 272;
+            for (int i = 0; i < n && w->nev < WORLD_MAXEVENT; i++) {
+                const unsigned char *b = d + leaf[L].off + i * 272;
+                WEvent *e = &w->ev[w->nev];
+                e->id      = b[0] | (b[1] << 8);
+                e->npoly   = b[2];
+                e->circuit = b[3];
+                e->len100m = b[5];
+                if (e->id < 4000 || e->npoly < 3 || e->npoly > WORLD_EVPOLY) continue;
+                snprintf(e->reg, sizeof e->reg, "%s", stem);
+                e->bb[0] = e->bb[2] = 1e30f; e->bb[1] = e->bb[3] = -1e30f;
+                for (int k = 0; k < e->npoly; k++) {
+                    memcpy(&e->poly[k][0], b + 8 + k*8,     4);
+                    memcpy(&e->poly[k][1], b + 8 + k*8 + 4, 4);
+                    if (e->poly[k][0] < e->bb[0]) e->bb[0] = e->poly[k][0];
+                    if (e->poly[k][0] > e->bb[1]) e->bb[1] = e->poly[k][0];
+                    if (e->poly[k][1] < e->bb[2]) e->bb[2] = e->poly[k][1];
+                    if (e->poly[k][1] > e->bb[3]) e->bb[3] = e->poly[k][1];
+                }
+                e->node0 = e->node1 = 0;
+                w->nev++;
+            }
+        }
+        free(d);
+    }
+    {   int nc = 0; for (int i = 0; i < w->nev; i++) nc += w->ev[i].circuit;
+        printf("race events: %d parsed from Paths*.bin chunk 0x3414c "
+               "(%d circuits, %d sprints)\n", w->nev, nc, w->nev - nc); }
+    return w->nev;
+}
+
+/* Index of the event with this id, or -1. */
+static int ev_by_id(const World *w, int id) {
+    for (int i = 0; i < w->nev; i++) if (w->ev[i].id == id) return i;
+    return -1;
+}
+
 int world_load_nav(World *w, const char *troot) {
     int cap = 4096, ecap = 4096;
     w->nav = (float *)malloc((size_t)cap * 2 * sizeof(float));
@@ -393,6 +463,10 @@ int world_load_nav(World *w, const char *troot) {
             snprintf(p, sizeof p, "%s/ROUTES%s/Paths%04d.bin", troot, stem, 4000 + fi);
             long len = 0; unsigned char *d = n2_read_file(p, &len);
             if (!d) continue;
+            /* remember which race event contributed which nodes: 0x34148 is the
+               event's OWN racing line, so the range below IS its corridor seed */
+            int evi = ev_by_id(w, 4000 + fi);
+            if (evi >= 0) w->ev[evi].node0 = w->nnav;
             N2Leaf leaf[8]; int nl = 0;
             n2_find_leaves(d, 0, len, 0x00034148u, leaf, &nl, 8);
             for (int L = 0; L < nl; L++) {
@@ -424,9 +498,15 @@ int world_load_nav(World *w, const char *troot) {
                     prev = id;
                 }
             }
+            if (evi >= 0) w->ev[evi].node1 = w->nnav;
             free(d);
         }
     }
+    w->navev   = (int  *)malloc((size_t)(w->nnav ? w->nnav : 1) * sizeof(int));
+    w->navopen = (char *)malloc((size_t)(w->nnav ? w->nnav : 1));
+    for (int i = 0; i < w->nnav; i++) { w->navev[i] = -1; w->navopen[i] = 1; }
+    for (int e = 0; e < w->nev; e++)
+        for (int i = w->ev[e].node0; i < w->ev[e].node1; i++) w->navev[i] = e;
     printf("nav graph: %d nodes, %d edges from TRACKS/ROUTES*/Paths*.bin (chunk 0x34148)\n",
            w->nnav, w->nnavedge);
     if (w->nnav) printf("  extent X[%.0f..%.0f] Y[%.0f..%.0f]\n",
@@ -449,6 +529,230 @@ int world_load_nav(World *w, const char *troot) {
    constant in runs and changes at segment boundaries (16,16,16,...,4,4,4), i.e.
    a per-segment road id/class. So there is no baked district code to read, and
    grouping by drivable connectivity is the correct fallback. */
+/* ---- routing graph + A* (Phase 70) ---------------------------------------
+   The 355 route files are independent polylines, so the within-route edges
+   ALONE do not form a city: measured, a BFS from node 0 reaches 9 of 15257
+   nodes (0.1%). Routing needs the coincidence welds promoted to real edges --
+   two races down the same street produce two node runs at the same coordinates,
+   and welding them is what turns the pile of routes into a drivable network.
+   Weld radius is the 5 m knee measured in Phase 68. */
+#define NAV_WELD 5.0f
+
+const char *world_district_name(const char *tok) {
+    /* EXTERNAL ground truth, supplied by the project owner from the in-game
+       world map. The codes come from the files; these names do not -- the
+       shipped data binds them to no coordinates (Phase 66 audit). */
+    if (!strcmp(tok, "SH")) return "Jackson Heights";
+    if (!strcmp(tok, "UC")) return "Beacon Hill";
+    if (!strcmp(tok, "CN")) return "City Core (North)";
+    if (!strcmp(tok, "CS")) return "City Core (South)";
+    if (!strcmp(tok, "IP")) return "Coal Harbor";
+    return tok;
+}
+
+/* Promote welds to edges, then build a CSR adjacency over the whole graph. */
+static void nav_build_adj(World *w) {
+    int cap = w->nnavedge * 2 + 64, ne = w->nnavedge;
+    int *ea = (int *)malloc((size_t)cap * 2 * sizeof(int));
+    for (int e = 0; e < ne; e++) { ea[e*2] = w->navedge[e*2]; ea[e*2+1] = w->navedge[e*2+1]; }
+    {   int nb = w->nnav * 2 + 7;
+        int *head = (int *)malloc((size_t)nb * sizeof(int));
+        int *next = (int *)malloc((size_t)w->nnav * sizeof(int));
+        for (int i = 0; i < nb; i++) head[i] = -1;
+        for (int i = 0; i < w->nnav; i++) {
+            int cx = (int)floorf(w->nav[i*2]/NAV_WELD), cy = (int)floorf(w->nav[i*2+1]/NAV_WELD);
+            unsigned h = ((unsigned)cx*73856093u) ^ ((unsigned)cy*19349663u);
+            int b = (int)(h % (unsigned)nb); next[i] = head[b]; head[b] = i;
+        }
+        for (int i = 0; i < w->nnav; i++) {
+            int cx = (int)floorf(w->nav[i*2]/NAV_WELD), cy = (int)floorf(w->nav[i*2+1]/NAV_WELD);
+            for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) {
+                unsigned h = ((unsigned)(cx+dx)*73856093u) ^ ((unsigned)(cy+dy)*19349663u);
+                for (int j = head[(int)(h % (unsigned)nb)]; j >= 0; j = next[j]) {
+                    if (j <= i) continue;
+                    float ddx = w->nav[i*2]-w->nav[j*2], ddy = w->nav[i*2+1]-w->nav[j*2+1];
+                    if (ddx*ddx + ddy*ddy > NAV_WELD*NAV_WELD) continue;
+                    if (ne == cap) { cap *= 2; ea = (int *)realloc(ea, (size_t)cap*2*sizeof(int)); }
+                    ea[ne*2] = i; ea[ne*2+1] = j; ne++;
+                }
+            }
+        }
+        free(head); free(next);
+    }
+    w->adjstart = (int *)calloc((size_t)w->nnav + 1, sizeof(int));
+    for (int e = 0; e < ne; e++) { w->adjstart[ea[e*2]+1]++; w->adjstart[ea[e*2+1]+1]++; }
+    for (int i = 0; i < w->nnav; i++) w->adjstart[i+1] += w->adjstart[i];
+    w->nadj = w->adjstart[w->nnav];
+    w->adjlist = (int *)malloc((size_t)w->nadj * sizeof(int));
+    int *fill = (int *)malloc((size_t)w->nnav * sizeof(int));
+    for (int i = 0; i < w->nnav; i++) fill[i] = w->adjstart[i];
+    for (int e = 0; e < ne; e++) {
+        int a = ea[e*2], b = ea[e*2+1];
+        w->adjlist[fill[a]++] = b; w->adjlist[fill[b]++] = a;
+    }
+    free(fill); free(ea);
+    printf("routing graph: %d nodes, %d directed links (%d edges after welding)\n",
+           w->nnav, w->nadj, ne);
+}
+
+/* ---- TrackManager: freeroam vs race event (Phase 71) ----------------------
+   A race is the event's own route network laid over the shared city graph. The
+   corridor is the node run that Paths<id>.bin contributed, grown across the
+   coincidence welds (the same street driven by two events produces two node
+   runs at identical coordinates, and both are the same road). Everything the
+   corridor touches but does not contain is a closed turning: one barrier each. */
+#define BAR_HALF   9.0f    /* barrier wall half-width, metres */
+#define BAR_REACH 40.0f    /* only test barriers this close to the car */
+
+int world_set_mode(World *w, int mode, int evidx) {
+    w->nbar = 0; w->nmasked = 0;
+    if (!w->navopen || !w->adjstart) return 0;
+    if (mode != MODE_RACE_EVENT || evidx < 0 || evidx >= w->nev) {
+        w->mode = MODE_FREEROAM; w->active_ev = -1;
+        for (int i = 0; i < w->nnav; i++) w->navopen[i] = 1;
+        return 0;
+    }
+    w->mode = MODE_RACE_EVENT; w->active_ev = evidx;
+    const WEvent *e = &w->ev[evidx];
+    for (int i = 0; i < w->nnav; i++) w->navopen[i] = 0;
+    for (int i = e->node0; i < e->node1; i++) w->navopen[i] = 1;
+    /* promote welded twins; chains of coincident nodes are short, so a handful
+       of sweeps reaches a fixed point (the loop exits as soon as one is idle). */
+    for (int pass = 0; pass < 8; pass++) {
+        int changed = 0;
+        for (int i = 0; i < w->nnav; i++) {
+            if (!w->navopen[i]) continue;
+            for (int k = w->adjstart[i]; k < w->adjstart[i+1]; k++) {
+                int nb = w->adjlist[k];
+                if (w->navopen[nb]) continue;
+                float dx = w->nav[nb*2]-w->nav[i*2], dy = w->nav[nb*2+1]-w->nav[i*2+1];
+                if (dx*dx + dy*dy <= NAV_WELD*NAV_WELD) { w->navopen[nb] = 1; changed = 1; }
+            }
+        }
+        if (!changed) break;
+    }
+    /* every remaining link out of the corridor is a road the race closes */
+    for (int i = 0; i < w->nnav; i++) {
+        if (!w->navopen[i]) continue;
+        for (int k = w->adjstart[i]; k < w->adjstart[i+1]; k++) {
+            int nb = w->adjlist[k];
+            if (w->navopen[nb]) continue;
+            w->nmasked++;
+            float dx = w->nav[nb*2]-w->nav[i*2], dy = w->nav[nb*2+1]-w->nav[i*2+1];
+            float d = sqrtf(dx*dx + dy*dy);
+            if (d < 1e-3f) continue;
+            float mx = w->nav[i*2] + dx*0.5f, my = w->nav[i*2+1] + dy*0.5f;
+            int dup = 0;                       /* one blockade per closed mouth */
+            for (int b = 0; b < w->nbar && !dup; b++) {
+                float ex = w->bar[b].x-mx, ey = w->bar[b].y-my;
+                if (ex*ex + ey*ey < BAR_HALF*BAR_HALF) dup = 1;
+            }
+            if (dup || w->nbar >= WORLD_MAXBARRIER) continue;
+            WBarrier *bar = &w->bar[w->nbar++];
+            bar->x = mx; bar->y = my; bar->dx = dx/d; bar->dy = dy/d;
+            bar->a = i;  bar->b = nb;
+        }
+    }
+    printf("race event %d (%s, %s, ~%d00 m): corridor nodes %d, "
+           "barriers %d, directed links masked %d\n",
+           e->id, e->reg, e->circuit ? "circuit" : "sprint", e->len100m,
+           e->node1 - e->node0, w->nbar, w->nmasked);
+    return w->nbar;
+}
+
+int world_barrier_push(const World *w, float *pos, float r) {
+    if (w->mode != MODE_RACE_EVENT) return 0;
+    int hit = 0;
+    for (int i = 0; i < w->nbar; i++) {
+        const WBarrier *b = &w->bar[i];
+        float rx = pos[0]-b->x, ry = pos[1]-b->y;
+        if (rx*rx + ry*ry > BAR_REACH*BAR_REACH) continue;
+        float s = rx*b->dx + ry*b->dy;              /* along the closed road */
+        float t = -rx*b->dy + ry*b->dx;             /* across it */
+        if (s <= -r || s >= r + BAR_HALF) continue; /* behind, or already past */
+        if (t < -(BAR_HALF + r) || t > BAR_HALF + r) continue;
+        pos[0] -= b->dx * (s + r);                  /* back to the corridor side */
+        pos[1] -= b->dy * (s + r);
+        hit = 1;
+    }
+    return hit;
+}
+
+int world_nav_nearest(const World *w, float x, float y) {
+    int best = -1; float bd = 1e30f;
+    for (int i = 0; i < w->nnav; i++) {
+        float dx = w->nav[i*2]-x, dy = w->nav[i*2+1]-y;
+        float d2 = dx*dx + dy*dy;
+        if (d2 < bd) { bd = d2; best = i; }
+    }
+    return best;
+}
+
+/* binary min-heap over (f, node) */
+typedef struct { float f; int n; } HeapIt;
+static void heap_push(HeapIt *h, int *n, HeapIt v) {
+    int i = (*n)++; h[i] = v;
+    while (i > 0) { int p = (i-1)/2; if (h[p].f <= h[i].f) break;
+        HeapIt t = h[p]; h[p] = h[i]; h[i] = t; i = p; }
+}
+static HeapIt heap_pop(HeapIt *h, int *n) {
+    HeapIt top = h[0]; h[0] = h[--(*n)]; int i = 0;
+    for (;;) { int l = i*2+1, r = l+1, m = i;
+        if (l < *n && h[l].f < h[m].f) m = l;
+        if (r < *n && h[r].f < h[m].f) m = r;
+        if (m == i) break;
+        HeapIt t = h[m]; h[m] = h[i]; h[i] = t; i = m; }
+    return top;
+}
+
+int world_route(const World *w, int start, int goal, int *out, int cap, float *outdist) {
+    if (outdist) *outdist = 0.0f;
+    if (!w->adjstart || start < 0 || goal < 0 || start >= w->nnav || goal >= w->nnav) return 0;
+    /* Race mode prunes the graph to the active corridor, so a route that would
+       cross a barrier is either re-routed inside it or reported unreachable. */
+    if (w->mode == MODE_RACE_EVENT && w->navopen &&
+        (!w->navopen[start] || !w->navopen[goal])) return 0;
+    float *g = (float *)malloc((size_t)w->nnav * sizeof(float));
+    int *came = (int *)malloc((size_t)w->nnav * sizeof(int));
+    char *closed = (char *)calloc((size_t)w->nnav, 1);
+    for (int i = 0; i < w->nnav; i++) { g[i] = 1e30f; came[i] = -1; }
+    HeapIt *heap = (HeapIt *)malloc((size_t)(w->nadj + 16) * sizeof(HeapIt));
+    int hn = 0;
+    float gx = w->nav[goal*2], gy = w->nav[goal*2+1];
+    g[start] = 0.0f;
+    HeapIt s0; s0.n = start;
+    s0.f = hypotf(w->nav[start*2]-gx, w->nav[start*2+1]-gy);
+    heap_push(heap, &hn, s0);
+    int found = 0;
+    while (hn > 0) {
+        HeapIt cur = heap_pop(heap, &hn);
+        if (cur.n == goal) { found = 1; break; }
+        if (closed[cur.n]) continue;
+        closed[cur.n] = 1;
+        for (int k = w->adjstart[cur.n]; k < w->adjstart[cur.n+1]; k++) {
+            int nb = w->adjlist[k];
+            if (closed[nb]) continue;
+            if (w->mode == MODE_RACE_EVENT && !w->navopen[nb]) continue;  /* barrier */
+            float dx = w->nav[nb*2]-w->nav[cur.n*2], dy = w->nav[nb*2+1]-w->nav[cur.n*2+1];
+            float ng = g[cur.n] + hypotf(dx, dy);
+            if (ng >= g[nb]) continue;
+            g[nb] = ng; came[nb] = cur.n;
+            HeapIt it; it.n = nb;
+            it.f = ng + hypotf(w->nav[nb*2]-gx, w->nav[nb*2+1]-gy);
+            if (hn < w->nadj + 15) heap_push(heap, &hn, it);
+        }
+    }
+    int n = 0;
+    if (found) {
+        int chain[8192], c = 0;
+        for (int v = goal; v >= 0 && c < 8192; v = came[v]) chain[c++] = v;
+        for (int i = c-1; i >= 0 && n < cap; i--) out[n++] = chain[i];
+        if (outdist) *outdist = g[goal];
+    }
+    free(g); free(came); free(closed); free(heap);
+    return n;
+}
+
 /* Nearest-neighbour semantic transfer (Phase 69): give every nav node the area
    code of the TRN_ terrain mesh it sits on.
 

@@ -165,6 +165,71 @@ and **closed circuits** (first ≈ last) — the latter are what you lap.
 `ROUTESL4RF/Paths4602.bin` is a small 33-waypoint circuit inside the
 `STREAML4RH` region, used here for the lap demo.
 
+### Freeroam vs. race event — the split is the game's own
+
+Each `ROUTES<REG>/` holds one `Paths<id>.bin` per race event **plus** a single
+`PathsFreeRoam.bin`. Comparing the leaves settles which data belongs to which:
+
+| leaf | `Paths4001` | `Paths4006` | `PathsFreeRoam` |
+|---|---|---|---|
+| `0x34148` racing line | 0x1ff8 | 0x2ac0 | *absent* |
+| `0x34149` | 0x2260 | 0x49e8 | *absent* |
+| `0x3414a` | 0x10ffc | 0x10ffc | 0x10ffc — **byte-identical** |
+| `0x3414c` event catalog | 0x3fc0 | 0x3fc0 | *absent* |
+| `0x3414d` | 0xfb70 | 0xfb70 | 0xfb70 — **byte-identical** |
+
+`0x3414a`/`0x3414d` are the shared per-region city data (same MD5 in every file
+of a region); the other three are per-event. So **a race event is a route
+network laid over the common city**, and freeroam is that city with no event
+overlay. `Routes<id>F/B.bin` confirms it from the other side: `Routes4001F.bin`
+names only 6 route sectors (`TrackRoutesA21`, `A30`–`A34`) where
+`RoutesFreeRoam.bin` names all 20 (`A10`–`A44`).
+
+### `0x3414c` — race event catalog (**SOLVED**)
+
+A flat table of that region's events, **272-byte records**:
+
+```
++0  u16  event id (4001..)          — also the Paths<id>.bin number
++2  u8   outline point count N
++3  u8   circuit flag  1 = closed lap circuit, 0 = point-to-point sprint
++4  u8   flag (0/1)
++5  u8   course length hint, units of 100 m (observed 20/30/40/50/60)
++6  u16  pad
++8  33 * (f32 x, f32 y)             — track outline polygon, world XY
+```
+
+Only the first `N` points are live (the array is a fixed 33 slots and the tail
+holds stale values from a longer record); the polygon is closed, `pts[N-1] ==
+pts[0]`, verified on every record. Census over the shipped regions: **105 events
+— L4RA 60, L4RB 9, L4RC 12, L4RD 3, L4RF 8, L4RG 13.** `ROUTESL4RH` and
+`ROUTESL4RR` carry only `PathsFreeRoam.bin`: those regions are isolated arenas
+with no AI route network.
+
+### `0x34146` — track position markers (`TrackPosMarkers*.bin`)
+
+8-byte `0x11` filler, then **48-byte records**:
+
+```
++0  u32 11    +4  u32 11    +8  u32 name hash   +12 u32 0
++16 f32 X     +20 f32 Y     +24 f32 Z           +28 f32 0
++32 u32 hash  +36 u32 track id (4000 = freeroam) +40 char[4] tag  +44 u32 0
+```
+
+18 markers per race event, 32 for freeroam (id 4000) — start/finish and
+checkpoint anchors, not barriers.
+
+### Race barriers — no barrier chunk exists (**measured, Phase 71**)
+
+A recursive chunk census of `TRACKS/L4R*.BUN`,
+`GLOBAL/InGame{FreeRoam,Race,Drift,Drag}.bun` and every `ROUTES<REG>` file finds
+**no blockade/barrier instance chunk** — in particular `0x0003410B` is not
+present in any shipped file. Road closure is expressed as **omission**: the
+event's route network simply does not contain the side streets. The engine
+therefore derives barrier placement (`world_set_mode` in `src/world.c`) as the
+links where the freeroam graph leaves the active event's corridor. Measured for
+event 4001: 341 corridor nodes, **24 barriers, 103 directed links masked**.
+
 ## Engine sound banks (`SOUND/ENGINE/CAR_*_ENG_MB_SPU.abk`)
 
 EA "Ginsu" engine audio: per-car banks of RPM-band loops. Header `ABKC`;

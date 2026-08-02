@@ -11,6 +11,12 @@
 
 #define WORLD_MAXREG 16
 #define WORLD_MAXDIST 24
+#define WORLD_MAXEVENT 128
+#define WORLD_MAXBARRIER 2048
+#define WORLD_EVPOLY 33
+
+/* WEvent / WBarrier / MODE_* live in debug.h so the ImGui panel can read them
+ * without pulling in GL — same reason ScriptedDef does. */
 
 /* A district = one connected component of the drivable nav graph (Phase 68).
  *
@@ -56,6 +62,17 @@ typedef struct {
     int   *navedge;    /* nnavedge * 2 node indices */
     int    nnavedge;
     float  navbb[4];   /* x0,x1,y0,y1 over all nodes, for map framing */
+    int   *adjstart;   /* CSR adjacency over the welded graph: nnav+1 offsets */
+    int   *adjlist;    /* neighbour node indices */
+    int    nadj;
+    /* --- race events vs freeroam (Phase 71) --- */
+    WEvent ev[WORLD_MAXEVENT]; int nev;
+    int   *navev;      /* event index that contributed each nav node, -1 = none */
+    char  *navopen;    /* 1 = node is inside the active corridor (all 1 in freeroam) */
+    WBarrier bar[WORLD_MAXBARRIER]; int nbar;
+    int    mode;       /* MODE_FREEROAM / MODE_RACE_EVENT */
+    int    active_ev;  /* index into ev[], -1 in freeroam */
+    int    nmasked;    /* directed CSR links disabled by the active barriers */
 } World;
 
 /* Load the navigation graph for the loaded regions from TRACKS/ROUTES<REGION>/
@@ -73,6 +90,49 @@ int world_build_districts(World *w);
 
 /* District of the nav node nearest (x,y) within maxdist, else -1. */
 int world_district_at(const World *w, float x, float y, float maxdist);
+
+/* Canonical district display names. The 2-letter codes are the artists' own
+ * (read from the TRN_ asset names); the human names below were supplied by the
+ * project owner from the in-game world map as EXTERNAL ground truth -- they are
+ * NOT derived from the shipped files, which bind those strings to no
+ * coordinates (see the LANGUAGES audit in Phase 66). */
+const char *world_district_name(const char *tok);
+
+/* Index of the nav node nearest (x,y), or -1 if the graph is empty. */
+int world_nav_nearest(const World *w, float x, float y);
+
+/* A* over the welded nav graph. Writes the node-index path (start..goal) into
+ * out[] and the route length in metres into *outdist. Returns the node count,
+ * 0 if unreachable. */
+int world_route(const World *w, int start, int goal, int *out, int cap, float *outdist);
+
+/* Parse the shipped race-event catalog for the loaded regions (Phase 71).
+ *
+ * DATA-FIRST: the split between freeroam and races is the game's own, not ours.
+ * Every TRACKS/ROUTES<REG>/Paths<id>.bin holds three race-only leaves (0x34148
+ * racing line, 0x34149, 0x3414c catalog) on top of the two leaves that are
+ * BYTE-IDENTICAL in every file of a region (0x3414a, 0x3414d — the shared
+ * freeroam network). PathsFreeRoam.bin carries only the shared pair. So a race
+ * event IS a per-event route network laid over the common city.
+ *
+ * 0x3414c is that region's event catalog: 272-byte records,
+ *   +0 u16 event id   +2 u8 outline point count   +3 u8 circuit flag
+ *   +4 u8 flag        +5 u8 length hint (x100 m)  +6 u16 pad
+ *   +8 33 * (f32 x, f32 y) track-outline polygon, closed (pts[n-1] == pts[0]).
+ * Returns the event count. Call before world_load_nav so it can tag nodes. */
+int world_load_events(World *w, const char *troot);
+
+/* Switch the engine between freeroam and a race event (evidx into w->ev, or -1).
+ *
+ * In MODE_RACE_EVENT the drivable graph is masked to the event's own corridor
+ * and every link that leaves it becomes a barrier — that is the road closure
+ * the neon blockades represent, derived from the event's shipped route network
+ * rather than from hand-placed coordinates. Returns the barrier count. */
+int world_set_mode(World *w, int mode, int evidx);
+
+/* Push the car circle (centre pos[3], radius r) back inside the corridor if it
+ * has crossed an active race barrier. No-op in freeroam. Returns 1 if it pushed. */
+int world_barrier_push(const World *w, float *pos, float r);
 
 /* Load trackname ("ALL" = every STREAM*.BUN under troot, else one region)
  * into w->scene. Builds per-mesh bounds and the ground grid. Returns the
