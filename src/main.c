@@ -959,27 +959,35 @@ int main(int argc, char **argv) {
         if (race_auto) {
             if (rp_gate != world.race.next) {
                 int s = world_nav_nearest(&world, carpos[0], carpos[1]);
-                rpn = world_route(&world, s, world.race.gate[world.race.next].node,
-                                  rpath, 8192, NULL);
+                int gnode = world.race.gate[world.race.next].node;
+                rpn = world_route(&world, s, gnode, rpath, 8192, NULL);
+                if (rpn <= 1 && world.mode == MODE_RACE_EVENT) {
+                    /* the corridor mask can disconnect the spawn/previous node
+                       from this gate; without a route the car would beeline
+                       straight through the city. Re-route on the UNMASKED road
+                       graph (fully connected) so it always stays on asphalt. */
+                    int mode = world.mode; world.mode = MODE_FREEROAM;
+                    rpn = world_route(&world, s, gnode, rpath, 8192, NULL);
+                    world.mode = mode;
+                }
                 rp_gate = world.race.next; rp_at = 0;
             }
             const WGate *ng = &world.race.gate[world.race.next];
             float gdx = ng->x - carpos[0], gdy = ng->y - carpos[1];
-            float gnear = gdx*gdx + gdy*gdy;
             float dx, dy;
-            if (gnear < 9.0f*9.0f) {
+            if (gdx*gdx + gdy*gdy < 9.0f*9.0f) {
                 /* almost on the gate: drive straight through on the current
-                   heading. The approach direction IS the crossing direction, so
-                   this always punches across the line — no stalling on the node
-                   and no limit-cycle between closely-spaced gates. */
+                   heading so the crossing always registers (no node stalling). */
                 dx = cosf(heading); dy = sinf(heading);
             } else {
                 float tx = ng->x, ty = ng->y;
                 if (rpn > 1) {                     /* follow the A* route in */
+                    /* hug each node (advance at 3 m) so the aim tracks the road
+                       polyline rather than cutting toward the distant gate */
                     if (rp_at < rpn - 1) {
                         float ax = world.nav[rpath[rp_at]*2]   - carpos[0];
                         float ay = world.nav[rpath[rp_at]*2+1] - carpos[1];
-                        if (ax*ax + ay*ay < 64.0f) rp_at++;
+                        if (ax*ax + ay*ay < 9.0f) rp_at++;
                     }
                     tx = world.nav[rpath[rp_at]*2]; ty = world.nav[rpath[rp_at]*2+1];
                 }
@@ -992,12 +1000,11 @@ int main(int argc, char **argv) {
                 heading = atan2f(dy, dx);
                 speed = step * 60.0f;
             }
-            /* clamp Z to the nearest road/terrain surface, but ease into it so a
-               gap in an elevated deck descends smoothly instead of teleporting */
+            /* clamp Z to the nearest road/terrain surface, eased so a gap in an
+               elevated deck descends smoothly instead of teleporting */
             { float gz = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
               float dz = gz - carpos[2];
-              float lim = 1.5f;                       /* max Z change per frame */
-              if (dz >  lim) dz =  lim; if (dz < -lim) dz = -lim;
+              if (dz >  1.5f) dz =  1.5f; if (dz < -1.5f) dz = -1.5f;
               carpos[2] += dz; }
             world_race_update(&world, carpos[0], carpos[1]);
         }
