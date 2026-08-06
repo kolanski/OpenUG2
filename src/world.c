@@ -81,7 +81,8 @@ static int world_dedup(World *w) {
 
     int wr = 0;
     for (int i = 0; i < nm; i++) {
-        if (drop[i]) { free(s->meshes[i].verts); free(s->meshes[i].idx); continue; }
+        if (drop[i]) { free(s->meshes[i].verts); free(s->meshes[i].idx);
+                       free(s->meshes[i].vcol); continue; }
         if (wr != i) s->meshes[wr] = s->meshes[i];
         wr++;
     }
@@ -203,7 +204,10 @@ int world_load(World *w, const char *troot, const char *trackname) {
                regs[r], g->len >> 20, g->mesh1 - g->mesh0, ntk);
     }
 
-    /* strip coplanar duplicates before anything downstream sees the scene */
+    /* strip coplanar duplicates before anything downstream sees the scene.
+       This handles the overlapping-superset bundles under --track ALL: the 8
+       bundles re-ship the same tiles byte-identically, so the exact key
+       (texkey,bbox,tri,vert) fuses them to one clean layer (residual == 0). */
     world_dedup(w);
 
     /* Terrain/road de-fighting (Phase 73.5). The paved ROAD strips and the

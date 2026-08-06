@@ -16,19 +16,21 @@
 
 static const char *VS =
     GLSL_HEADER
-    "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor;\n"
+    "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
     "uniform mat4 uMVP; varying vec2 vUV; varying vec3 vN; varying float vDepth;\n"
-    "varying vec3 vPos;\n"
+    "varying vec3 vPos; varying vec4 vColor;\n"
     /* clip.w == view-space depth under a perspective projection, for world
        (P*V) and car (P*V*M) alike — no view matrix or extra uniforms needed.
        NDC-drawn HUD quads have w==1, so fog leaves them alone. */
-    "void main(){ vUV=aUV; vN=aNor; vPos=aPos; gl_Position=uMVP*vec4(aPos,1.0);\n"
-    "  vDepth=gl_Position.w; }\n";
+    "void main(){ vUV=aUV; vN=aNor; vPos=aPos; vColor=aColor;\n"
+    "  gl_Position=uMVP*vec4(aPos,1.0); vDepth=gl_Position.w; }\n";
 
 static const char *FS =
     GLSL_HEADER
     "varying vec2 vUV; varying vec3 vN; varying float vDepth; varying vec3 vPos;\n"
+    "varying vec4 vColor;\n"
     "uniform sampler2D uTex;\n"
+    "uniform float uVColor;\n"   /* 0..1: apply the source per-vertex prelight */
     "uniform float uUseTex; uniform vec3 uColor; uniform float uUnlit; uniform float uAlpha; uniform float uSoft; uniform float uSpec; uniform float uDecal;\n"
     "uniform float uAmbient; uniform float uDiffuse; uniform vec3 uLight;\n"
     "uniform vec3 uFogColor; uniform float uFogDensity;\n"
@@ -95,6 +97,12 @@ static const char *FS =
     "  float sp = pow(max(dot(reflect(-L,N), V), 0.0), uGloss)*uSpec;\n"
     "  float rim = pow(1.0-abs(N.z), 3.0)*uSpec*0.4;\n"        /* fresnel-ish edge sheen */
     "  vec3 lit = base*d*1.35 + sp + rim;\n"
+    /* per-vertex prelight (world geometry): the source stores baked AO/lighting
+       and terrain tint in the vertex colour. MODULATE2X (0.5 == neutral) is the
+       PS2/RenderWare convention, so building bases darken, terrain gets its
+       grass/dirt variation back, and the flat "cardboard" look goes away. Gated
+       by uVColor so cars/props (which don't carry it) are untouched. */
+    "  if(uVColor>0.001) lit = mix(lit, lit*clamp(vColor.rgb*2.0, 0.0, 1.6), uVColor);\n"
     /* environment reflection (cars only, uEnv>0): a procedural night-city
        sphere — dark ground, warm city-glow horizon band, dim blue sky —
        sampled with the model-space reflection vector, fresnel-weighted.
@@ -210,6 +218,7 @@ RProg render_program(void) {
     glBindAttribLocation(r.prog, 0, "aPos");
     glBindAttribLocation(r.prog, 1, "aUV");
     glBindAttribLocation(r.prog, 2, "aNor");
+    glBindAttribLocation(r.prog, 3, "aColor");
     glLinkProgram(r.prog); glUseProgram(r.prog);
     r.uMVP     = glGetUniformLocation(r.prog, "uMVP");
     r.uUseTex  = glGetUniformLocation(r.prog, "uUseTex");
@@ -227,6 +236,7 @@ RProg render_program(void) {
     r.uAmbient = glGetUniformLocation(r.prog, "uAmbient");
     r.uDiffuse = glGetUniformLocation(r.prog, "uDiffuse");
     r.uLight   = glGetUniformLocation(r.prog, "uLight");
+    r.uVColor  = glGetUniformLocation(r.prog, "uVColor");
     r.uGloss   = glGetUniformLocation(r.prog, "uGloss");
     r.uFlipN   = glGetUniformLocation(r.prog, "uFlipN");
     r.uRimTint = glGetUniformLocation(r.prog, "uRimTint");
@@ -313,6 +323,9 @@ static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
             o->pos[0]=p[0]; o->pos[1]=p[1]; o->pos[2]=p[2];
             o->uv[0]=p[3];  o->uv[1]=p[4];
             o->normal[0]=nor[v*3]; o->normal[1]=nor[v*3+1]; o->normal[2]=nor[v*3+2];
+            if (m->vcol) { o->col[0]=m->vcol[v*4]; o->col[1]=m->vcol[v*4+1];
+                           o->col[2]=m->vcol[v*4+2]; o->col[3]=m->vcol[v*4+3]; }
+            else { o->col[0]=o->col[1]=o->col[2]=o->col[3]=255; }  /* neutral */
             for (int c = 0; c < 3; c++) {
                 if (p[c] < mn[c]) mn[c] = p[c];
                 if (p[c] > mx[c]) mx[c] = p[c];
@@ -415,6 +428,8 @@ void draw_batch(const N2Batch *b) {
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(BatchedVertex), (void*)12);
     glEnableVertexAttribArray(2);
     glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(BatchedVertex), (void*)20);
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(BatchedVertex), (void*)32);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
     glDrawElements(GL_TRIANGLES, b->index_count, GL_UNSIGNED_SHORT, 0);
 }
@@ -510,6 +525,7 @@ GpuMesh make_quad(void) {
 }
 
 void draw_gpumesh(GpuMesh *g) {
+    glDisableVertexAttribArray(3);   /* cars carry no prelight; draw_batch left it on */
     glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5*sizeof(float), (void*)0);

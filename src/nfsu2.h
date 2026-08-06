@@ -17,6 +17,9 @@ enum { N2_ROAD = 0, N2_TERRAIN = 1, N2_OTHER = 2, N2_SKY = 3, N2_GLOW = 4,
        N2_CAR_TIRE = 13, N2_CAR_MISC = 14, N2_CAR_BRAKELIGHT = 15, N2_CAR_MECH = 16 };
 typedef struct {
     float   *verts;   /* 5 floats per vertex: pos.xyz, uv */
+    unsigned char *vcol; /* 4 bytes/vertex: RGBA prelight from the source stream
+                            (world meshes, 24B stride, colour @ off 12). NULL for
+                            car meshes and any stream without it. */
     int      nverts;
     uint16_t *idx;
     int      nidx;
@@ -214,6 +217,10 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
     N2Mesh m; memset(&m, 0, sizeof(m));
     m.cat = cat; m.texkey = texkey; m.nverts = n;
     m.verts = (float *)malloc(n * 5 * sizeof(float));
+    /* World stream (24B stride) packs an RGBA8 prelight colour between position
+       and UV (pos@0, colour@12, uv@16). Car stream (36B) has no such slot. */
+    int coloff = (stride == 24) ? 12 : -1;
+    if (coloff >= 0) m.vcol = (unsigned char *)malloc((size_t)n * 4);
     for (int i = 0; i < n; i++) {
         float px, py, pz;
         memcpy(&px, rec+i*stride,   4);
@@ -225,6 +232,7 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
             m.verts[i*5+2] = px*mtx[2]+py*mtx[6]+pz*mtx[10]+mtx[14];
         } else { m.verts[i*5+0]=px; m.verts[i*5+1]=py; m.verts[i*5+2]=pz; }
         memcpy(m.verts + i*5 + 3, rec + i*stride + uvoff, 8);
+        if (m.vcol) memcpy(m.vcol + i*4, rec + i*stride + coloff, 4);
     }
     /* the index leaf carries the same 0x11 filler prefix as the vertex leaf
        (as whole 0x1111 u16 words). Skipping it is essential: when the filler is
@@ -254,7 +262,7 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
             m.idx[m.nidx++] = a; m.idx[m.nidx++] = b; m.idx[m.nidx++] = c;
         }
     }
-    if (m.nidx == 0) { free(m.verts); free(m.idx); return; }
+    if (m.nidx == 0) { free(m.verts); free(m.idx); free(m.vcol); return; }
     n2_push_mesh(scene, m);
 }
 
@@ -362,6 +370,16 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
             int cat = n2_mesh_category(d, ds, ds + size);
             char anm[40]; n2_mesh_name(d, ds, ds + size, anm, sizeof anm);
             int sc = n2_scen_class(anm);
+            /* PAN_ objects are panorama vista impostors: huge flat backdrop
+               billboards (spans to ~4300, placed at the map edge / below ground,
+               Z down to -955) that retail draws only as a far horizon ring. Drawn
+               as solid world geometry they loom through the city as giant angled
+               planes -- the "scattered planes / explosion". The buildings and
+               terrain they back are placed correctly (verified: transformed
+               centroids form the coherent city that matches the nav graph), so
+               cull only the impostors. ponytail: cull, not a backdrop-ring pass --
+               re-add far-plane billboards if the empty horizon ever matters. */
+            if (!strncmp(anm, "PAN", 3)) { o = ds + size; continue; }
             uint32_t tk = n2_mesh_texkey_cat(d, ds, ds + size, cat, keys, nkeys);
             float objm[16]; n2_obj_matrix(d, ds, ds + size, objm);   /* world placement */
             N2Leaf vtx[64], idx[64]; int nv = 0, ni = 0;

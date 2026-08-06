@@ -78,6 +78,7 @@ typedef struct {
 
     /* --- lighting (fed to the shader as uniforms) --- */
     float ambient, diffuse, body_spec;
+    float vcolor;   /* 0..1 strength of world per-vertex prelight (baked AO/tint) */
     float fog_density;          /* exp^2 fog: f = exp(-(depth*density)^2) */
     float fog_r, fog_g, fog_b;  /* fog + sky-clear colour (kept identical) */
 

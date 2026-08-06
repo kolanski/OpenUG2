@@ -33,7 +33,9 @@ typedef struct {
     float pos[3];
     float uv[2];
     float normal[3];
-} BatchedVertex;              /* 32 B, interleaved */
+    unsigned char col[4];     /* per-vertex RGBA prelight from the source stream
+                                 (baked AO/lighting + terrain tint); 255=neutral */
+} BatchedVertex;              /* 36 B, interleaved */
 
 typedef struct {
     GLuint vbo;               /* unified interleaved VBO */
@@ -51,6 +53,7 @@ typedef struct {
     GLuint prog;
     GLint uMVP, uUseTex, uColor, uUnlit, uAlpha, uSoft, uSpec, uAmbient, uDiffuse,
           uLight,   /* sun direction in the CURRENT object's model space */
+          uVColor,  /* 0..1 strength of per-vertex prelight (world geometry only) */
           uDecal,   /* 1 = texture is an alpha-masked decal over uColor paint */
           uFogColor, uFogDensity,   /* exp^2 distance fog (matches the sky) */
           uCamPos,  /* camera in the current object's model space */

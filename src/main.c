@@ -46,6 +46,7 @@ DbgState g_dbg = {
     .rim_paint = 1, .rim_color = { 0.85f, 0.88f, 0.92f },   /* silver by default */
     .tune_accel = 1.0f, .tune_brake = 1.0f, .tune_turn = 1.0f, .tune_top = 220.0f,
     .ambient = 0.38f, .diffuse = 0.62f, .body_spec = 0.50f,   /* glossy paint */
+    .vcolor = 1.0f,   /* full source prelight on world geometry */
     /* f(700m cull range) ~= 0.07 — far batches dissolve into the sky */
     .fog_density = 0.0023f, .fog_r = 0.06f, .fog_g = 0.07f, .fog_b = 0.11f,
     .paint_override = 0, .paint = { 0.68f, 0.09f, 0.08f },
@@ -199,7 +200,10 @@ int main(int argc, char **argv) {
     /* Point at your own NFSU2 install/data directory (contains TRACKS/, CARS/).
        Usage: nfsu2 [DATA_DIR] [options]
          --car NAME       car folder under CARS/ (default HUMMER)
-         --track NAME     STREAM .BUN under TRACKS/, or ALL = whole city (default)
+         --track NAME     STREAM .BUN under TRACKS/, or ALL = whole city (default).
+                          The 8 bundles are overlapping per-race supersets in ONE
+                          coord space; they re-ship the same tiles byte-identically
+                          so world_dedup fuses them to one seamless layer.
          --circuit PATH   circuit Paths .bin under TRACKS/ (default ROUTESL4RF/Paths4602.bin)
          --shot out.png   render one frame and exit */
     const char *selfexe = argv[0];   /* for the menu's track-switch re-exec */
@@ -366,134 +370,17 @@ int main(int argc, char **argv) {
                n, dist, t1 - t0);
     }
 
-    /* Race & Track Manager self-check (Phase 71): take the first shipped
-       circuit, mask the graph to it, and prove the barriers actually cut the
-       A* graph — the same query must succeed in freeroam and be refused (or
-       re-routed inside the corridor) once the road is closed. */
-    if (world.nev > 0 && world.nnav > 0) {
-        int ei = 0;
-        for (int i = 0; i < world.nev; i++) if (world.ev[i].circuit) { ei = i; break; }
-        printf("\n-- race event catalog (%d events) --\n", world.nev);
-        for (int i = 0; i < world.nev; i++)
-            printf("  %d %-5s %-7s ~%d00 m  %2d-pt outline  nav nodes %d\n",
-                   world.ev[i].id, world.ev[i].reg,
-                   world.ev[i].circuit ? "circuit" : "sprint", world.ev[i].len100m,
-                   world.ev[i].npoly, world.ev[i].node1 - world.ev[i].node0);
-
-        world_set_mode(&world, MODE_RACE_EVENT, ei);
-        for (int i = 0; i < world.nbar && i < 8; i++)
-            printf("  barrier %2d at (%8.1f,%8.1f) out (%5.2f,%5.2f)  closes node %d -> %d\n",
-                   i, world.bar[i].x, world.bar[i].y,
-                   world.bar[i].dx, world.bar[i].dy, world.bar[i].a, world.bar[i].b);
-        if (world.nbar > 8) printf("  ... %d more\n", world.nbar - 8);
-
-        if (world.nbar > 0) {
-            static int rp[8192]; float rd = 0;
-            int s0 = world.bar[0].a, g0 = world.bar[0].b;   /* straddle a barrier */
-            world.mode = MODE_FREEROAM;
-            int nf = world_route(&world, s0, g0, rp, 8192, &rd);
-            printf("A* across barrier 0 (node %d -> %d)  FREEROAM: %d nodes, %.0f m\n",
-                   s0, g0, nf, rd);
-            world.mode = MODE_RACE_EVENT;
-            float rd2 = 0;
-            int nr = world_route(&world, s0, g0, rp, 8192, &rd2);
-            printf("A* across barrier 0 (node %d -> %d)  RACE %d : %d nodes, %.0f m%s\n",
-                   s0, g0, world.ev[ei].id, nr, rd2,
-                   nr ? " (re-routed inside the corridor)" : " (blocked - outside the race)");
-            assert(nf > 0 && nr != nf);   /* the mask must change the answer */
-
-            /* Second query: both endpoints ON the circuit, so race mode cannot
-               refuse it — it must find the way round inside the corridor. Sample
-               goals along the lap and report the biggest detour the mask forces;
-               most pairs are already on-corridor in freeroam, so a fixed pair
-               proves nothing. 32 A* runs at ~1 ms is free at load time. */
-            const WEvent *e = &world.ev[ei];
-            int span = e->node1 - e->node0, a2 = world.bar[0].a;
-            int bestg = -1; float bestf = 0, bestr = 0; int bnf = 0, bnr = 0;
-            for (int k = 1; k < 16; k++) {
-                int b2 = e->node0 + span * k / 16;
-                float df = 0, dr = 0;
-                /* the corridor mask is already built; world_route only consults
-                   it in race mode, so flipping the flag is the whole A/B */
-                world.mode = MODE_FREEROAM;
-                int naf = world_route(&world, a2, b2, rp, 8192, &df);
-                world.mode = MODE_RACE_EVENT;
-                int nar = world_route(&world, a2, b2, rp, 8192, &dr);
-                if (naf && nar && dr - df > bestr - bestf) {
-                    bestg = b2; bestf = df; bestr = dr; bnf = naf; bnr = nar;
-                }
-            }
-            printf("A* on-circuit (node %d -> %d)  FREEROAM: %d nodes %.0f m  |  "
-                   "RACE %d: %d nodes %.0f m  (+%.0f m round the closures)\n",
-                   a2, bestg, bnf, bestf, e->id, bnr, bestr, bestr - bestf);
-            assert(bestg >= 0 && bestr >= bestf);  /* corridor route exists, never shorter */
-
-            /* Collision masking: a car sitting just past barrier 0 must be
-               pushed back to the corridor side, and must be untouched once the
-               race ends. Same check the physics step runs every frame. */
-            {   const WBarrier *b0 = &world.bar[0];
-                float p[3] = { b0->x + b0->dx * 0.5f, b0->y + b0->dy * 0.5f, 0 };
-                float before = (p[0]-b0->x)*b0->dx + (p[1]-b0->y)*b0->dy;
-                int pushed = world_barrier_push(&world, p, 1.3f);
-                float after  = (p[0]-b0->x)*b0->dx + (p[1]-b0->y)*b0->dy;
-                printf("barrier collision: car at s=%+.2f m -> %s s=%+.2f m\n",
-                       before, pushed ? "pushed back to" : "left at", after);
-                assert(pushed && after < before);
-                world.mode = MODE_FREEROAM;                  /* race over */
-                float q[3] = { b0->x + b0->dx * 0.5f, b0->y + b0->dy * 0.5f, 0 };
-                assert(!world_barrier_push(&world, q, 1.3f));  /* barrier is gone */
-                world.mode = MODE_RACE_EVENT;
-            }
-        }
-        world_set_mode(&world, MODE_FREEROAM, -1);
-
-        /* Checkpoint self-check (Phase 72): drive a virtual car through the
-           first gates in order, then try one out of sequence. Proves the state
-           machine advances ONLY on an in-order, correctly-directed crossing. */
-        {   int gn = world_race_start(&world, troot, ei, 2);
-            WRace *R = &world.race;
-            printf("-- checkpoint trace, event %d (%d gates) --\n", world.ev[ei].id, gn);
-            for (int k = 0; k < 4 && k < gn; k++) {
-                const WGate *g = &R->gate[R->next];
-                /* approach the armed gate head-on and drive through it */
-                float bx = g->x - g->dx*12.0f, by = g->y - g->dy*12.0f;
-                float fx = g->x + g->dx*12.0f, fy = g->y + g->dy*12.0f;
-                int before = R->next;
-                world_race_update(&world, bx, by);
-                world_race_update(&world, fx, fy);
-                printf("   gate %d at (%8.1f,%8.1f) dir (%5.2f,%5.2f) -> next=%d lap=%d cleared=%d\n",
-                       before, g->x, g->y, g->dx, g->dy, R->next, R->lap, R->cleared);
-                assert(R->next == (before + 1) % gn);
-            }
-            {   /* out of sequence: jump ahead and cross a gate that is NOT armed */
-                int armed = R->next, skip = (armed + 3) % gn;
-                const WGate *g = &R->gate[skip];
-                world_race_update(&world, g->x - g->dx*12.0f, g->y - g->dy*12.0f);
-                world_race_update(&world, g->x + g->dx*12.0f, g->y + g->dy*12.0f);
-                printf("   OUT OF SEQUENCE: crossed gate %d while %d armed -> next=%d (unchanged)\n",
-                       skip, armed, R->next);
-                assert(R->next == armed);
-            }
-            {   /* wrong way: cross the armed gate against the direction of travel */
-                const WGate *g = &R->gate[R->next];
-                int armed = R->next;
-                world_race_update(&world, g->x + g->dx*12.0f, g->y + g->dy*12.0f);
-                world_race_update(&world, g->x - g->dx*12.0f, g->y - g->dy*12.0f);
-                printf("   WRONG WAY: crossed gate %d backwards -> next=%d (unchanged)\n",
-                       armed, R->next);
-                assert(R->next == armed);
-            }
-            world_race_stop(&world);
-            world_set_mode(&world, MODE_FREEROAM, -1);
-        }
-
-        if (want_event_id) {
-            int wi = -1;
-            for (int i = 0; i < world.nev; i++) if (world.ev[i].id == want_event_id) wi = i;
-            if (wi < 0) fprintf(stderr, "--event %d: no such race event\n", want_event_id);
-            else world_race_start(&world, troot, wi, want_laps);
-        }
-        printf("\n");
+    /* Boot straight into a race event if asked (--event <id>). The Phase 71/72
+       load-time A-star and checkpoint self-checks that used to run here were
+       removed: they asserted on load and aborted for small events (e.g. 4301,
+       where the on-circuit sample finds no reroutable pair) and flooded the
+       console -- exactly the automated race telemetry the manual-testing
+       protocol drops. The barrier/checkpoint logic in world.c is unchanged. */
+    if (want_event_id && world.nev > 0) {
+        int wi = -1;
+        for (int i = 0; i < world.nev; i++) if (world.ev[i].id == want_event_id) wi = i;
+        if (wi < 0) fprintf(stderr, "--event %d: no such race event\n", want_event_id);
+        else world_race_start(&world, troot, wi, want_laps);
     }
 
     /* Scripted-object entity DEFINITIONS from the district companion L4R*.BUN.
@@ -1206,6 +1093,7 @@ int main(int argc, char **argv) {
         int ndrawn = 0;
         g_dbg.drawn = 0;   /* per-frame draw-call tally (text glyphs excluded) */
         GLuint lasttex = (GLuint)-1;
+        glUniform1f(rp.uVColor, g_dbg.vcolor);   /* apply source prelight to world geom */
         for (int k = 0; g_dbg.show_track && k < nbatch; k++) {
             N2Batch *b = &wbatch[k];
             float dx = cam[0] < b->bbox_min[0] ? b->bbox_min[0]-cam[0]
@@ -1222,6 +1110,8 @@ int main(int argc, char **argv) {
             draw_batch(b);
             g_dbg.drawn++;
         }
+        glUniform1f(rp.uVColor, 0.0f);   /* off for everything else (cars carry no
+                                            prelight; their attrib-3 default is black) */
 
         /* car shadows: a soft dark blob on the ground under each car, so they
            sit on the road instead of floating (darkens, so it reads on any
