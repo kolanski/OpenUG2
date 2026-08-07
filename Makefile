@@ -25,8 +25,8 @@ else
 endif
 
 # engine modules (see docs/INIT.md): orchestrator + Renderer/Physics/AI/Audio/Resources
-SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c
-HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h
+SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_mesh.c
+HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world_mesh.h
 
 nfsu2: $(SRC) $(HDRS)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(SRC) -o nfsu2 $(SDL_LIBS) $(GL_LIBS) -lz -lm
