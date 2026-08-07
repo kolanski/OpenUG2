@@ -207,7 +207,7 @@ int main(int argc, char **argv) {
          --circuit PATH   circuit Paths .bin under TRACKS/ (default ROUTESL4RF/Paths4602.bin)
          --shot out.png   render one frame and exit */
     const char *selfexe = argv[0];   /* for the menu's track-switch re-exec */
-    const char *dataroot = ".", *shot = NULL;
+    const char *dataroot = ".", *shot = NULL, *objdump = NULL;
     const char *carname = "HUMMER", *trackname = "ALL";
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
@@ -221,6 +221,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--laps")    && i+1 < argc) want_laps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--track")   && i+1 < argc) trackname = argv[++i];
         else if (!strcmp(argv[i], "--circuit") && i+1 < argc) { circuit = argv[++i]; explicit_circuit = 1; }
+        else if (!strcmp(argv[i], "--objdump") && i+1 < argc) objdump = argv[++i];
         else dataroot = argv[i];
     }
     char carp[1024], cartexp[1024], pathp[1024], troot[1024];
@@ -231,6 +232,37 @@ int main(int argc, char **argv) {
 
     static World world;
     int nm = world_load(&world, troot, trackname);
+
+    /* --objdump: write the exact post-dedup, world-space scene the GPU batches
+       are built from to a .obj, then exit. Independent parser-vs-renderer check:
+       if this opens coherent in Blender/MeshLab, the assembly is sound and any
+       on-screen mangling is strictly the GL path or camera. Runs before any GL. */
+    if (objdump) {
+        FILE *of = fopen(objdump, "w");
+        if (!of) { fprintf(stderr, "objdump: cannot write %s\n", objdump); return 1; }
+        const N2Scene *s = &world.scene;
+        fprintf(of, "# OpenUG scene export  track=%s  meshes=%d (post-dedup, world space)\n",
+                trackname, s->count);
+        long base = 1, tv = 0, tf = 0;   /* OBJ is 1-indexed */
+        for (int mi = 0; mi < s->count; mi++) {
+            const N2Mesh *m = &world.scene.meshes[mi];
+            fprintf(of, "o m%d_%.31s\n", mi, m->sname[0] ? m->sname : "mesh");
+            for (int v = 0; v < m->nverts; v++) {
+                const float *p = m->verts + v*5;
+                fprintf(of, "v %.3f %.3f %.3f\n", p[0], p[1], p[2]);
+                fprintf(of, "vt %.4f %.4f\n", p[3], p[4]);
+            }
+            for (int t = 0; t + 2 < m->nidx; t += 3) {
+                long a = base + m->idx[t], b = base + m->idx[t+1], c = base + m->idx[t+2];
+                fprintf(of, "f %ld/%ld %ld/%ld %ld/%ld\n", a,a, b,b, c,c);
+            }
+            base += m->nverts; tv += m->nverts; tf += m->nidx/3;
+        }
+        fclose(of);
+        printf("objdump: wrote %s  (%ld verts, %ld tris, %d meshes)\n",
+               objdump, tv, tf, s->count);
+        return 0;
+    }
     if (!nm) { fprintf(stderr, "no track data\n  (pass your NFSU2 data dir: nfsu2 /path/to/data)\n"); return 1; }
     N2Scene scene = world.scene;   /* shares world.scene.meshes */
     printf("loaded %d submeshes from %d region(s)\n", nm, world.nreg);
