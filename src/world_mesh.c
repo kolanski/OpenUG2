@@ -115,15 +115,52 @@ static GLuint wm_compile(GLenum type, const char *src) {
     }
     return s;
 }
+/* Embedded fallbacks — kept byte-for-byte in sync with world_debug_120.vert/.frag
+   so the binary runs from any CWD when the source files aren't found on disk. */
+static const char *WORLD_DEBUG_VS_120 =
+    "#version 120\n"
+    "attribute vec3 a_Position;\n"
+    "attribute vec3 a_Normal;\n"
+    "attribute vec2 a_UV0;\n"
+    "attribute vec4 a_Color;\n"
+    "uniform mat4 u_MVP;\n"
+    "varying vec3 v_Normal;\n"
+    "varying vec2 v_UV0;\n"
+    "varying vec4 v_Color;\n"
+    "void main() {\n"
+    "    v_Normal    = a_Normal;\n"
+    "    v_UV0       = a_UV0;\n"
+    "    v_Color     = a_Color;\n"
+    "    gl_Position = u_MVP * vec4(a_Position, 1.0);\n"
+    "}\n";
+static const char *WORLD_DEBUG_FS_120 =
+    "#version 120\n"
+    "varying vec3 v_Normal;\n"
+    "varying vec2 v_UV0;\n"
+    "varying vec4 v_Color;\n"
+    "uniform int u_DebugMode;\n"
+    "void main() {\n"
+    "    if (u_DebugMode == 1) {\n"
+    "        gl_FragColor = vec4(normalize(v_Normal) * 0.5 + 0.5, 1.0);\n"
+    "    } else if (u_DebugMode == 2) {\n"
+    "        gl_FragColor = vec4(0.85, 0.85, 0.90, 1.0);\n"
+    "    } else {\n"
+    "        gl_FragColor = vec4(v_Color.rgb, 1.0);\n"
+    "    }\n"
+    "}\n";
+
 GLuint world_debug_program_load(const char *vert_path, const char *frag_path) {
-    char *vsrc = wm_read_text(vert_path), *fsrc = wm_read_text(frag_path);
-    if (!vsrc || !fsrc) {
-        fprintf(stderr, "world_debug: cannot read %s / %s\n", vert_path, frag_path);
-        free(vsrc); free(fsrc); return 0;
-    }
+    /* Prefer on-disk files (live-editable during dev); fall back per-shader to
+       the embedded source so the binary works from any working directory. */
+    char *vfile = wm_read_text(vert_path), *ffile = wm_read_text(frag_path);
+    const char *vsrc = vfile ? vfile : WORLD_DEBUG_VS_120;
+    const char *fsrc = ffile ? ffile : WORLD_DEBUG_FS_120;
+    if (!vfile) fprintf(stderr, "world_debug: %s not found, using embedded vertex shader\n", vert_path);
+    if (!ffile) fprintf(stderr, "world_debug: %s not found, using embedded fragment shader\n", frag_path);
+
     GLuint v = wm_compile(GL_VERTEX_SHADER, vsrc);
     GLuint f = wm_compile(GL_FRAGMENT_SHADER, fsrc);
-    free(vsrc); free(fsrc);
+    free(vfile); free(ffile);
     if (!v || !f) return 0;
 
     GLuint p = glCreateProgram();
