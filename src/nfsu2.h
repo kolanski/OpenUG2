@@ -202,16 +202,21 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
 
     if (cull_skybox) {
         float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
+        int bad = 0;
         for (int i = 0; i < n; i++)
             for (int c = 0; c < 3; c++) {
                 float v; memcpy(&v, rec + i*stride + c*4, 4);
+                if (v != v) bad = 1;                 /* NaN: comparisons stay false */
                 if (v < mn[c]) mn[c] = v; if (v > mx[c]) mx[c] = v;
             }
         float span = 0;
         for (int c = 0; c < 3; c++) if (mx[c]-mn[c] > span) span = mx[c]-mn[c];
         /* the skybox is dropped by material name now; keep only an absurd-span
-           safety so big city ground/buildings (thousands of units) still draw. */
-        if (span >= 60000.0f) return;
+           safety so big city ground/buildings (thousands of units) still draw.
+           Also drop meshes with a corrupt/uninitialised vertex — retail leaves a
+           few (e.g. XS_MEDIANPOLE, XS_WARN* road signs) with one NaN/1e38 coord,
+           which would otherwise spike across the map or render as GPU garbage. */
+        if (bad || span >= 60000.0f) return;
     }
 
     N2Mesh m; memset(&m, 0, sizeof(m));

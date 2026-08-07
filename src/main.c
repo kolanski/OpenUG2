@@ -201,9 +201,9 @@ int main(int argc, char **argv) {
        Usage: nfsu2 [DATA_DIR] [options]
          --car NAME       car folder under CARS/ (default HUMMER)
          --track NAME     STREAM .BUN under TRACKS/, or ALL = whole city (default).
-                          The 8 bundles are overlapping per-race supersets in ONE
-                          coord space; they re-ship the same tiles byte-identically
-                          so world_dedup fuses them to one seamless layer.
+                          The 8 region bundles share ONE coord space; world_dedup
+                          fuses the byte-identical re-ships into one seamless map.
+                          (There is no STREAMALL.BUN; ALL = every STREAM<region>.)
          --circuit PATH   circuit Paths .bin under TRACKS/ (default ROUTESL4RF/Paths4602.bin)
          --shot out.png   render one frame and exit */
     const char *selfexe = argv[0];   /* for the menu's track-switch re-exec */
