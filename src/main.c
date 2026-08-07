@@ -692,6 +692,7 @@ int main(int argc, char **argv) {
     GpuMesh quad = make_quad();
 
     glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);   /* coplanar re-draws (last write wins) pass cleanly */
     /* Stock showroom paint: metallic silver (the files carry no chosen
        colour; badges/vinyls overlay as decals). The debug pane's paint
        override still allows any colour live. */
@@ -1077,7 +1078,14 @@ int main(int argc, char **argv) {
            driving near scales with region size but is clamped so a whole-city
            maxr can't push it past the car and clip it. */
         float znear = race_state==3 ? 0.2f : (maxr*0.01f < 1.0f ? maxr*0.01f : 1.0f);
-        mat_persp(0.9f, (float)W/H, znear, maxr*30, P);
+        /* zfar used to be maxr*30 (~290000) — a ~300000:1 range that destroys
+           24-bit depth precision and z-fights coplanar surfaces (worse on GPUs
+           with a shallower depth buffer). Nothing past VIEW_DIST (700 m) is drawn,
+           so clamp the world far plane to a realistic 2000 m: znear/zfar ~= 2000:1
+           gives ample resolution. The skydome shell spans ~16 km and would clip
+           at 2000, so it gets its own deep frustum (Psky) below. */
+        float zfar = 2000.0f;
+        mat_persp(0.9f, (float)W/H, znear, zfar, P);
         mat_lookat(cam, look, V);
         mat_mul(P, V, MVP);
         glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
@@ -1091,9 +1099,10 @@ int main(int argc, char **argv) {
            the depth test alone. Falls back to nothing (flat fog clear
            colour shows through) when the region has no SKYDOME mesh. */
         if (nsky) {
-            float zero[3] = {0,0,0}, Vsky[16], MVPsky[16];
+            float zero[3] = {0,0,0}, Vsky[16], MVPsky[16], Psky[16];
             mat_lookat(zero, look, Vsky);
-            mat_mul(P, Vsky, MVPsky);
+            mat_persp(0.9f, (float)W/H, znear, maxr*30, Psky);  /* deep: dome ~16 km */
+            mat_mul(Psky, Vsky, MVPsky);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPsky);
             glUniform1f(uUnlit, 1.0f);
             glDepthMask(GL_FALSE);
