@@ -231,8 +231,10 @@ static void car_info_walk(const unsigned char *d, long beg, long end,
                 while (ip + 2 <= ib2 && ib[ip] == 0x11 && ib[ip+1] == 0x11) ip += 2;
                 tris += (ib2 - ip) / 2 / 3;
             }
-            printf("  %-34s %-10s verts=%-5ld tris=%-5ld\n",
-                   nm[0] ? nm : "(noname)", car_cat_name(c), verts, tris);
+            float M[16]; int hasM = n2_obj_matrix(d, ds, ds + s, M);
+            printf("  %-34s %-10s verts=%-5ld tris=%-5ld  mat=%d t=(%+.3f %+.3f %+.3f)\n",
+                   nm[0] ? nm : "(noname)", car_cat_name(c), verts, tris,
+                   hasM, M[12], M[13], M[14]);
             (*nobj)++; if (c >= 0 && c < 24) cat[c]++;
         } else if (m != 0 && (m >> 28) == 8) {
             car_info_walk(d, ds, ds + s, nobj, cat);
