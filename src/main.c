@@ -38,7 +38,14 @@
 DbgState g_dbg = {
     .freecam = 0, .speed = 0.6f,
     .race_maxlaps_want = 2,
-    .wheel_frontf = 0.62f, .wheel_rearf = 0.58f, .wheel_trackf = 0.76f,
+    /* front/rear fractions of the body bbox that locate the axles. Nudged up ~3%
+       from the old 0.62/0.58: those ran the wheelbase short (Peugeot 206 2.30 m
+       vs real 2.44 m, -6%), pulling both axles inboard of the arches. The
+       bbox->wheelbase ratio isn't constant across body styles, so this is a
+       fleet compromise, not a per-car fit -- measured wheelbases now: Peugeot
+       2.37 (real 2.44), Focus 2.64 (real 2.62), Golf 2.60 (real 2.57), all
+       within ~3%. Live-tunable per car in the `make debug` ImGui panel. */
+    .wheel_frontf = 0.639f, .wheel_rearf = 0.597f, .wheel_trackf = 0.76f,
     /* wheel_z 0 = hub at the body's model origin, which is exactly where every
        car's stock N2_CAR_TIRE hub centre sits (measured Z = 0.000). */
     .wheel_z = 0.0f, .wheel_scale = 1.0f,

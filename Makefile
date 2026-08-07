@@ -28,6 +28,8 @@ endif
 SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_mesh.c
 HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world_mesh.h
 
+.DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
+
 # Auto-embed the F3 debug shaders so world_mesh.c has a CWD-independent fallback
 # with no hand-maintained string copy. Relative input paths give stable array
 # names src_world_debug_120_vert / _frag (+ *_len). Regenerated when either
