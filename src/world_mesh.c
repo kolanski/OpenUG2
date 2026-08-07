@@ -1,5 +1,6 @@
 /* world_mesh.c — see world_mesh.h. Pure C99, GL 2.1, no VAO. */
 #include "world_mesh.h"
+#include "generated_world_debug_shaders.h"   /* make-embedded shader byte arrays */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,9 +104,10 @@ static char *wm_read_text(const char *path) {
     s[n] = 0; fclose(f);
     return s;
 }
-static GLuint wm_compile(GLenum type, const char *src) {
+static GLuint wm_compile(GLenum type, const char *src, GLint len) {
     GLuint s = glCreateShader(type);
-    glShaderSource(s, 1, &src, NULL);
+    const GLint *lp = (len < 0) ? NULL : &len;   /* len < 0 = NUL-terminated */
+    glShaderSource(s, 1, &src, lp);
     glCompileShader(s);
     GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) {
@@ -115,51 +117,26 @@ static GLuint wm_compile(GLenum type, const char *src) {
     }
     return s;
 }
-/* Embedded fallbacks — kept byte-for-byte in sync with world_debug_120.vert/.frag
-   so the binary runs from any CWD when the source files aren't found on disk. */
-static const char *WORLD_DEBUG_VS_120 =
-    "#version 120\n"
-    "attribute vec3 a_Position;\n"
-    "attribute vec3 a_Normal;\n"
-    "attribute vec2 a_UV0;\n"
-    "attribute vec4 a_Color;\n"
-    "uniform mat4 u_MVP;\n"
-    "varying vec3 v_Normal;\n"
-    "varying vec2 v_UV0;\n"
-    "varying vec4 v_Color;\n"
-    "void main() {\n"
-    "    v_Normal    = a_Normal;\n"
-    "    v_UV0       = a_UV0;\n"
-    "    v_Color     = a_Color;\n"
-    "    gl_Position = u_MVP * vec4(a_Position, 1.0);\n"
-    "}\n";
-static const char *WORLD_DEBUG_FS_120 =
-    "#version 120\n"
-    "varying vec3 v_Normal;\n"
-    "varying vec2 v_UV0;\n"
-    "varying vec4 v_Color;\n"
-    "uniform int u_DebugMode;\n"
-    "void main() {\n"
-    "    if (u_DebugMode == 1) {\n"
-    "        gl_FragColor = vec4(normalize(v_Normal) * 0.5 + 0.5, 1.0);\n"
-    "    } else if (u_DebugMode == 2) {\n"
-    "        gl_FragColor = vec4(0.85, 0.85, 0.90, 1.0);\n"
-    "    } else {\n"
-    "        gl_FragColor = vec4(v_Color.rgb, 1.0);\n"
-    "    }\n"
-    "}\n";
 
 GLuint world_debug_program_load(const char *vert_path, const char *frag_path) {
     /* Prefer on-disk files (live-editable during dev); fall back per-shader to
-       the embedded source so the binary works from any working directory. */
+       the make-embedded source (generated_world_debug_shaders.h, xxd byte
+       arrays -- not NUL-terminated, so pass their *_len) so the binary works
+       from any working directory. */
     char *vfile = wm_read_text(vert_path), *ffile = wm_read_text(frag_path);
-    const char *vsrc = vfile ? vfile : WORLD_DEBUG_VS_120;
-    const char *fsrc = ffile ? ffile : WORLD_DEBUG_FS_120;
-    if (!vfile) fprintf(stderr, "world_debug: %s not found, using embedded vertex shader\n", vert_path);
-    if (!ffile) fprintf(stderr, "world_debug: %s not found, using embedded fragment shader\n", frag_path);
+    const char *vsrc; GLint vlen;
+    const char *fsrc; GLint flen;
+    if (vfile) { vsrc = vfile; vlen = -1; }
+    else { vsrc = (const char *)src_world_debug_120_vert;
+           vlen = (GLint)src_world_debug_120_vert_len;
+           fprintf(stderr, "world_debug: %s not found, using embedded vertex shader\n", vert_path); }
+    if (ffile) { fsrc = ffile; flen = -1; }
+    else { fsrc = (const char *)src_world_debug_120_frag;
+           flen = (GLint)src_world_debug_120_frag_len;
+           fprintf(stderr, "world_debug: %s not found, using embedded fragment shader\n", frag_path); }
 
-    GLuint v = wm_compile(GL_VERTEX_SHADER, vsrc);
-    GLuint f = wm_compile(GL_FRAGMENT_SHADER, fsrc);
+    GLuint v = wm_compile(GL_VERTEX_SHADER, vsrc, vlen);
+    GLuint f = wm_compile(GL_FRAGMENT_SHADER, fsrc, flen);
     free(vfile); free(ffile);
     if (!v || !f) return 0;
 

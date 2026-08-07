@@ -28,7 +28,17 @@ endif
 SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_mesh.c
 HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world_mesh.h
 
-nfsu2: $(SRC) $(HDRS)
+# Auto-embed the F3 debug shaders so world_mesh.c has a CWD-independent fallback
+# with no hand-maintained string copy. Relative input paths give stable array
+# names src_world_debug_120_vert / _frag (+ *_len). Regenerated when either
+# shader changes; a build-time artifact (gitignored, not committed).
+GEN := src/generated_world_debug_shaders.h
+$(GEN): src/world_debug_120.vert src/world_debug_120.frag
+	@echo "/* AUTO-GENERATED from world_debug_120.vert/.frag by make -- do not edit */" > $@
+	@xxd -i src/world_debug_120.vert >> $@
+	@xxd -i src/world_debug_120.frag >> $@
+
+nfsu2: $(SRC) $(HDRS) $(GEN)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(SRC) -o nfsu2 $(SDL_LIBS) $(GL_LIBS) -lz -lm
 
 # Dev build with the Dear ImGui debug overlay + freecam controls (`make debug`).
@@ -49,7 +59,7 @@ build/debugui.o: src/debugui.cpp src/debug.h
 	$(CXX) -O2 $(SDL_CFLAGS) -I$(IMGUI_DIR) -c src/debugui.cpp -o $@
 
 DBG_OBJ := $(SRC:src/%.c=build/%.dbg.o)
-build/%.dbg.o: src/%.c $(HDRS)
+build/%.dbg.o: src/%.c $(HDRS) $(GEN)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -DDEBUG_UI -c $< -o $@
 
@@ -58,14 +68,14 @@ debug: $(DBG_OBJ) $(IMGUI_OBJ)
 
 # OpenGL ES 2.0 (embedded/mobile). Cross-compile e.g.:
 #   CC=aarch64-linux-gnu-gcc make gles
-gles: $(SRC) $(HDRS)
+gles: $(SRC) $(HDRS) $(GEN)
 	$(CC) $(CFLAGS) -DN2_GLES $(SDL_CFLAGS) $(SRC) -o nfsu2 $(SDL_LIBS) -lGLESv2 -lz -lm
 
 run: nfsu2
 	./nfsu2 $(DATA)
 
 clean:
-	rm -f nfsu2 *.png
+	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
 .PHONY: run gles clean debug

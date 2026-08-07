@@ -29,6 +29,7 @@ build/
 # --- Screenshots / generated ---
 *.png
 mesh_out.*
+src/generated_world_debug_shaders.h
 
 # --- Reverse-engineering scratch (Ghidra projects, clones) ---
 ghidra/
