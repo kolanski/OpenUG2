@@ -710,7 +710,11 @@ int main(int argc, char **argv) {
        ordinary car walker reads it. Each brand file holds its styles under
        STYLEnn tokens, which is the SAME token hoods use inside a car, so the
        style selector here is wheel_style_id rather than hood_style. */
+    /* NFSU first: GEOMETRY_NFSU.BIN is the game's STOCK rim set (the wheels a
+       car ships with), so it is the authentic default; the rest are the
+       aftermarket brands, still selectable in the debug panel. */
     static const char wheel_brands[][24] = {
+        "NFSU",
         "BBS","ENKEI","VOLK","OZ","MOMO","ADVAN","AVUS","KONIG",
         "LOWENHART","RACINGHART","ROTA","WORK","5ZIGEN","LEXANI"
     };
@@ -744,7 +748,7 @@ int main(int argc, char **argv) {
     if (load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
                        &wheellib, &wheelgm, &nwheelgm,
                        wtdata, wtlen, &rimtex, carWheelR))
-        printf("rims: BBS style %d, %d mesh(es)\n", wheel_style, nwheelgm);
+        printf("rims: %s style %d, %d mesh(es)\n", wheel_brands[wheel_brand], wheel_style, nwheelgm);
     else
         printf("rims: library unavailable, using procedural wheels\n");
 
