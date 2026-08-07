@@ -30,6 +30,7 @@
 #include "audio.h"
 #include "resource.h"
 #include "world.h"
+#include "world_mesh.h"   /* F3 prelight/normal/wireframe debug pipeline */
 #include "debug.h"
 
 /* debug tunables — defaults match the previously hard-coded constants, so a
@@ -758,6 +759,20 @@ int main(int argc, char **argv) {
     free(mtex);
     printf("world batched: %d meshes -> %d batches\n", nm, nbatch);
 
+    /* F3 debug pipeline: wrap the existing world VBOs/IBOs in WorldMeshBatch so
+       render_world_map can draw them with the prelight/normal/wireframe shader.
+       Shared GL handles (owned by wbatch) -> no extra VRAM, no separate upload. */
+    GLuint dbgprog = world_debug_program_load("src/world_debug_120.vert",
+                                              "src/world_debug_120.frag");
+    WorldMeshBatch *wmbatch = (WorldMeshBatch *)calloc((size_t)(nbatch > 0 ? nbatch : 1),
+                                                       sizeof *wmbatch);
+    for (int k = 0; k < nbatch; k++) {
+        wmbatch[k].vbo = wbatch[k].vbo; wmbatch[k].ibo = wbatch[k].ibo;
+        wmbatch[k].index_count = wbatch[k].index_count; wmbatch[k].chunk_id = (uint32_t)k;
+    }
+    int g_debug_mode = 0;   /* F3 cycles: 0 default, 1 prelight, 2 normals, 3 wireframe */
+    if (!dbgprog) fprintf(stderr, "world_debug shaders failed to load; F3 disabled\n");
+
     /* unit-quad for the 2D HUD (drawn in NDC via uMVP) */
     GpuMesh quad = make_quad();
 
@@ -848,6 +863,14 @@ int main(int argc, char **argv) {
                         fc[0]=cam[0]; fc[1]=cam[1]; fc[2]=cam[2];
                         fyaw = atan2f(carpos[1]-cam[1], carpos[0]-cam[0]);
                         fpitch = -0.2f;
+                    }
+                }
+                else if (k == SDLK_F3) {   /* cycle world render debug view */
+                    if (dbgprog) {
+                        g_debug_mode = (g_debug_mode + 1) & 3;
+                        static const char *dm[4] = { "default", "prelight",
+                                                     "normals", "wireframe" };
+                        printf("render mode %d: %s\n", g_debug_mode, dm[g_debug_mode]);
                     }
                 }
                 else if (k == SDLK_w && wldata) {
@@ -1203,6 +1226,7 @@ int main(int argc, char **argv) {
         #define VIEW_DIST 700.0f
         int ndrawn = 0;
         g_dbg.drawn = 0;   /* per-frame draw-call tally (text glyphs excluded) */
+        if (g_debug_mode == 0 || !dbgprog) {   /* --- default textured world pass --- */
         GLuint lasttex = (GLuint)-1;
         glUniform1f(rp.uVColor, g_dbg.vcolor);   /* apply source prelight to world geom */
         for (int k = 0; g_dbg.show_track && k < nbatch; k++) {
@@ -1223,6 +1247,14 @@ int main(int argc, char **argv) {
         }
         glUniform1f(rp.uVColor, 0.0f);   /* off for everything else (cars carry no
                                             prelight; their attrib-3 default is black) */
+        } else if (g_dbg.show_track) {   /* --- F3 debug view: prelight/normals/wire --- */
+            /* draw every world batch with the debug shader (no distance cull),
+               then restore the main program for the car/glow/HUD passes below. */
+            render_world_map(wmbatch, (uint32_t)nbatch, dbgprog, MVP, g_debug_mode - 1);
+            glUseProgram(rp.prog);
+            glUniform1f(rp.uVColor, 0.0f);
+            ndrawn += nbatch; g_dbg.drawn += nbatch;
+        }
 
         /* car shadows: a soft dark blob on the ground under each car, so they
            sit on the road instead of floating (darkens, so it reads on any
@@ -2095,6 +2127,8 @@ int main(int argc, char **argv) {
     dbgui_shutdown();
 #endif
     n2_free_scene(&scene);   /* region buffers already freed after texture upload */
+    free(wmbatch);           /* wraps wbatch's GL handles; frees the array only */
+    if (dbgprog) glDeleteProgram(dbgprog);
     if (adev) SDL_CloseAudioDevice(adev);
     SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
     return 0;
