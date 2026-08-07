@@ -193,6 +193,73 @@ static void relaunch(const char *selfexe, const char *dataroot,
     _exit(1);   /* only reached if execvp itself failed */
 }
 
+/* ---- --carinfo <CAR>: GL-free vehicle geometry + texture inspection ---- */
+static const char *car_cat_name(int c) {
+    switch (c) {
+        case N2_CAR_BODY: return "BODY";  case N2_CAR_GLASS: return "GLASS";
+        case N2_CAR_LIGHT: return "LIGHT"; case N2_CAR_TIRE: return "TIRE";
+        case N2_CAR_MISC: return "MISC";  case N2_CAR_BRAKELIGHT: return "BRAKELIGHT";
+        case N2_CAR_MECH: return "MECH";  default: return "OTHER";
+    }
+}
+static void car_info_walk(const unsigned char *d, long beg, long end,
+                          long *nobj, long *cat) {
+    long o = beg;
+    while (o + 8 <= end) {
+        uint32_t m = n2_u32(d + o), s = n2_u32(d + o + 4); long ds = o + 8;
+        if (m == 0x80134010u) {
+            char nm[48]; n2_mesh_name(d, ds, ds + s, nm, sizeof nm);
+            int c = n2_car_category(d, ds, ds + s);
+            N2Leaf vtx[64], idx[64]; int nv = 0, ni = 0;
+            n2_find_leaves(d, ds, ds + s, 0x00134B01u, vtx, &nv, 64);
+            n2_find_leaves(d, ds, ds + s, 0x00134B03u, idx, &ni, 64);
+            long verts = 0, tris = 0;
+            for (int k = 0; k < nv; k++) {
+                int pad = n2_skip_filler(d + vtx[k].off, (int)vtx[k].size);
+                int b = (int)vtx[k].size - pad; if (b > 0 && b % 36 == 0) verts += b / 36;
+            }
+            for (int k = 0; k < ni; k++) {
+                const unsigned char *ib = d + idx[k].off; int ip = 0, ib2 = (int)idx[k].size;
+                while (ip + 2 <= ib2 && ib[ip] == 0x11 && ib[ip+1] == 0x11) ip += 2;
+                tris += (ib2 - ip) / 2 / 3;
+            }
+            printf("  %-34s %-10s verts=%-5ld tris=%-5ld\n",
+                   nm[0] ? nm : "(noname)", car_cat_name(c), verts, tris);
+            (*nobj)++; if (c >= 0 && c < 24) cat[c]++;
+        } else if (m != 0 && (m >> 28) == 8) {
+            car_info_walk(d, ds, ds + s, nobj, cat);
+        }
+        o = ds + s;
+    }
+}
+static int dump_car_info(const char *dataroot, const char *car) {
+    char gp[1024], tp[1024];
+    snprintf(gp, sizeof gp, "%s/CARS/%s/GEOMETRY.BIN", dataroot, car);
+    snprintf(tp, sizeof tp, "%s/CARS/%s/TEXTURES.BIN", dataroot, car);
+    long gn = 0; unsigned char *g = n2_read_file(gp, &gn);
+    if (!g) { fprintf(stderr, "--carinfo: cannot read %s\n", gp); return 1; }
+    long cat[24] = {0}, nobj = 0;
+    printf("=== %s (%ld KB) : vehicle parts ===\n", gp, gn >> 10);
+    car_info_walk(g, 0, gn, &nobj, cat);
+    printf("  %ld part objects.  by category:", nobj);
+    for (int i = 10; i <= 16; i++) if (cat[i]) printf(" %s=%ld", car_cat_name(i), cat[i]);
+    printf("\n\n");
+    long tn = 0; unsigned char *t = n2_read_file(tp, &tn);
+    if (!t) { fprintf(stderr, "--carinfo: cannot read %s\n", tp); free(g); return 0; }
+    uint32_t keys[512]; int nk = n2_car_tex_keys(t, tn, keys, 512);
+    printf("=== %s (%ld KB) : %d car textures ===\n", tp, tn >> 10, nk);
+    for (int i = 0; i < nk; i++) {
+        N2Tex tex;
+        if (n2_load_car_tex_by_key(t, tn, keys[i], &tex)) {
+            printf("  key=0x%08X  %4dx%-4d  %s\n", keys[i], tex.w, tex.h,
+                   tex.alpha ? "DXT3 (alpha)" : "DXT1");
+            free(tex.rgb); free(tex.alpha);
+        } else printf("  key=0x%08X  (decode failed)\n", keys[i]);
+    }
+    free(g); free(t);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     collide_walls_selftest();
     phys_selftest();
@@ -205,9 +272,10 @@ int main(int argc, char **argv) {
                           fuses the byte-identical re-ships into one seamless map.
                           (There is no STREAMALL.BUN; ALL = every STREAM<region>.)
          --circuit PATH   circuit Paths .bin under TRACKS/ (default ROUTESL4RF/Paths4602.bin)
-         --shot out.png   render one frame and exit */
+         --shot out.png   render one frame and exit
+         --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free) */
     const char *selfexe = argv[0];   /* for the menu's track-switch re-exec */
-    const char *dataroot = ".", *shot = NULL, *objdump = NULL;
+    const char *dataroot = ".", *shot = NULL, *objdump = NULL, *carinfo = NULL;
     const char *carname = "HUMMER", *trackname = "ALL";
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
@@ -222,8 +290,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--track")   && i+1 < argc) trackname = argv[++i];
         else if (!strcmp(argv[i], "--circuit") && i+1 < argc) { circuit = argv[++i]; explicit_circuit = 1; }
         else if (!strcmp(argv[i], "--objdump") && i+1 < argc) objdump = argv[++i];
+        else if (!strcmp(argv[i], "--carinfo") && i+1 < argc) carinfo = argv[++i];
         else dataroot = argv[i];
     }
+    if (carinfo) return dump_car_info(dataroot, carinfo);   /* inspect one car, GL-free, exit */
     char carp[1024], cartexp[1024], pathp[1024], troot[1024];
     snprintf(troot,   sizeof troot,   "%s/TRACKS", dataroot);
     snprintf(carp,    sizeof carp,    "%s/CARS/%s/GEOMETRY.BIN", dataroot, carname);
