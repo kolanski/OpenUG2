@@ -553,14 +553,28 @@ GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
     if (g_tex_s3tc && t->dxtfmt && t->dxt && t->dxtlen > 0) {
         GLenum fmt = (t->dxtfmt == 3) ? GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
                                       : GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
+        int bpb = (t->dxtfmt == 3) ? 16 : 8;   /* S3TC block bytes */
         GLuint id; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
-        glCompressedTexImage2D(GL_TEXTURE_2D, 0, fmt, t->w, t->h, 0,
-                               t->dxtlen, t->dxt);
-        /* base level only (matches the CPU path's single-level decode), so no
-           mipmap min-filter -- that would leave the texture incomplete/black. */
+        /* Replay every complete mip level in the blob (level 0 = base .. 1x1).
+           Per-level block count matches n2_mipbytes2 exactly so the offsets line
+           up. Only whole levels are uploaded; a chain that reaches 1x1 is a
+           complete pyramid (mipmap filtering legal), otherwise fall back to a
+           base-only LINEAR filter -- which only ever samples level 0, so a short
+           chain can never leave the texture incomplete/black. */
+        int lw = t->w, lh = t->h, off = 0, level = 0, complete = 0;
+        for (;;) {
+            int bw = lw < 4 ? 1 : lw/4, bh = lh < 4 ? 1 : lh/4;
+            int sz = bw * bh * bpb;
+            if (off + sz > t->dxtlen) break;
+            glCompressedTexImage2D(GL_TEXTURE_2D, level, fmt, lw, lh, 0, sz, t->dxt + off);
+            off += sz; level++;
+            if (lw == 1 && lh == 1) { complete = 1; break; }
+            if (lw > 1) lw /= 2; if (lh > 1) lh /= 2;
+        }
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                        complete ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         return id;
     }

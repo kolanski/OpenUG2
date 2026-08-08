@@ -54,6 +54,7 @@ DbgState g_dbg = {
     .rim_paint = 1, .rim_color = { 0.85f, 0.88f, 0.92f },   /* silver by default */
     .tune_accel = 1.0f, .tune_brake = 1.0f, .tune_turn = 1.0f, .tune_top = 220.0f,
     .ambient = 0.38f, .diffuse = 0.62f, .body_spec = 0.50f,   /* glossy paint */
+    .body_env = 1.0f,                                          /* 1.0 = tuned clearcoat reflection */
     .vcolor = 1.0f,   /* full source prelight on world geometry */
     /* f(700m cull range) ~= 0.07 — far batches dissolve into the sky */
     .fog_density = 0.0023f, .fog_r = 0.06f, .fog_g = 0.07f, .fog_b = 0.11f,
@@ -1489,7 +1490,7 @@ int main(int argc, char **argv) {
                    body-paint gloss or reflection either. Soft-top canvas
                    doesn't reflect the environment like painted metal either. */
                 glUniform1f(rp.uEnv, cgm[i].roof ? 0.02f
-                                   : (c==N2_CAR_BODY||c==N2_CAR_MISC)?0.50f
+                                   : (c==N2_CAR_BODY||c==N2_CAR_MISC)?0.50f*g_dbg.body_env
                                    : is_light?0.55f : c==N2_CAR_MECH?0.0f : 0.15f);
                 glUniform1f(rp.uDecal, 0.0f);   /* body branch may re-enable */
                 GLuint tex = 0; int hasalpha = 0;

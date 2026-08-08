@@ -127,6 +127,7 @@ extern "C" void dbgui_frame(void) {
             ImGui::SliderFloat("ambient",   &g_dbg.ambient,   0.0f, 1.0f);
             ImGui::SliderFloat("diffuse",   &g_dbg.diffuse,   0.0f, 1.5f);
             ImGui::SliderFloat("body spec", &g_dbg.body_spec, 0.0f, 1.0f);
+            ImGui::SliderFloat("body reflection", &g_dbg.body_env, 0.0f, 2.0f, "%.2fx");
             ImGui::SliderFloat("fog density", &g_dbg.fog_density, 0.0f, 0.01f, "%.4f");
             ImGui::ColorEdit3("fog / sky colour", &g_dbg.fog_r);
         }

@@ -1441,7 +1441,12 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
     t->alpha = dxt3 ? (unsigned char *)malloc((long)tw*th) : NULL;
     if (dxt3) n2_dxt3(raw, tw, th, t->rgb, t->alpha);
     else      n2_dxt1(raw, tw, th, t->rgb);
-    t->dxtlen = dxt3 ? tw*th : tw*th/2; t->dxtfmt = dxt3 ? 3 : 1;   /* base-level blocks */
+    /* Keep the WHOLE compressed mip chain (base..1x1), not just the base level:
+       this slot passed the square-solve, so dec matches the full chain within a
+       block. The GPU uploader replays every level for mipmap filtering. */
+    t->dxtfmt = dxt3 ? 3 : 1;
+    t->dxtlen = n2_mipbytes2(tw, th, dxt3 ? 16 : 8);
+    if (t->dxtlen > dec) t->dxtlen = dec;   /* never read past the decoded blob */
     t->dxt = (unsigned char *)malloc(t->dxtlen);
     memcpy(t->dxt, raw, t->dxtlen);
     free(raw);
