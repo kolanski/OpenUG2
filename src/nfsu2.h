@@ -1128,6 +1128,40 @@ static void n2_car_profile(const N2Scene *s, const char *name,
     p->clearance = p->ride + b0[2];
 }
 
+/* Exact wheel geometry from the GLOBAL AttribSys car table (GLOBALB.BUN, the
+ * decompressed GlobalB.lzc). Each car record in the 0x00034600 table holds its
+ * four wheel positions as (X,Y,Z) floats at fixed offsets, in the SAME frame and
+ * scale as the model (the record's length/width/height match the body AABB to
+ * the mm). The record is located by its unique "CARS\<NAME>\GEOMETRY.BIN" path
+ * string; the wheel block sits 0x40 before it. front/rear axle X and half-track
+ * Y decode to real spec dims (verified across 10 cars: Focus wb 2.62, Skyline
+ * 2.66, Miata 2.29, Hummer 3.11, ...). This is the authentic per-car placement,
+ * so it supersedes the body-box fraction fallback. Returns 1 on a plausible hit. */
+typedef struct { float front_axle, rear_axle, front_track, rear_track; } N2WheelAttr;
+static int n2_global_wheel_attr(const unsigned char *g, long glen,
+                                const char *carname, N2WheelAttr *w) {
+    if (!g || !carname || !w) return 0;
+    char sig[128];
+    int n = snprintf(sig, sizeof sig, "CARS\\%s\\GEOMETRY.BIN", carname);
+    if (n <= 0 || n >= (int)sizeof sig) return 0;
+    long at = -1;
+    for (long i = 0; i + n <= glen; i++)
+        if (g[i] == (unsigned char)sig[0] && memcmp(g + i, sig, (size_t)n) == 0) { at = i; break; }
+    if (at < 0) return 0;
+    long base = at - 0x40;                       /* wheel block precedes the path */
+    if (base < 0 || base + 392 + 4 > glen) return 0;
+    float fx, rx, fy, ry;                        /* front/rear axle X, front/rear half-track Y */
+    memcpy(&fx, g + base + 288, 4); memcpy(&rx, g + base + 384, 4);
+    memcpy(&fy, g + base + 292, 4); memcpy(&ry, g + base + 388, 4);
+    fy = fy < 0 ? -fy : fy; ry = ry < 0 ? -ry : ry;
+    /* sanity-gate to real car proportions so a mismatched record can't misplace */
+    if (!(fx > 0.3f && fx < 2.5f && rx < -0.3f && rx > -2.5f &&
+          fy > 0.4f && fy < 1.3f && ry > 0.4f && ry < 1.3f)) return 0;
+    w->front_axle = fx; w->rear_axle = rx;
+    w->front_track = 2.0f * fy; w->rear_track = 2.0f * ry;
+    return 1;
+}
+
 /* ---- DXT1 / BC1 decode ---- */
 static void n2_rgb565(uint16_t c, unsigned char *o) {
     int r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;

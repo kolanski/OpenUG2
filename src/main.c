@@ -18,7 +18,6 @@
  */
 #include <stdio.h>
 #include <string.h>
-#include <strings.h>   /* strcasecmp: per-car wheel-stance table lookup */
 #include <math.h>
 #include <assert.h>
 #include <unistd.h>   /* execvp: menu track-switch re-launches the process */
@@ -57,31 +56,32 @@ DbgState g_dbg = {
     .hud_hide_menu = 1,   /* only consulted under DEBUG_UI; see debug.h */
 };
 
-/* ---- Explicit per-car wheel stance ---------------------------------------
- * Replaces the old AABB-fraction heuristic. Each entry is absolute car-model-
- * space metres (see VehicleWheelConfig). Cars NOT listed fall back to a one-
- * time seed from their own measured body box (the same numbers the fraction
- * math produced, applied once at load rather than every frame) so the ~40
- * un-tuned cars keep their prior placement. Add a row to dial any car in;
- * the ImGui "Wheel Stance" sliders edit the active car's copy live. */
+/* ---- Per-car wheel stance ------------------------------------------------
+ * Primary source is the GLOBAL AttribSys car table (n2_global_wheel_attr): the
+ * exact factory axle X and track Y the game itself ships, decoded per car with
+ * no hash and no hand-tuned table. Cars with no GLOBAL record (or when GLOBAL is
+ * absent) fall back to a one-time seed from their own measured body box. Hub Z
+ * stays the exact tyre-mesh measurement either way. The ImGui "Wheel Stance"
+ * sliders still edit the active car's live copy. */
 #define WHEEL_SEED_FRONTF 0.639f   /* fallback-only: fraction of front body extent */
 #define WHEEL_SEED_REARF  0.597f   /* fallback-only: fraction of rear body extent  */
 #define WHEEL_SEED_TRACKF 0.760f   /* fallback-only: fraction of half-width -> track */
-static const struct { const char *name; VehicleWheelConfig cfg; } WHEEL_TABLE[] = {
-    /* name      front_axle rear_axle front_track rear_track ride_y  (metres) */
-    { "PEUGOT", { 1.230f,   -1.137f,   1.452f,     1.452f,   0.000f } },
-    { "FOCUS",  { 1.315f,   -1.319f,   1.508f,     1.508f,   0.000f } },
-    { "GOLF",   { 1.314f,   -1.279f,   1.515f,     1.515f,   0.000f } },
-};
-static VehicleWheelConfig wheel_config_for(const char *name, const N2CarProfile *p) {
-    for (size_t i = 0; name && i < sizeof WHEEL_TABLE / sizeof WHEEL_TABLE[0]; i++)
-        if (strcasecmp(name, WHEEL_TABLE[i].name) == 0) return WHEEL_TABLE[i].cfg;
-    /* fallback: seed from this car's own body box (one-time, at load) */
+static VehicleWheelConfig wheel_config_for(const char *name, const N2CarProfile *p,
+                                           const unsigned char *gdata, long glen, int *from_global) {
     VehicleWheelConfig c;
-    c.front_axle  = p->body[1] * WHEEL_SEED_FRONTF;
+    N2WheelAttr wa;
+    if (n2_global_wheel_attr(gdata, glen, name, &wa)) {   /* exact, from GLOBAL AttribSys */
+        c.front_axle = wa.front_axle; c.rear_axle = wa.rear_axle;
+        c.front_track = wa.front_track; c.rear_track = wa.rear_track;
+        c.ride_y = p->hub_z;
+        if (from_global) *from_global = 1;
+        return c;
+    }
+    c.front_axle  = p->body[1] * WHEEL_SEED_FRONTF;   /* fallback: this car's own body box */
     c.rear_axle   = p->body[0] * WHEEL_SEED_REARF;
     c.front_track = c.rear_track = 2.0f * p->body[3] * WHEEL_SEED_TRACKF;
     c.ride_y      = p->hub_z;
+    if (from_global) *from_global = 0;
     return c;
 }
 
@@ -603,14 +603,21 @@ int main(int argc, char **argv) {
         n2_car_profile(&car, carname, WHEEL_SEED_FRONTF, WHEEL_SEED_REARF,
                        WHEEL_SEED_TRACKF, n2_car_brake_radius(cdata, 0, clen),
                        &carprof);
-        g_dbg.wheel = wheel_config_for(carname, &carprof);   /* explicit stance / seeded fallback */
+        /* GLOBAL AttribSys holds each car's exact factory wheel positions. */
+        long globlen = 0; char gp[1024];
+        snprintf(gp, sizeof gp, "%s/GLOBAL/GLOBALB.BUN", dataroot);
+        unsigned char *globdata = n2_read_file(gp, &globlen);
+        int wheel_from_global = 0;
+        g_dbg.wheel = wheel_config_for(carname, &carprof, globdata, globlen, &wheel_from_global);
+        free(globdata);
         wR = carprof.wheel_r; wHW = 0.5f * carprof.wheel_w;
         if (wHW < 0.04f) wHW = 0.04f;
         carWheelR = carprof.wheel_r;               /* aftermarket rims fit to this */
-        printf("wheel stance %-12s axle F%+.3f R%+.3f (wb %.3f)  track F%.3f R%.3f  ride %+.3f\n",
+        printf("wheel stance %-12s axle F%+.3f R%+.3f (wb %.3f)  track F%.3f R%.3f  ride %+.3f  [%s]\n",
                carprof.name, g_dbg.wheel.front_axle, g_dbg.wheel.rear_axle,
                g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle,
-               g_dbg.wheel.front_track, g_dbg.wheel.rear_track, g_dbg.wheel.ride_y);
+               g_dbg.wheel.front_track, g_dbg.wheel.rear_track, g_dbg.wheel.ride_y,
+               wheel_from_global ? "GLOBAL AttribSys" : "body-box fallback");
         printf("car profile %-12s wheel R %.3f W %.3f%s  hubZ %+.3f  ride %.3f  "
                "wheelbase %.2f  track %.2f  clearance %.3f\n",
                carprof.name, carprof.wheel_r, carprof.wheel_w,
