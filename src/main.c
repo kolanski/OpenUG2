@@ -18,6 +18,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp: per-car wheel-stance table lookup */
 #include <math.h>
 #include <assert.h>
 #include <unistd.h>   /* execvp: menu track-switch re-launches the process */
@@ -38,17 +39,9 @@
 DbgState g_dbg = {
     .freecam = 0, .speed = 0.6f,
     .race_maxlaps_want = 2,
-    /* front/rear fractions of the body bbox that locate the axles. Nudged up ~3%
-       from the old 0.62/0.58: those ran the wheelbase short (Peugeot 206 2.30 m
-       vs real 2.44 m, -6%), pulling both axles inboard of the arches. The
-       bbox->wheelbase ratio isn't constant across body styles, so this is a
-       fleet compromise, not a per-car fit -- measured wheelbases now: Peugeot
-       2.37 (real 2.44), Focus 2.64 (real 2.62), Golf 2.60 (real 2.57), all
-       within ~3%. Live-tunable per car in the `make debug` ImGui panel. */
-    .wheel_frontf = 0.639f, .wheel_rearf = 0.597f, .wheel_trackf = 0.76f,
-    /* wheel_z 0 = hub at the body's model origin, which is exactly where every
-       car's stock N2_CAR_TIRE hub centre sits (measured Z = 0.000). */
-    .wheel_z = 0.0f, .wheel_scale = 1.0f,
+    /* .wheel (VehicleWheelConfig) is filled per car at load by wheel_config_for()
+       -- an explicit table entry or a body-box fallback -- so no default here. */
+    .wheel_scale = 1.0f,
     .insp_sel = -1,
     .neon_on = 1, .neon_col = { 0.15f, 0.45f, 1.0f }, .neon_str = 0.85f,
     .rim_paint = 1, .rim_color = { 0.85f, 0.88f, 0.92f },   /* silver by default */
@@ -63,6 +56,34 @@ DbgState g_dbg = {
     .show_misc = 1, .show_track = 1,
     .hud_hide_menu = 1,   /* only consulted under DEBUG_UI; see debug.h */
 };
+
+/* ---- Explicit per-car wheel stance ---------------------------------------
+ * Replaces the old AABB-fraction heuristic. Each entry is absolute car-model-
+ * space metres (see VehicleWheelConfig). Cars NOT listed fall back to a one-
+ * time seed from their own measured body box (the same numbers the fraction
+ * math produced, applied once at load rather than every frame) so the ~40
+ * un-tuned cars keep their prior placement. Add a row to dial any car in;
+ * the ImGui "Wheel Stance" sliders edit the active car's copy live. */
+#define WHEEL_SEED_FRONTF 0.639f   /* fallback-only: fraction of front body extent */
+#define WHEEL_SEED_REARF  0.597f   /* fallback-only: fraction of rear body extent  */
+#define WHEEL_SEED_TRACKF 0.760f   /* fallback-only: fraction of half-width -> track */
+static const struct { const char *name; VehicleWheelConfig cfg; } WHEEL_TABLE[] = {
+    /* name      front_axle rear_axle front_track rear_track ride_y  (metres) */
+    { "PEUGOT", { 1.230f,   -1.137f,   1.452f,     1.452f,   0.000f } },
+    { "FOCUS",  { 1.315f,   -1.319f,   1.508f,     1.508f,   0.000f } },
+    { "GOLF",   { 1.314f,   -1.279f,   1.515f,     1.515f,   0.000f } },
+};
+static VehicleWheelConfig wheel_config_for(const char *name, const N2CarProfile *p) {
+    for (size_t i = 0; name && i < sizeof WHEEL_TABLE / sizeof WHEEL_TABLE[0]; i++)
+        if (strcasecmp(name, WHEEL_TABLE[i].name) == 0) return WHEEL_TABLE[i].cfg;
+    /* fallback: seed from this car's own body box (one-time, at load) */
+    VehicleWheelConfig c;
+    c.front_axle  = p->body[1] * WHEEL_SEED_FRONTF;
+    c.rear_axle   = p->body[0] * WHEEL_SEED_REARF;
+    c.front_track = c.rear_track = 2.0f * p->body[3] * WHEEL_SEED_TRACKF;
+    c.ride_y      = p->hub_z;
+    return c;
+}
 
 /* Switching car or track means a whole new asset load (world batches, car
  * buffers/textures, physics obstacles, AI paths — ~30 pieces of long-lived
@@ -563,12 +584,17 @@ int main(int argc, char **argv) {
                    wHW = 0.5f*(tb1[1]-tb0[1]); if (wHW<0.04f) wHW=0.04f; }
         /* Build this car's dimension profile from its OWN geometry, and drive
            the wheel/ride numbers from it instead of any absolute constant. */
-        n2_car_profile(&car, carname, g_dbg.wheel_frontf, g_dbg.wheel_rearf,
-                       g_dbg.wheel_trackf, n2_car_brake_radius(cdata, 0, clen),
+        n2_car_profile(&car, carname, WHEEL_SEED_FRONTF, WHEEL_SEED_REARF,
+                       WHEEL_SEED_TRACKF, n2_car_brake_radius(cdata, 0, clen),
                        &carprof);
+        g_dbg.wheel = wheel_config_for(carname, &carprof);   /* explicit stance / seeded fallback */
         wR = carprof.wheel_r; wHW = 0.5f * carprof.wheel_w;
         if (wHW < 0.04f) wHW = 0.04f;
         carWheelR = carprof.wheel_r;               /* aftermarket rims fit to this */
+        printf("wheel stance %-12s axle F%+.3f R%+.3f (wb %.3f)  track F%.3f R%.3f  ride %+.3f\n",
+               carprof.name, g_dbg.wheel.front_axle, g_dbg.wheel.rear_axle,
+               g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle,
+               g_dbg.wheel.front_track, g_dbg.wheel.rear_track, g_dbg.wheel.ride_y);
         printf("car profile %-12s wheel R %.3f W %.3f%s  hubZ %+.3f  ride %.3f  "
                "wheelbase %.2f  track %.2f  clearance %.3f\n",
                carprof.name, carprof.wheel_r, carprof.wheel_w,
@@ -1431,14 +1457,13 @@ int main(int argc, char **argv) {
               g_dbg.wheel_rpm = fabsf(speed / wR) * 60.0f * 9.5493f;
               g_dbg.steer_deg = vsteer * 57.2958f;
               g_dbg.wheel_radius = wR;
-              /* Axle lines + track from this car's profile (its own measured body
-                 extents scaled by the live sliders), and hub Z from its measured
-                 hub_z -- no shared constant anywhere in the placement. */
-              float fr=carprof.body[1]*g_dbg.wheel_frontf,
-                    rr=carprof.body[0]*g_dbg.wheel_rearf,
-                    tr=carprof.body[3]*g_dbg.wheel_trackf,
-                    s=g_dbg.wheel_scale, wz=carprof.hub_z + g_dbg.wheel_z;
-              float wp[4][2]={{fr,tr},{fr,-tr},{rr,tr},{rr,-tr}};
+              /* Explicit per-car stance (g_dbg.wheel): absolute axle X, per-axle
+                 track and hub height, set at load from the table/fallback and
+                 live-edited by the ImGui stance sliders. No fraction math here. */
+              float fht = g_dbg.wheel.front_track*0.5f, rht = g_dbg.wheel.rear_track*0.5f,
+                    s=g_dbg.wheel_scale, wz=g_dbg.wheel.ride_y;
+              float wp[4][2]={{g_dbg.wheel.front_axle, fht},{g_dbg.wheel.front_axle,-fht},
+                              {g_dbg.wheel.rear_axle,  rht},{g_dbg.wheel.rear_axle, -rht}};
               for(int k=0;k<4;k++){ float sy=(k&1)?-s:s;
                   /* rear axle: plain scale * rotY(wang) */
                   float M[16]={s*c,0,-s*sn,0, 0,sy,0,0, s*sn,0,s*c,0,
@@ -2072,9 +2097,9 @@ int main(int argc, char **argv) {
                        bb[0],bb[1],bb[2],bb[3],bb[4],bb[5]);
                 printf("  car world pos (%.2f,%.2f,%.2f) heading %.3f rad  %.1f km/h\n",
                        carpos[0],carpos[1],carpos[2], heading, PHYS_KMH(speed));
-                printf("  wheel scale %.3f  z-offset %.3f  front %.2f rear %.2f track %.2f\n",
-                       g_dbg.wheel_scale, g_dbg.wheel_z, g_dbg.wheel_frontf,
-                       g_dbg.wheel_rearf, g_dbg.wheel_trackf);
+                printf("  wheel scale %.3f  stance: axle F%+.3f R%+.3f  track F%.3f R%.3f  ride %+.3f\n",
+                       g_dbg.wheel_scale, g_dbg.wheel.front_axle, g_dbg.wheel.rear_axle,
+                       g_dbg.wheel.front_track, g_dbg.wheel.rear_track, g_dbg.wheel.ride_y);
                 for (int w = 0; w < 4; w++) {
                     printf("  wheelT[%d] (column-major):\n", w);
                     for (int r = 0; r < 4; r++)
@@ -2137,7 +2162,7 @@ int main(int argc, char **argv) {
                        "  track %.2f  tyre bottom %+.3f (0=flush)  clearance %.3f\n",
                        carprof.name, carprof.wheel_r, carprof.has_tire ? "" : "*",
                        rd, carprof.hub_z, carprof.wheelbase, carprof.track_f,
-                       rd + carprof.hub_z + g_dbg.wheel_z - g_dbg.wheel_radius,
+                       rd + g_dbg.wheel.ride_y - g_dbg.wheel_radius,
                        rd + carprof.body[4]); }
             printf("wrote %s (%dx%d) after driving to (%.0f,%.0f)\n", shot, W, H, carpos[0], carpos[1]);
             running = 0;

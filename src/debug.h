@@ -68,13 +68,28 @@ typedef struct {
     float px, py; int havep;         /* previous car XY: gates are crossed, not touched */
 } WRace;
 
+/* Explicit per-corner wheel stance for the active car, in the car's own model
+   space (X = longitudinal/+forward, Y = lateral, Z = vertical/up). Replaces the
+   old AABB-fraction heuristic: values are absolute metres, set once at load from
+   a per-car table (or a body-box fallback) and live-editable in the ImGui panel.
+   The task's Z-forward / Y-up field names map here as: front_axle_z->front_axle,
+   track_width(X)->front/rear_track, ride_height_y->ride_y. */
+typedef struct {
+    float front_axle;    /* X of the front axle line */
+    float rear_axle;     /* X of the rear axle line (negative = behind origin) */
+    float front_track;   /* full front track width (lateral wheel-centre spacing) */
+    float rear_track;    /* full rear track width */
+    float ride_y;        /* hub-centre height (measured from the car's tyre mesh) */
+} VehicleWheelConfig;
+
 typedef struct {
     /* --- freecam (works in every build; toggle with F) --- */
     int   freecam;
     float speed;                 /* freecam move units/frame */
 
-    /* --- wheel placement (fractions of the car AABB) --- */
-    float wheel_frontf, wheel_rearf, wheel_trackf, wheel_z, wheel_scale;
+    /* --- wheel placement: explicit per-car stance (see VehicleWheelConfig) --- */
+    VehicleWheelConfig wheel;
+    float wheel_scale;           /* rim radius multiplier (fits rim to the arch) */
 
     /* --- lighting (fed to the shader as uniforms) --- */
     float ambient, diffuse, body_spec;

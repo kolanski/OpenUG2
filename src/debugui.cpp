@@ -47,11 +47,15 @@ extern "C" void dbgui_frame(void) {
 
     /* ---- Tab 1: Vehicle & Wheels ---- */
     if (ImGui::BeginTabItem("Vehicle & Wheels")) {
-        if (ImGui::CollapsingHeader("Wheel & Rim Geometry", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::SliderFloat("front offset", &g_dbg.wheel_frontf, 0.0f, 1.0f);
-            ImGui::SliderFloat("rear offset",  &g_dbg.wheel_rearf,  0.0f, 1.0f);
-            ImGui::SliderFloat("track width",  &g_dbg.wheel_trackf, 0.0f, 1.2f);
-            ImGui::SliderFloat("z offset",     &g_dbg.wheel_z,    -1.0f, 1.0f);
+        if (ImGui::CollapsingHeader("Wheel Stance (per-car, metres)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            /* Absolute stance for the active car -- edits apply next frame, since
+               the wheel transforms are rebuilt from g_dbg.wheel every frame. */
+            ImGui::SliderFloat("front axle Z", &g_dbg.wheel.front_axle,  0.0f, 2.5f, "%.3f m");
+            ImGui::SliderFloat("rear axle Z",  &g_dbg.wheel.rear_axle,  -2.5f, 0.0f, "%.3f m");
+            ImGui::SliderFloat("front track",  &g_dbg.wheel.front_track, 0.8f, 2.2f, "%.3f m");
+            ImGui::SliderFloat("rear track",   &g_dbg.wheel.rear_track,  0.8f, 2.2f, "%.3f m");
+            ImGui::SliderFloat("ride height Y",&g_dbg.wheel.ride_y,     -0.5f, 0.5f, "%.3f m");
+            ImGui::Text("wheelbase %.3f m", g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle);
             ImGui::SliderFloat("radius/scale", &g_dbg.wheel_scale, 0.3f, 2.0f);
             ImGui::Text("radius %.3f m   %.0f RPM   steer %+.1f deg",
                         g_dbg.wheel_radius, g_dbg.wheel_rpm, g_dbg.steer_deg);
