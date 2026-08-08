@@ -122,27 +122,27 @@ static VehicleWheelConfig wheel_config_for(const char *name, const N2CarProfile 
  * this archive is the only place the condition arises. Purely local, and
  * geometric (edge > 0.25*diag) rather than name-based, so it is self-limiting
  * and cannot misfire on a legitimately large triangle in a small mesh. */
-static void rim_drop_welded_tris(N2Scene *s) {
-    for (int i = 0; i < s->count; i++) {
-        N2Mesh *m = &s->meshes[i];
-        float bb[6]; n2_mesh_bbox(m, bb);
-        float dx = bb[1]-bb[0], dy = bb[3]-bb[2], dz = bb[5]-bb[4];
-        float diag = sqrtf(dx*dx + dy*dy + dz*dz);
-        if (diag <= 0.0f) continue;
-        float lim = 0.25f * diag, lim2 = lim * lim;
-        int w = 0;
-        for (int t = 0; t + 2 < m->nidx; t += 3) {
-            int ok = 1;
-            for (int k = 0; k < 3 && ok; k++) {
-                const float *p = m->verts + m->idx[t+k]*5;
-                const float *q = m->verts + m->idx[t+(k+1)%3]*5;
-                float ex=p[0]-q[0], ey=p[1]-q[1], ez=p[2]-q[2];
-                if (ex*ex+ey*ey+ez*ez > lim2) ok = 0;
-            }
-            if (ok) { m->idx[w]=m->idx[t]; m->idx[w+1]=m->idx[t+1]; m->idx[w+2]=m->idx[t+2]; w += 3; }
+static void rim_drop_welded_mesh(N2Mesh *m) {
+    float bb[6]; n2_mesh_bbox(m, bb);
+    float dx = bb[1]-bb[0], dy = bb[3]-bb[2], dz = bb[5]-bb[4];
+    float diag = sqrtf(dx*dx + dy*dy + dz*dz);
+    if (diag <= 0.0f) return;
+    float lim = 0.25f * diag, lim2 = lim * lim;
+    int w = 0;
+    for (int t = 0; t + 2 < m->nidx; t += 3) {
+        int ok = 1;
+        for (int k = 0; k < 3 && ok; k++) {
+            const float *p = m->verts + m->idx[t+k]*5;
+            const float *q = m->verts + m->idx[t+(k+1)%3]*5;
+            float ex=p[0]-q[0], ey=p[1]-q[1], ez=p[2]-q[2];
+            if (ex*ex+ey*ey+ez*ez > lim2) ok = 0;
         }
-        m->nidx = w;
+        if (ok) { m->idx[w]=m->idx[t]; m->idx[w+1]=m->idx[t+1]; m->idx[w+2]=m->idx[t+2]; w += 3; }
     }
+    m->nidx = w;
+}
+static void rim_drop_welded_tris(N2Scene *s) {
+    for (int i = 0; i < s->count; i++) rim_drop_welded_mesh(&s->meshes[i]);
 }
 
 static int load_rim_style(const unsigned char *wldata, long wllen,
@@ -564,6 +564,7 @@ int main(int argc, char **argv) {
     uint32_t ckeys[64]; int nck = ctdata ? n2_car_tex_keys(ctdata, ctlen, ckeys, 64) : 0;
     uint32_t mapkey[32]; GLuint maptex[32]; char mapalpha[32]; int nmap = 0;
     N2Scene car; int ncar = 0; GpuMesh *cgm = NULL;
+    int stock_wheel = -1;   /* cgm[] index of the car's own highest-LOD stock wheel mesh */
     float wheelT[4][16];                         /* 4 wheel placements (car-local) */
     float wheelTAI[4][16];                       /* same, minus the player's steer (AI cars) */
     GpuMesh wheelmesh; int have_wheel = 0;       /* procedural tyre, built after GL init */
@@ -592,6 +593,14 @@ int main(int argc, char **argv) {
         }
         carbb[0]=bb0[0];carbb[1]=bb0[1];carbb[2]=bb0[2];
         carbb[3]=bb1[0];carbb[4]=bb1[1];carbb[5]=bb1[2];  /* wheelT built per-frame from g_dbg */
+        /* Cull each stock wheel mesh's flat backing/hub-plane quad (the same
+           welded quad the library rims carry) so the car's OWN rim renders as
+           clean spokes, and remember its highest-LOD tier to instance at the
+           4 corners. */
+        for (int i=0;i<ncar;i++) if (car.meshes[i].cat==N2_CAR_TIRE) {
+            rim_drop_welded_mesh(&car.meshes[i]);
+            if (stock_wheel<0 || car.meshes[i].nverts>car.meshes[stock_wheel].nverts) stock_wheel=i;
+        }
         cgm = upload_scene(&car);
         /* size the procedural tyre from the car's own wheel mesh (radius in X-Z,
            width in Y) so a Hummer gets big tyres and a compact gets small ones. */
@@ -603,10 +612,28 @@ int main(int argc, char **argv) {
         n2_car_profile(&car, carname, WHEEL_SEED_FRONTF, WHEEL_SEED_REARF,
                        WHEEL_SEED_TRACKF, n2_car_brake_radius(cdata, 0, clen),
                        &carprof);
-        /* GLOBAL AttribSys holds each car's exact factory wheel positions. */
+        /* GLOBAL AttribSys holds each car's exact factory wheel positions.
+           Prefer the pre-decompressed GLOBALB.BUN; if it is absent, decompress
+           the shipped GlobalB.lzc in place (it is a JDLZ stream) so the pipeline
+           is fully self-contained from the retail files. */
         long globlen = 0; char gp[1024];
         snprintf(gp, sizeof gp, "%s/GLOBAL/GLOBALB.BUN", dataroot);
         unsigned char *globdata = n2_read_file(gp, &globlen);
+        if (!globdata) {
+            snprintf(gp, sizeof gp, "%s/GLOBAL/GlobalB.lzc", dataroot);
+            long clen2 = 0; unsigned char *cz = n2_read_file(gp, &clen2);
+            if (cz && clen2 >= 16 && memcmp(cz, "JDLZ", 4) == 0) {
+                uint32_t usize = n2_u32(cz + 8);
+                if (usize > 0 && usize < (1u << 28)) {
+                    globdata = (unsigned char *)malloc(usize);
+                    if (globdata) {
+                        globlen = n2_jdlz(cz, (int)clen2, globdata, (int)usize);
+                        printf("GLOBAL: decompressed GlobalB.lzc (JDLZ) -> %ld bytes\n", globlen);
+                    }
+                }
+            }
+            free(cz);
+        }
         int wheel_from_global = 0;
         g_dbg.wheel = wheel_config_for(carname, &carprof, globdata, globlen, &wheel_from_global);
         free(globdata);
@@ -965,6 +992,11 @@ int main(int argc, char **argv) {
                     free(cgm); cgm = NULL;
                     n2_free_scene(&car);
                     ncar = n2_load_car(cdata, clen, &car, ckeys, nck, &carcfg);
+                    stock_wheel = -1;   /* re-cull wheels + re-find stock index for the new kit */
+                    for (int i=0;i<ncar;i++) if (car.meshes[i].cat==N2_CAR_TIRE) {
+                        rim_drop_welded_mesh(&car.meshes[i]);
+                        if (stock_wheel<0 || car.meshes[i].nverts>car.meshes[stock_wheel].nverts) stock_wheel=i;
+                    }
                     cgm = upload_scene(&car);
                     printf("body kit -> KIT%02d (%d meshes)\n", carcfg.body_kit, ncar);
                 }
@@ -1669,6 +1701,22 @@ int main(int argc, char **argv) {
                the radial rim texture gives them a hub + spokes instead of a void */
             if (have_wheel && g_dbg.show_tires) {
                 glUniform1f(rp.uDecal, 0.0f);
+                /* Authentic stock wheel: the car's OWN FRONT_WHEEL mesh (rim +
+                   tyre) from its GEOMETRY.BIN, with the flat backing-plane quad
+                   culled at load, instanced at all four AttribSys corners. This
+                   is the real factory wheel, so it wins over the shared rim
+                   library below whenever the car ships one (all but the 2 tyre-
+                   less cars). At blur speed the procedural disc still takes over. */
+                if (stock_wheel >= 0 && PHYS_KMH(speed) <= WHEEL_BLUR_KMH) {
+                    GLuint stex=0; for(int j=0;j<nmap;j++) if(mapkey[j]==cgm[stock_wheel].texkey){stex=maptex[j];break;}
+                    glUniform1f(uUseTex, stex?1.0f:0.0f); glUniform1f(rp.uEnv, 0.25f);
+                    glUniform1f(uSpec, 0.5f); glUniform3f(uColor,0.6f,0.6f,0.62f);
+                    if (stex) glBindTexture(GL_TEXTURE_2D, stex);
+                    for (int k=0;k<4;k++){ float MVPw[16]; mat_mul(MVPc, wheelT[k], MVPw);
+                        glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPw); draw_gpumesh(&cgm[stock_wheel]); }
+                    g_dbg.drawn+=4; glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
+                    goto wheels_drawn;
+                }
                 /* Geometric rim below the blur threshold, else the procedural
                    disc (its angular-averaged sheet sells the motion blur).
                    The WHEELS/TEXTURES.BIN rim diffuse is AUTHENTIC (blue spans
@@ -1701,6 +1749,7 @@ int main(int argc, char **argv) {
                 g_dbg.drawn += 4;
                 glUniform1f(rp.uRimTint, 0.0f);   /* rim paint is rim-only */
                 glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
+                wheels_drawn: ;
             }
             glUniform1f(uUseTex, 0.0f);
             glUniform1f(uSpec, 0.3f);     /* AIs: flat colour but glossy paint */
