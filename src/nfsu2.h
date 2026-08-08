@@ -76,7 +76,12 @@ typedef struct {
 
 /* Decoded RGB texture (3 bytes/pixel, top-left origin). alpha is a separate
  * w*h plane, only non-NULL for DXT3 car textures (decal/badge masks). */
-typedef struct { int w, h; unsigned char *rgb; unsigned char *alpha; } N2Tex;
+typedef struct { int w, h; unsigned char *rgb; unsigned char *alpha;
+    /* Optional raw S3TC block copy (base mip only) for a direct GPU upload
+       via glCompressedTexImage2D; rgb/alpha stay populated as the portable
+       fallback. Set only by n2_load_car_tex_by_key for straight DXT1/DXT3
+       slots. dxtfmt: 0 = none (use rgb), 1 = DXT1, 3 = DXT3. */
+    unsigned char *dxt; int dxtlen, dxtfmt; } N2Tex;
 
 /* ---- file I/O ---- */
 static unsigned char *n2_read_file(const char *path, long *out_len) {
@@ -1339,6 +1344,7 @@ static int n2_mipbytes(int s, int bpb) { return n2_mipbytes2(s, s, bpb); }
 static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key, N2Tex *t) {
     uint32_t sz; const unsigned char *p = n2_tpk_slots(d, len, &sz);
     if (!p) return 0;
+    t->dxt = NULL; t->dxtlen = 0; t->dxtfmt = 0;   /* raw-block fast path off by default */
     int absoff = 0, enc = 0, dec = 0;
     for (uint32_t i = 0; i + 0x18 <= sz; i += 0x18)
         if (n2_u32(p + i) == key) {
@@ -1369,6 +1375,9 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
                     t->w = w; t->h = h; t->alpha = NULL;
                     t->rgb = (unsigned char *)malloc(n * 3);
                     n2_dxt1(raw, w, h, t->rgb);
+                    t->dxtlen = (int)(n/2); t->dxtfmt = 1;          /* base-level blocks */
+                    t->dxt = (unsigned char *)malloc(t->dxtlen);
+                    memcpy(t->dxt, raw, t->dxtlen);
                     free(raw); return 1;
                 }
                 if (fmt == 0x33545844 && n + 144 <= dec) {          /* "DXT3" */
@@ -1376,6 +1385,9 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
                     t->rgb = (unsigned char *)malloc(n * 3);
                     t->alpha = (unsigned char *)malloc(n);
                     n2_dxt3(raw, w, h, t->rgb, t->alpha);
+                    t->dxtlen = (int)n; t->dxtfmt = 3;
+                    t->dxt = (unsigned char *)malloc(t->dxtlen);
+                    memcpy(t->dxt, raw, t->dxtlen);
                     free(raw); return 1;
                 }
                 if (n + 144 <= dec) {
@@ -1429,6 +1441,9 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
     t->alpha = dxt3 ? (unsigned char *)malloc((long)tw*th) : NULL;
     if (dxt3) n2_dxt3(raw, tw, th, t->rgb, t->alpha);
     else      n2_dxt1(raw, tw, th, t->rgb);
+    t->dxtlen = dxt3 ? tw*th : tw*th/2; t->dxtfmt = dxt3 ? 3 : 1;   /* base-level blocks */
+    t->dxt = (unsigned char *)malloc(t->dxtlen);
+    memcpy(t->dxt, raw, t->dxtlen);
     free(raw);
     return 1;
 }

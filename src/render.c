@@ -495,7 +495,7 @@ static GLuint make_wheel_tex_var(int spin_blur) {
         unsigned char *o = px + (y*S + x)*3;
         o[0] = v; o[1] = v; o[2] = (unsigned char)(v + v/16);        /* cool metal */
     }
-    N2Tex t = { S, S, px, NULL };
+    N2Tex t = { S, S, px, NULL, NULL, 0, 0 };
     GLuint id = upload_tex(&t);
     /* radial, single-sample cap texture (no tiling intended) — clamp so a
        filter footprint near u/v=0 or 1 can't wrap and bleed in colour from
@@ -536,6 +536,35 @@ void draw_gpumesh(GpuMesh *g) {
     glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g->ibo);
     glDrawElements(GL_TRIANGLES, g->nidx, GL_UNSIGNED_SHORT, 0);
+}
+
+/* S3TC format enums + capability flag. glext.h / SDL_opengl.h define these on
+   desktop; guard so the -DN2_GLES build (where the flag stays 0 unless the GPU
+   advertises the extension) still compiles. */
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+#  define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT 0x83F1
+#endif
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
+#  define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT 0x83F2
+#endif
+int g_tex_s3tc = 0;
+
+GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
+    if (g_tex_s3tc && t->dxtfmt && t->dxt && t->dxtlen > 0) {
+        GLenum fmt = (t->dxtfmt == 3) ? GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
+                                      : GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
+        GLuint id; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
+        glCompressedTexImage2D(GL_TEXTURE_2D, 0, fmt, t->w, t->h, 0,
+                               t->dxtlen, t->dxt);
+        /* base level only (matches the CPU path's single-level decode), so no
+           mipmap min-filter -- that would leave the texture incomplete/black. */
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        return id;
+    }
+    return upload_tex(t);   /* portable fallback: CPU-decoded RGBA + mipmaps */
 }
 
 GLuint upload_tex(const N2Tex *t) {

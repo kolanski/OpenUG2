@@ -101,6 +101,12 @@ int  upload_world_batches(const N2Scene *s, const float (*mbb)[4],
 int  upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **out);
 void draw_batch(const N2Batch *b);
 GLuint   upload_tex(const N2Tex *t);
+/* Upload a decoded TPK texture, preferring a direct glCompressedTexImage2D of
+   its raw S3TC blocks when the driver supports the format; falls back to the
+   portable CPU-decoded RGBA path (upload_tex) otherwise. Leaves the texture
+   bound (callers may override wrap/filter after). */
+GLuint   upload_tpk_texture_to_gpu(const N2Tex *t);
+extern int g_tex_s3tc;   /* 1 = GL_EXT_texture_compression_s3tc present; set once at GL init */
 
 /* ---- 3x5 bitmap font (uppercase, digits, _ - /) ---- */
 void  draw_text(GpuMesh *quad, GLint uMVP, const char *s,

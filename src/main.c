@@ -170,7 +170,7 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
     N2Tex rt; memset(&rt, 0, sizeof rt);
     long ar=0, ag=0, ab=0, bmn=255, bmx=0;
     if (tk && wtdata && n2_load_car_tex_by_key(wtdata, wtlen, tk, &rt)) {
-        *rimtex = upload_tex(&rt);
+        *rimtex = upload_tpk_texture_to_gpu(&rt);
         /* rim sheets are atlases with UVs in [0,1]: clamp so REPEAT wrap +
            mip filtering cannot bleed the opposite border in (same reason as
            the car body atlases above). */
@@ -181,7 +181,7 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
             ar += rt.rgb[p*3]; ag += rt.rgb[p*3+1]; ab += b;
             if (b < bmn) bmn = b; if (b > bmx) bmx = b; }
         if (np) { ar/=np; ag/=np; ab/=np; }
-        free(rt.rgb); free(rt.alpha);
+        free(rt.rgb); free(rt.alpha); free(rt.dxt);
     }
     /* channel telemetry: B min/max spanning 0..255 confirms the decode is NOT
        truncating blue -- the low average is an authentic gold/bronze rim. */
@@ -263,7 +263,7 @@ static int dump_car_info(const char *dataroot, const char *car) {
         if (n2_load_car_tex_by_key(t, tn, keys[i], &tex)) {
             printf("  key=0x%08X  %4dx%-4d  %s\n", keys[i], tex.w, tex.h,
                    tex.alpha ? "DXT3 (alpha)" : "DXT1");
-            free(tex.rgb); free(tex.alpha);
+            free(tex.rgb); free(tex.alpha); free(tex.dxt);
         } else printf("  key=0x%08X  (decode failed)\n", keys[i]);
     }
     free(g); free(t);
@@ -441,6 +441,14 @@ int main(int argc, char **argv) {
     SDL_GLContext ctx = SDL_GL_CreateContext(win);
     if (!ctx) { fprintf(stderr, "GL ctx: %s\n", SDL_GetError()); return 1; }
     SDL_GL_SetSwapInterval(shot ? 0 : 1);   /* raw frame times in shot mode */
+    /* Detect S3TC so car/rim TPK textures can upload their DXT blocks directly
+       (glCompressedTexImage2D) instead of the CPU-decoded RGBA. Legacy GL 2.1
+       and GLES2 both return a valid GL_EXTENSIONS string here. */
+    { const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+      g_tex_s3tc = ext && (strstr(ext, "GL_EXT_texture_compression_s3tc") ||
+                           strstr(ext, "texture_compression_dxt1")); }
+    printf("texture path: %s\n", g_tex_s3tc ? "S3TC direct (glCompressedTexImage2D)"
+                                            : "CPU DXT decode (no s3tc extension)");
 #ifdef DEBUG_UI
     dbgui_init(win, ctx);
 #endif
@@ -574,14 +582,14 @@ int main(int argc, char **argv) {
             if (seen || nmap >= 32) continue;
             N2Tex ct;
             if (n2_load_car_tex_by_key(ctdata, ctlen, tk, &ct)) {
-                mapkey[nmap] = tk; maptex[nmap] = upload_tex(&ct);
+                mapkey[nmap] = tk; maptex[nmap] = upload_tpk_texture_to_gpu(&ct);
                 mapalpha[nmap] = ct.alpha != NULL;   /* DXT3 = decal mask */
                 nmap++;
                 /* car textures are atlases (UVs in [0,1]): clamp so REPEAT
                    wrap + mip filtering can't bleed the opposite border in. */
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                free(ct.rgb); free(ct.alpha);
+                free(ct.rgb); free(ct.alpha); free(ct.dxt);
             }
         }
         printf("car textures bound: %d distinct\n", nmap);
@@ -616,13 +624,13 @@ int main(int argc, char **argv) {
                     float f = (float)op / (float)n;
                     if (f > 0.04f && f < 0.55f) { got = 1; gotkey = vkeys[k]; break; }
                 }
-                free(vt.rgb); free(vt.alpha);
+                free(vt.rgb); free(vt.alpha); free(vt.dxt);
             }
             N2Tex bt;
             if (got && bodykey && n2_load_car_tex_by_key(ctdata, ctlen, bodykey, &bt)) {
                 int W = bt.w > vt.w ? bt.w : vt.w, H = bt.h > vt.h ? bt.h : vt.h;
                 N2Tex out = { W, H, (unsigned char *)malloc((long)W*H*3),
-                                    (unsigned char *)malloc((long)W*H) };
+                                    (unsigned char *)malloc((long)W*H), NULL, 0, 0 };
                 for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
                     long o  = (long)y*W + x;
                     long bo = (long)(y*bt.h/H)*bt.w + x*bt.w/W;   /* nearest */
@@ -647,9 +655,9 @@ int main(int argc, char **argv) {
                 }
                 printf("vinyl layer: key %08x (%dx%d) composited under the badge atlas\n",
                        gotkey, vt.w, vt.h);
-                free(out.rgb); free(out.alpha); free(bt.rgb); free(bt.alpha);
+                free(out.rgb); free(out.alpha); free(bt.rgb); free(bt.alpha); free(bt.dxt);
             }
-            if (got) { free(vt.rgb); free(vt.alpha); }
+            if (got) { free(vt.rgb); free(vt.alpha); free(vt.dxt); }
             free(vdata);
         }
         /* spawn on the road mesh nearest the track centre; aim inward so a

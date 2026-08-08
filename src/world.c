@@ -268,13 +268,14 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
             uint32_t tk = w->scene.meshes[i].texkey; if (!tk) continue;
             int seen = 0; for (int j = 0; j < n; j++) if (keys[j] == tk) seen = 1;
             if (seen || n >= cap) continue;
-            N2Tex tt; int ok = n2_tpk_decode(g->data, g->len, g->tpk, tk, &tt);
+            N2Tex tt = {0};   /* zero-init: n2_tpk_decode leaves dxt untouched */
+            int ok = n2_tpk_decode(g->data, g->len, g->tpk, tk, &tt);
             if (!ok && w->loc4)
                 ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
             if (!ok && w->master)
                 ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
             if (ok && !n2_tex_noise(&tt)) { keys[n] = tk; texs[n] = upload_tex(&tt); n++; }
-            if (ok) free(tt.rgb);
+            if (ok) { free(tt.rgb); free(tt.dxt); }
         }
         free(g->data); g->data = NULL;   /* meshes + textures live on the GPU now */
     }
