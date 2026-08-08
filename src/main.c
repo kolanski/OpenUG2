@@ -257,6 +257,22 @@ static void car_info_walk(const unsigned char *d, long beg, long end,
             printf("  %-34s %-10s verts=%-5ld tris=%-5ld  mat=%d t=(%+.3f %+.3f %+.3f)\n",
                    nm[0] ? nm : "(noname)", car_cat_name(c), verts, tris,
                    hasM, M[12], M[13], M[14]);
+            /* Running-gear parts (wheel + brake disc) carry the axle position IF
+               they are modelled in place. Print their vertex bbox centre to show
+               they are NOT: every one sits at the model origin, so GEOMETRY.BIN
+               holds no per-axle wheelbase/track -- see the N2CarProfile audit. */
+            if ((strstr(nm, "BRAKE") && !strstr(nm, "LIGHT")) || strstr(nm, "WHEEL")) {
+                float b0[3] = {1e30f,1e30f,1e30f}, b1[3] = {-1e30f,-1e30f,-1e30f};
+                for (int k = 0; k < nv; k++) {
+                    int pad = n2_skip_filler(d + vtx[k].off, (int)vtx[k].size);
+                    int nvv = ((int)vtx[k].size - pad) / 36;
+                    for (int q = 0; q < nvv; q++) {
+                        const unsigned char *vp = d + vtx[k].off + pad + q*36;
+                        for (int a = 0; a < 3; a++) { float f; memcpy(&f, vp + a*4, 4);
+                            if (f < b0[a]) b0[a] = f; if (f > b1[a]) b1[a] = f; } } }
+                printf("      bbox centre (%+.3f %+.3f %+.3f)  <- at origin: no axle offset stored\n",
+                       0.5f*(b0[0]+b1[0]), 0.5f*(b0[1]+b1[1]), 0.5f*(b0[2]+b1[2]));
+            }
             (*nobj)++; if (c >= 0 && c < 24) cat[c]++;
         } else if (m != 0 && (m >> 28) == 8) {
             car_info_walk(d, ds, ds + s, nobj, cat);
