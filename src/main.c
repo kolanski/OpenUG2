@@ -593,13 +593,21 @@ int main(int argc, char **argv) {
         }
         carbb[0]=bb0[0];carbb[1]=bb0[1];carbb[2]=bb0[2];
         carbb[3]=bb1[0];carbb[4]=bb1[1];carbb[5]=bb1[2];  /* wheelT built per-frame from g_dbg */
-        /* Cull each stock wheel mesh's flat backing/hub-plane quad (the same
-           welded quad the library rims carry) so the car's OWN rim renders as
-           clean spokes, and remember its highest-LOD tier to instance at the
-           4 corners. */
+        /* Prep each stock wheel mesh: (1) the tyre is modelled with its solid
+           spoke/cap face inboard (low Y) and the hollow barrel mouth outboard,
+           so rotate it 180 deg about the vertical (Z) through its own Y-centre
+           -- (x,y)->(-x,-y) -- which flips the cap outward and centres the tyre
+           on the AttribSys track line; a rotation (not a mirror) keeps winding
+           and normals valid. (2) drop the flat backing/hub-plane quad so the
+           rim renders as clean spokes. Then remember the highest-LOD tier. */
         for (int i=0;i<ncar;i++) if (car.meshes[i].cat==N2_CAR_TIRE) {
-            rim_drop_welded_mesh(&car.meshes[i]);
-            if (stock_wheel<0 || car.meshes[i].nverts>car.meshes[stock_wheel].nverts) stock_wheel=i;
+            N2Mesh *m=&car.meshes[i];
+            float ty0=1e30f,ty1=-1e30f;
+            for(int v=0;v<m->nverts;v++){ float y=m->verts[v*5+1]; if(y<ty0)ty0=y; if(y>ty1)ty1=y; }
+            float ymid=0.5f*(ty0+ty1);
+            for(int v=0;v<m->nverts;v++){ m->verts[v*5]=-m->verts[v*5]; m->verts[v*5+1]=ymid-m->verts[v*5+1]; }
+            rim_drop_welded_mesh(m);
+            if (stock_wheel<0 || m->nverts>car.meshes[stock_wheel].nverts) stock_wheel=i;
         }
         cgm = upload_scene(&car);
         /* size the procedural tyre from the car's own wheel mesh (radius in X-Z,
@@ -992,10 +1000,15 @@ int main(int argc, char **argv) {
                     free(cgm); cgm = NULL;
                     n2_free_scene(&car);
                     ncar = n2_load_car(cdata, clen, &car, ckeys, nck, &carcfg);
-                    stock_wheel = -1;   /* re-cull wheels + re-find stock index for the new kit */
+                    stock_wheel = -1;   /* re-orient + re-cull wheels, re-find stock index */
                     for (int i=0;i<ncar;i++) if (car.meshes[i].cat==N2_CAR_TIRE) {
-                        rim_drop_welded_mesh(&car.meshes[i]);
-                        if (stock_wheel<0 || car.meshes[i].nverts>car.meshes[stock_wheel].nverts) stock_wheel=i;
+                        N2Mesh *m=&car.meshes[i];
+                        float ty0=1e30f,ty1=-1e30f;
+                        for(int v=0;v<m->nverts;v++){ float y=m->verts[v*5+1]; if(y<ty0)ty0=y; if(y>ty1)ty1=y; }
+                        float ymid=0.5f*(ty0+ty1);
+                        for(int v=0;v<m->nverts;v++){ m->verts[v*5]=-m->verts[v*5]; m->verts[v*5+1]=ymid-m->verts[v*5+1]; }
+                        rim_drop_welded_mesh(m);
+                        if (stock_wheel<0 || m->nverts>car.meshes[stock_wheel].nverts) stock_wheel=i;
                     }
                     cgm = upload_scene(&car);
                     printf("body kit -> KIT%02d (%d meshes)\n", carcfg.body_kit, ncar);
