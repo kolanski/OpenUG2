@@ -1565,6 +1565,12 @@ int main(int argc, char **argv) {
                     (is_light       && !g_dbg.show_lights)|| (c==N2_CAR_TIRE && !g_dbg.show_tires) ||
                     ((c==N2_CAR_MISC||c==N2_CAR_MECH) && !g_dbg.show_misc)) continue;
                 if (c == N2_CAR_GLASS) continue;   /* translucent: blended pass below */
+                /* Emissive lenses: light parts carry no diffuse texture (verified),
+                   so the unlit path (uColor out, no shadow darkening) IS the
+                   emissive channel -- uColor = light colour, its magnitude = the
+                   emissive intensity. Headlights glow at night; tail/brake lenses
+                   glow red (brighter on the brakes). Everything else stays lit. */
+                glUniform1f(uUnlit, is_light ? 1.0f : 0.0f);
                 /* plastic trim (bumpers/skirts, real per-part name tokens —
                    see n2_car_is_trim): duller and broader than the metallic
                    paint around it, so it doesn't read as the same "sticker"
@@ -1630,13 +1636,14 @@ int main(int argc, char **argv) {
                     glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, tex);  /* wheel/brake */
                 } else {
                     glUniform1f(uUseTex, 0.0f);
-                    if      (c == N2_CAR_LIGHT)      glUniform3f(uColor, 0.92f, 0.90f, 0.85f);  /* clear/chrome lens */
+                    if      (c == N2_CAR_LIGHT)      glUniform3f(uColor, 1.0f, 0.94f, 0.78f);  /* headlight ON: warm emissive lens */
                     else if (c == N2_CAR_BRAKELIGHT) {
                         /* lens glows hot while braking (S, rolling forward) or the
-                           handbrake (SPACE) is pulled; otherwise its unlit red. */
+                           handbrake (SPACE) is pulled; otherwise a dim red running
+                           light (still emissive, so it reads as "on" at night). */
                         int braking = (throttle < -0.1f && speed > 0.01f) || handbrake;
                         if (braking) glUniform3f(uColor, 1.0f, 0.16f, 0.10f);
-                        else         glUniform3f(uColor, 0.60f, 0.02f, 0.02f);
+                        else         glUniform3f(uColor, 0.62f, 0.05f, 0.04f);
                     }
                     else if (c == N2_CAR_TIRE)       glUniform3f(uColor, 0.05f, 0.05f, 0.06f);
                     else if (c == N2_CAR_MECH)       glUniform3f(uColor, 0.05f, 0.05f, 0.05f);  /* unpainted metal/plastic */
@@ -1671,6 +1678,7 @@ int main(int argc, char **argv) {
                 if (insp_on && g_dbg.insp_cull) glDisable(GL_CULL_FACE);
 #endif
             }
+            glUniform1f(uUnlit, 0.0f);   /* emissive lenses left it on; glass/wheels below are lit */
             /* glass pass: translucent tint, blended over the finished body,
                depth-write off (no self-occlusion), spec kept by the shader's
                uAlpha output. State restored before anything else draws. */
