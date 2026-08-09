@@ -570,6 +570,8 @@ int main(int argc, char **argv) {
     GpuMesh wheelmesh; int have_wheel = 0;       /* procedural tyre, built after GL init */
     for (int k=0;k<4;k++){ float I[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}; memcpy(wheelT[k],I,sizeof(I)); }
     float carbb[6] = {0,0,0,0,0,0};              /* body AABB min/max, for wheel placement */
+    float bloomc[4][4] = {{0}};                  /* light-cluster centroids (car-local) + valid
+                                                    flag: 0 front-L, 1 front-R, 2 rear-L, 3 rear-R */
     float carWheelR = 0.0f;                       /* car's stock wheel radius (rim fit) */
     N2CarProfile carprof; memset(&carprof, 0, sizeof carprof);   /* per-car dimensions */
     N2CarConfig carcfg = { 0, 0, 0, 0 };         /* active customization profile (K cycles kits) */
@@ -609,6 +611,19 @@ int main(int argc, char **argv) {
             rim_drop_welded_mesh(m);
             if (stock_wheel<0 || m->nverts>car.meshes[stock_wheel].nverts) stock_wheel=i;
         }
+        /* Light-bloom clusters: average the lens vertices in each of the 4
+           quadrants (front/rear x sign, left/right y sign) to get a halo anchor
+           per headlight/taillight group. A vertex threshold keeps a stray single
+           lamp from spawning a halo. */
+        { double a[4][3]={{0}}; long ln[4]={0,0,0,0};
+          for (int i=0;i<ncar;i++){ int c=car.meshes[i].cat;
+              if (c!=N2_CAR_LIGHT && c!=N2_CAR_BRAKELIGHT) continue;
+              for (int v=0;v<car.meshes[i].nverts;v++){ float *p=car.meshes[i].verts+v*5;
+                  int b=(p[0]<0?2:0)+(p[1]<0?1:0);
+                  a[b][0]+=p[0]; a[b][1]+=p[1]; a[b][2]+=p[2]; ln[b]++; } }
+          for (int b=0;b<4;b++) if (ln[b]>40) {
+              bloomc[b][0]=(float)(a[b][0]/ln[b]); bloomc[b][1]=(float)(a[b][1]/ln[b]);
+              bloomc[b][2]=(float)(a[b][2]/ln[b]); bloomc[b][3]=1.0f; } }
         cgm = upload_scene(&car);
         /* size the procedural tyre from the car's own wheel mesh (radius in X-Z,
            width in Y) so a Hummer gets big tyres and a compact gets small ones. */
@@ -1716,6 +1731,42 @@ int main(int argc, char **argv) {
 #endif
                     }
                 glUniform1f(uAlpha, 1.0f);
+                glDepthMask(GL_TRUE); glDisable(GL_BLEND);
+            }
+            /* Headlight/taillight bloom: a soft camera-facing additive halo over
+               each lens cluster -- night-time light diffusion the flat lens mesh
+               can't give on its own. Front clusters glow warm, rear red. Blend is
+               SRC_ALPHA/ONE (additive but alpha-shaped by uSoft's radial falloff,
+               so the halo has a soft edge; plain ONE/ONE would be a hard disc).
+               Depth-tested (occluded by nearer body) but no depth write; nudged
+               slightly toward the camera so it sits over its own lens. */
+            if (g_dbg.show_lights) {
+                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                glDepthMask(GL_FALSE);
+                glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
+                for (int b=0;b<4;b++){ if (bloomc[b][3]<0.5f) continue;
+                    float lx=bloomc[b][0], ly=bloomc[b][1], lz=bloomc[b][2];
+                    float wx=Model[0]*lx+Model[4]*ly+Model[8]*lz+Model[12];
+                    float wy=Model[1]*lx+Model[5]*ly+Model[9]*lz+Model[13];
+                    float wz=Model[2]*lx+Model[6]*ly+Model[10]*lz+Model[14];
+                    float vd[3]={wx-cam[0],wy-cam[1],wz-cam[2]};
+                    float vl=sqrtf(vd[0]*vd[0]+vd[1]*vd[1]+vd[2]*vd[2]); if (vl<1e-3f) continue;
+                    vd[0]/=vl; vd[1]/=vl; vd[2]/=vl;
+                    wx-=vd[0]*0.08f; wy-=vd[1]*0.08f; wz-=vd[2]*0.08f;   /* over its lens */
+                    float rt[3]={vd[1],-vd[0],0};                        /* = vd x worldUp(0,0,1) */
+                    float rl=sqrtf(rt[0]*rt[0]+rt[1]*rt[1]); if (rl<1e-3f) continue;
+                    rt[0]/=rl; rt[1]/=rl;
+                    float u2[3]={rt[1]*vd[2]-rt[2]*vd[1], rt[2]*vd[0]-rt[0]*vd[2], rt[0]*vd[1]-rt[1]*vd[0]};
+                    float sz=0.5f;
+                    float M[16]={ rt[0]*sz,rt[1]*sz,rt[2]*sz,0,  u2[0]*sz,u2[1]*sz,u2[2]*sz,0,  0,0,1,0,
+                                  wx-(rt[0]+u2[0])*sz*0.5f, wy-(rt[1]+u2[1])*sz*0.5f, wz-(rt[2]+u2[2])*sz*0.5f, 1 };
+                    float MV[16]; mat_mul(MVP,M,MV); glUniformMatrix4fv(uMVP,1,GL_FALSE,MV);
+                    if (b<2) glUniform3f(uColor, 0.90f,0.82f,0.55f);     /* front: warm white */
+                    else     glUniform3f(uColor, 0.90f,0.08f,0.05f);     /* rear: red */
+                    glUniform1f(uAlpha, 0.55f); draw_gpumesh(&quad); g_dbg.drawn++;
+                }
+                glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f); glUniform1f(uUnlit,0.0f);
+                glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
                 glDepthMask(GL_TRUE); glDisable(GL_BLEND);
             }
             /* procedural tyres at the 4 arches (the game rims render as urchins);
