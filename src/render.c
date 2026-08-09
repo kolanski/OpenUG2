@@ -547,13 +547,17 @@ void draw_gpumesh(GpuMesh *g) {
 #ifndef GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
 #  define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT 0x83F2
 #endif
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
+#  define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
+#endif
 int g_tex_s3tc = 0;
 
 GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
     if (g_tex_s3tc && t->dxtfmt && t->dxt && t->dxtlen > 0) {
         GLenum fmt = (t->dxtfmt == 3) ? GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
+                   : (t->dxtfmt == 5) ? GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
                                       : GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
-        int bpb = (t->dxtfmt == 3) ? 16 : 8;   /* S3TC block bytes */
+        int bpb = (t->dxtfmt == 1) ? 8 : 16;   /* S3TC block bytes (DXT3/DXT5 = 16) */
         GLuint id; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
         /* Replay every complete mip level in the blob (level 0 = base .. 1x1).
            Per-level block count matches n2_mipbytes2 exactly so the offsets line

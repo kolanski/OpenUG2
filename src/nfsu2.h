@@ -1217,6 +1217,36 @@ static void n2_dxt3(const unsigned char *src, int w, int h, unsigned char *out,
         }
 }
 
+/* DXT5/BC3: 8-byte interpolated alpha (2 endpoints + 3-bit indices), then the
+ * 8-byte DXT1 colour block. alf optional. */
+static void n2_dxt5(const unsigned char *src, int w, int h, unsigned char *out,
+                    unsigned char *alf) {
+    int bi = 0;
+    for (int by = 0; by < h; by += 4)
+        for (int bx = 0; bx < w; bx += 4) {
+            int a0 = src[bi], a1 = src[bi+1], al[8];
+            al[0] = a0; al[1] = a1;
+            if (a0 > a1) for (int k = 1; k <= 6; k++) al[k+1] = ((7-k)*a0 + k*a1)/7;
+            else { for (int k = 1; k <= 4; k++) al[k+1] = ((5-k)*a0 + k*a1)/5; al[6]=0; al[7]=255; }
+            uint64_t abits = 0; for (int k = 0; k < 6; k++) abits |= (uint64_t)src[bi+2+k] << (8*k);
+            uint16_t c0 = src[bi+8] | src[bi+9] << 8, c1 = src[bi+10] | src[bi+11] << 8;
+            uint32_t bits = n2_u32(src + bi + 12);
+            unsigned char pal[4][3];
+            n2_rgb565(c0, pal[0]); n2_rgb565(c1, pal[1]);
+            for (int j = 0; j < 3; j++) {
+                pal[2][j] = (2*pal[0][j]+pal[1][j])/3; pal[3][j] = (pal[0][j]+2*pal[1][j])/3;
+            }
+            for (int py = 0; py < 4; py++)
+                for (int px = 0; px < 4; px++) {
+                    int x = bx+px, y = by+py; if (x >= w || y >= h) continue;
+                    int pi = py*4+px;
+                    memcpy(out + (y*w+x)*3, pal[(bits >> (2*pi)) & 3], 3);
+                    if (alf) alf[y*w+x] = (unsigned char)al[(abits >> (3*pi)) & 7];
+                }
+            bi += 16;
+        }
+}
+
 /* JDLZ decompress (EA NFS). Writes up to out_cap bytes; returns bytes written. */
 static int n2_jdlz(const unsigned char *s, int slen, unsigned char *out, int out_cap) {
     if (slen < 16 || memcmp(s, "JDLZ", 4)) return 0;
@@ -1379,11 +1409,13 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
     uint32_t sz; const unsigned char *p = n2_tpk_slots(d, len, &sz);
     if (!p) return 0;
     t->dxt = NULL; t->dxtlen = 0; t->dxtfmt = 0;   /* raw-block fast path off by default */
-    int absoff = 0, enc = 0, dec = 0;
+    int absoff = 0, enc = 0, dec = 0; uint32_t hfe = 0;
     for (uint32_t i = 0; i + 0x18 <= sz; i += 0x18)
         if (n2_u32(p + i) == key) {
             absoff = (int)n2_u32(p + i + 4); enc = (int)n2_u32(p + i + 8);
-            dec = (int)n2_u32(p + i + 12); break;
+            dec = (int)n2_u32(p + i + 12);
+            hfe = n2_u32(p + i + 16);   /* +0x10: header_from_end (was mis-read as RefCount) */
+            break;
         }
     if (dec <= 0 || absoff < 0 || (long)absoff + enc > len) return 0;
     unsigned char *raw = (unsigned char *)malloc(dec);
@@ -1448,39 +1480,48 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
         }
     } else
         n2_jdlz(d + absoff, enc, raw, dec);
-    /* recover dims by matching the mip-chain byte total: square first (the
-       common case), then rectangular pairs (headlight strips, banners) —
-       orientation of a w!=h tie is unknowable from size alone, so wider-
-       than-tall wins (matches the rect atlases seen in the data). */
-    int tw = 0, th = 0, dxt3 = 0, bestd = 1 << 30;
-    for (int s = 8; s <= 1024; s <<= 1) {
-        int d1 = dec - n2_mipbytes2(s, s, 8), d3 = dec - n2_mipbytes2(s, s, 16);
-        if (d1 < 0) d1 = -d1; if (d3 < 0) d3 = -d3;
-        if (d1 < bestd) { bestd = d1; tw = th = s; dxt3 = 0; }
-        if (d3 < bestd) { bestd = d3; tw = th = s; dxt3 = 1; }
-    }
-    if (bestd > 256) {
-        for (int w = 16; w <= 1024; w <<= 1)
-            for (int h = 8; h < w; h <<= 1) {
-                int d1 = dec - n2_mipbytes2(w, h, 8), d3 = dec - n2_mipbytes2(w, h, 16);
-                if (d1 < 0) d1 = -d1; if (d3 < 0) d3 = -d3;
-                if (d1 < bestd) { bestd = d1; tw = w; th = h; dxt3 = 0; }
-                if (d3 < bestd) { bestd = d3; tw = w; th = h; dxt3 = 1; }
-            }
-    }
-    if (tw == 0 || bestd > 256) { free(raw); return 0; }
+    /* Exact format from the embedded texture header (independent RE), replacing
+       the old square-dimension size guess. The info header sits header_from_end
+       (slot +0x10) bytes before the payload end; P = dec - header_from_end +
+       0x88 lands on it. key @P+0 validates the slot, w/h are u16 @P+0x20/0x22,
+       and the byte @P+0x26 is the exact ImageCompressionType. */
+    long P = (long)dec - (long)hfe + 0x88;
+    if (P < 0 || P + 0x28 > dec) { free(raw); return 0; }
+    if (n2_u32(raw + P) != key) { free(raw); return 0; }          /* header sanity */
+    int tw = raw[P+0x20] | raw[P+0x21] << 8;
+    int th = raw[P+0x22] | raw[P+0x23] << 8;
+    unsigned fmt = raw[P+0x26];
+    if (tw < 1 || th < 1 || tw > 4096 || th > 4096) { free(raw); return 0; }
+    long n = (long)tw * th;
     t->w = tw; t->h = th;
-    t->rgb = (unsigned char *)malloc((long)tw*th*3);
-    /* keep DXT3's explicit alpha: it masks the body decals/badges */
-    t->alpha = dxt3 ? (unsigned char *)malloc((long)tw*th) : NULL;
-    if (dxt3) n2_dxt3(raw, tw, th, t->rgb, t->alpha);
-    else      n2_dxt1(raw, tw, th, t->rgb);
-    /* Keep the WHOLE compressed mip chain (base..1x1), not just the base level:
-       this slot passed the square-solve, so dec matches the full chain within a
-       block. The GPU uploader replays every level for mipmap filtering. */
-    t->dxtfmt = dxt3 ? 3 : 1;
-    t->dxtlen = n2_mipbytes2(tw, th, dxt3 ? 16 : 8);
-    if (t->dxtlen > dec) t->dxtlen = dec;   /* never read past the decoded blob */
+    if (fmt == 0x20) {                    /* uncompressed BGRA: no compressed upload */
+        if (n*4 > P) { free(raw); return 0; }
+        t->rgb = (unsigned char *)malloc(n*3);
+        t->alpha = (unsigned char *)malloc(n);
+        for (long q = 0; q < n; q++) {    /* B,G,R,A -> RGB + alpha plane */
+            t->rgb[q*3]   = raw[q*4+2]; t->rgb[q*3+1] = raw[q*4+1];
+            t->rgb[q*3+2] = raw[q*4];   t->alpha[q]   = raw[q*4+3];
+        }
+        free(raw); return 1;              /* dxtfmt stays 0 -> RGBA upload path */
+    }
+    if (fmt == 0x22) {                    /* DXT1 */
+        t->alpha = NULL; t->rgb = (unsigned char *)malloc(n*3);
+        n2_dxt1(raw, tw, th, t->rgb); t->dxtfmt = 1;
+    } else if (fmt == 0x24) {             /* DXT3 */
+        t->rgb = (unsigned char *)malloc(n*3); t->alpha = (unsigned char *)malloc(n);
+        n2_dxt3(raw, tw, th, t->rgb, t->alpha); t->dxtfmt = 3;
+    } else if (fmt == 0x26) {             /* DXT5 */
+        t->rgb = (unsigned char *)malloc(n*3); t->alpha = (unsigned char *)malloc(n);
+        n2_dxt5(raw, tw, th, t->rgb, t->alpha); t->dxtfmt = 5;
+    } else {                              /* palettised (0x08/0x80/0x81) / unknown */
+        fprintf(stderr, "car tex %08x: unhandled format 0x%02x (%dx%d) skipped\n", key, fmt, tw, th);
+        free(raw); return 0;
+    }
+    /* Keep the whole compressed mip chain (base..1x1) for the GPU fast path;
+       the header sits right after it, so cap at P. */
+    int bpb = (t->dxtfmt == 1) ? 8 : 16;
+    t->dxtlen = n2_mipbytes2(tw, th, bpb);
+    if (t->dxtlen > (int)P) t->dxtlen = (int)P;
     t->dxt = (unsigned char *)malloc(t->dxtlen);
     memcpy(t->dxt, raw, t->dxtlen);
     free(raw);
