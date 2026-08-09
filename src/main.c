@@ -1525,16 +1525,24 @@ int main(int argc, char **argv) {
               /* w = v/r per tick: speed is m/tick and this runs once per tick, so
                  the angle step is exactly speed/wR rad (the earlier *1/60 made the
                  tread crawl ~60x too slow -- ~3 rad/s instead of ~205 at 220 km/h). */
-              wang += speed / wR;
+              static float vsteer = 0.0f;
+              /* visual steer: ease the raw -1/0/1 key state toward a ~28 deg lock
+                 so the front wheels swing smoothly instead of snapping. Rotation is
+                 about the wheel's own centre (the mesh is modelled at the origin and
+                 the arch position lives in the translation column), so steering and
+                 spin can't swing it out of the arch. Demo mode drives both from a
+                 clock (free spin + sine steer) so the matrices can be verified with
+                 the car parked. */
+              if (g_dbg.wheel_demo) {
+                  static float dt = 0.0f; dt += 0.03f;
+                  wang += 0.18f;                                   /* free continuous spin */
+                  vsteer += (sinf(dt) * 0.5f - vsteer) * 0.25f;    /* +/-0.5 rad oscillation */
+              } else {
+                  wang += speed / wR;
+                  vsteer += (steer*0.50f - vsteer) * 0.25f;
+              }
               wang = fmodf(wang, 6.2831853f);
               float c = cosf(wang), sn = sinf(wang);
-              /* visual steer: ease the raw -1/0/1 key state toward a ~28 deg
-                 lock so the front wheels swing smoothly instead of snapping.
-                 Rotation is about the wheel's own centre (the mesh is modelled
-                 at the origin and the arch position lives in the translation
-                 column), so steering can't swing it out of the arch. */
-              static float vsteer = 0.0f;
-              vsteer += (steer*0.50f - vsteer) * 0.25f;
               float sc = cosf(vsteer), ss = sinf(vsteer);
               /* telemetry: wheel RPM from w=v/r (rad/s -> RPM) and steer angle */
               g_dbg.wheel_rpm = fabsf(speed / wR) * 60.0f * 9.5493f;

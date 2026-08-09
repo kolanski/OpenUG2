@@ -57,6 +57,7 @@ extern "C" void dbgui_frame(void) {
             ImGui::SliderFloat("ride height Y",&g_dbg.wheel.ride_y,     -0.5f, 0.5f, "%.3f m");
             ImGui::Text("wheelbase %.3f m", g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle);
             ImGui::SliderFloat("radius/scale", &g_dbg.wheel_scale, 0.3f, 2.0f);
+            ImGui::Checkbox("anim demo (free spin + sine steer)", (bool *)&g_dbg.wheel_demo);
             ImGui::Text("radius %.3f m   %.0f RPM   steer %+.1f deg",
                         g_dbg.wheel_radius, g_dbg.wheel_rpm, g_dbg.steer_deg);
         }

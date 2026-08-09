@@ -90,6 +90,8 @@ typedef struct {
     /* --- wheel placement: explicit per-car stance (see VehicleWheelConfig) --- */
     VehicleWheelConfig wheel;
     float wheel_scale;           /* rim radius multiplier (fits rim to the arch) */
+    int   wheel_demo;            /* 1 = drive spin/steer from a demo clock (free spin +
+                                    sine steer) instead of physics, to verify the matrices */
 
     /* --- lighting (fed to the shader as uniforms) --- */
     float ambient, diffuse, body_spec;
