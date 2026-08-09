@@ -87,6 +87,11 @@ typedef struct {
     int   freecam;
     float speed;                 /* freecam move units/frame */
 
+    /* --- chase camera (3rd-person follow): ideal pos = car - forward*distance
+       + up*height; actual pos and look-target ease toward their ideals by
+       `stiffness` each frame (exponential smoothing, fixed timestep) --- */
+    float chase_distance, chase_height, chase_stiffness;
+
     /* --- wheel placement: explicit per-car stance (see VehicleWheelConfig) --- */
     VehicleWheelConfig wheel;
     float wheel_scale;           /* rim radius multiplier (fits rim to the arch) */

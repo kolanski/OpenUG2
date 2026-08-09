@@ -37,6 +37,7 @@
  * normal build behaves exactly as before; `make debug` adds an ImGui panel. */
 DbgState g_dbg = {
     .freecam = 0, .speed = 0.6f,
+    .chase_distance = 10.0f, .chase_height = 4.5f, .chase_stiffness = 0.22f,
     .race_maxlaps_want = 2,
     /* .wheel (VehicleWheelConfig) is filled per car at load by wheel_config_for()
        -- an explicit table entry or a body-box fallback -- so no default here. */
@@ -1276,12 +1277,21 @@ int main(int argc, char **argv) {
             want[0] = carpos[0] + cosf(menuspin)*16.0f;
             want[1] = carpos[1] + sinf(menuspin)*16.0f;
             want[2] = carpos[2] + 8.0f;
-        } else {
-            want[0] = carpos[0]-fwd[0]*10; want[1] = carpos[1]-fwd[1]*10;
-            want[2] = carpos[2]+4.5f;
+        } else {                            /* chase: behind + above, tunable */
+            want[0] = carpos[0]-fwd[0]*g_dbg.chase_distance;
+            want[1] = carpos[1]-fwd[1]*g_dbg.chase_distance;
+            want[2] = carpos[2]+g_dbg.chase_height;
         }
-        for (int c=0;c<3;c++) cam[c] += (want[c]-cam[c])*0.22f; /* smooth follow */
-        float look[3] = { carpos[0]-cam[0], carpos[1]-cam[1], (carpos[2]+1.5f)-cam[2] };
+        /* exponential smoothing (fixed timestep): actual pos AND look-target each
+           ease toward their ideal by `stiffness`/frame -- the target lag is what
+           gives the spring/swing feel through corners. */
+        float k = g_dbg.chase_stiffness; if (k < 0.02f) k = 0.02f; if (k > 1.0f) k = 1.0f;
+        for (int c=0;c<3;c++) cam[c] += (want[c]-cam[c])*k;
+        static float camtgt[3]; static int camtgt_init = 0;
+        float idealtgt[3] = { carpos[0], carpos[1], carpos[2]+1.5f };  /* car centre, slightly up */
+        if (!camtgt_init) { camtgt[0]=idealtgt[0]; camtgt[1]=idealtgt[1]; camtgt[2]=idealtgt[2]; camtgt_init=1; }
+        for (int c=0;c<3;c++) camtgt[c] += (idealtgt[c]-camtgt[c])*k;
+        float look[3] = { camtgt[0]-cam[0], camtgt[1]-cam[1], camtgt[2]-cam[2] };
         if (g_dbg.freecam) {                 /* fly-through overrides the chase/orbit cam */
             cam[0]=fc[0]; cam[1]=fc[1]; cam[2]=fc[2];
             float cp=cosf(fpitch);

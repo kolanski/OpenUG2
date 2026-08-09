@@ -151,6 +151,15 @@ extern "C" void dbgui_frame(void) {
             ImGui::TextDisabled(g_dbg.night_mode ? "(lenses glow, headlights on)"
                                                  : "(daylight, lenses off)");
         }
+        if (ImGui::CollapsingHeader("Camera (3rd-person chase)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::SliderFloat("distance (back)", &g_dbg.chase_distance,  3.0f, 25.0f, "%.1f m");
+            ImGui::SliderFloat("height (up)",     &g_dbg.chase_height,    1.0f, 15.0f, "%.1f m");
+            ImGui::SliderFloat("stiffness (lerp)",&g_dbg.chase_stiffness, 0.02f, 1.0f, "%.2f/frame");
+            if (ImGui::Button("reset chase cam")) {
+                g_dbg.chase_distance=10.0f; g_dbg.chase_height=4.5f; g_dbg.chase_stiffness=0.22f;
+            }
+            ImGui::TextDisabled("low stiffness = looser spring; 1.0 = rigidly glued");
+        }
         if (ImGui::CollapsingHeader("Lighting / Fog", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::SliderFloat("ambient",   &g_dbg.ambient,   0.0f, 1.0f);
             ImGui::SliderFloat("diffuse",   &g_dbg.diffuse,   0.0f, 1.5f);
