@@ -91,6 +91,9 @@ typedef struct {
        + up*height; actual pos and look-target ease toward their ideals by
        `stiffness` each frame (exponential smoothing, fixed timestep) --- */
     float chase_distance, chase_height, chase_stiffness;
+    int   auto_drive;   /* 1 = feed steady throttle + sine steer to the physics so
+                           the car drives an S-curve hands-free (camera-spring test);
+                           interactive only -- never overrides the --shot autopilot */
 
     /* --- wheel placement: explicit per-car stance (see VehicleWheelConfig) --- */
     VehicleWheelConfig wheel;

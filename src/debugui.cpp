@@ -159,6 +159,9 @@ extern "C" void dbgui_frame(void) {
                 g_dbg.chase_distance=10.0f; g_dbg.chase_height=4.5f; g_dbg.chase_stiffness=0.22f;
             }
             ImGui::TextDisabled("low stiffness = looser spring; 1.0 = rigidly glued");
+            ImGui::Separator();
+            ImGui::Checkbox("Auto-Drive (camera test)", (bool *)&g_dbg.auto_drive);
+            ImGui::TextDisabled("steady throttle + sine steer -> hands-free S-curve");
         }
         if (ImGui::CollapsingHeader("Lighting / Fog", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::SliderFloat("ambient",   &g_dbg.ambient,   0.0f, 1.0f);

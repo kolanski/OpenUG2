@@ -1090,6 +1090,15 @@ int main(int argc, char **argv) {
         float steer = g_dbg.freecam ? 0.f
                     : (ks[SDL_SCANCODE_A]?1.f:0.f) - (ks[SDL_SCANCODE_D]?1.f:0.f);
         int handbrake = (race_state==1 && ks[SDL_SCANCODE_SPACE]);
+        /* Auto-drive (camera-spring test): steady throttle + smooth sine steer fed
+           straight into the physics, so the car throws itself through an S-curve
+           hands-free. Interactive only -- gated on !shot so it never fights the
+           headless --shot A* autopilot below. */
+        if (g_dbg.auto_drive && !shot) {
+            static float adt = 0.0f; adt += 0.02f;      /* ~5 s period at 60 Hz */
+            throttle = 1.0f;
+            steer = sinf(adt) * 0.9f;                   /* near-full-lock S-curve */
+        }
         /* push the ImGui handling sliders into the physics tune (stock when untouched) */
         g_phys_tune.accel = g_dbg.tune_accel; g_phys_tune.brake = g_dbg.tune_brake;
         g_phys_tune.turn = g_dbg.tune_turn;   g_phys_tune.top_kmh = g_dbg.tune_top;
