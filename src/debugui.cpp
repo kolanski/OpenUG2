@@ -47,6 +47,17 @@ extern "C" void dbgui_frame(void) {
 
     /* ---- Tab 1: Vehicle & Wheels ---- */
     if (ImGui::BeginTabItem("Vehicle & Wheels")) {
+        if (ImGui::CollapsingHeader("Vehicle Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
+            /* body paint -> u_PaintColor (uColor) when override is on; the draw
+               loop reads g_dbg.paint for BODY/MISC meshes, so this repaints live. */
+            ImGui::Checkbox("custom paint (override per-car colour)", (bool *)&g_dbg.paint_override);
+            ImGui::ColorEdit3("body paint (u_PaintColor)", g_dbg.paint);
+            if (ImGui::Button("Red"))    { g_dbg.paint_override=1; g_dbg.paint[0]=0.70f; g_dbg.paint[1]=0.05f; g_dbg.paint[2]=0.05f; } ImGui::SameLine();
+            if (ImGui::Button("Blue"))   { g_dbg.paint_override=1; g_dbg.paint[0]=0.05f; g_dbg.paint[1]=0.10f; g_dbg.paint[2]=0.60f; } ImGui::SameLine();
+            if (ImGui::Button("Black"))  { g_dbg.paint_override=1; g_dbg.paint[0]=0.02f; g_dbg.paint[1]=0.02f; g_dbg.paint[2]=0.03f; } ImGui::SameLine();
+            if (ImGui::Button("Silver")) { g_dbg.paint_override=1; g_dbg.paint[0]=0.60f; g_dbg.paint[1]=0.62f; g_dbg.paint[2]=0.66f; }
+            ImGui::TextDisabled("body kit: K cycles KIT00/01/02 (see console)");
+        }
         if (ImGui::CollapsingHeader("Wheel Stance (per-car, metres)", ImGuiTreeNodeFlags_DefaultOpen)) {
             /* Absolute stance for the active car -- edits apply next frame, since
                the wheel transforms are rebuilt from g_dbg.wheel every frame. */
@@ -57,7 +68,6 @@ extern "C" void dbgui_frame(void) {
             ImGui::SliderFloat("ride height Y",&g_dbg.wheel.ride_y,     -0.5f, 0.5f, "%.3f m");
             ImGui::Text("wheelbase %.3f m", g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle);
             ImGui::SliderFloat("radius/scale", &g_dbg.wheel_scale, 0.3f, 2.0f);
-            ImGui::Checkbox("anim demo (free spin + sine steer)", (bool *)&g_dbg.wheel_demo);
             ImGui::Text("radius %.3f m   %.0f RPM   steer %+.1f deg",
                         g_dbg.wheel_radius, g_dbg.wheel_rpm, g_dbg.steer_deg);
         }
@@ -97,9 +107,7 @@ extern "C" void dbgui_frame(void) {
             ImGui::Checkbox("tires",  (bool *)&g_dbg.show_tires);  ImGui::SameLine();
             ImGui::Checkbox("misc",   (bool *)&g_dbg.show_misc);   ImGui::SameLine();
             ImGui::Checkbox("track",  (bool *)&g_dbg.show_track);
-            ImGui::Checkbox("paint override", (bool *)&g_dbg.paint_override);
-            ImGui::ColorEdit3("paint", g_dbg.paint);
-            ImGui::TextDisabled("body kit: K cycles KIT00/01/02 (see console)");
+            ImGui::TextDisabled("body paint moved to Vehicle Controls");
         }
         if (ImGui::CollapsingHeader("Mesh Inspector")) {
             static const char *catn[] = {"ROAD","TERRAIN","OTHER","SKY","GLOW","?","?","?","?","?",
@@ -123,11 +131,26 @@ extern "C" void dbgui_frame(void) {
             ImGui::Checkbox("[Debug] Force Alpha Depth Write", (bool *)&g_dbg.insp_glass_depth);
             if (ImGui::Button("clear selection")) g_dbg.insp_sel = -1;
         }
+        if (ImGui::CollapsingHeader("Debug")) {
+            ImGui::Checkbox("anim demo (free spin + sine steer)", (bool *)&g_dbg.wheel_demo);
+            ImGui::TextDisabled("drives the wheel matrices off a clock so spin/steer");
+            ImGui::TextDisabled("can be verified with the car parked");
+        }
         ImGui::EndTabItem();
     }
 
     /* ---- Tab 2: Lighting & Environment ---- */
     if (ImGui::BeginTabItem("Lighting & Environment")) {
+        if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen)) {
+            /* Night mode: emissive light lenses + headlight pools/bloom + low
+               ambient. Toggling applies an ambient preset; the slider below still
+               fine-tunes it. The emissive/pool gating is read live in the draw. */
+            if (ImGui::Checkbox("Night Mode", (bool *)&g_dbg.night_mode))
+                g_dbg.ambient = g_dbg.night_mode ? 0.38f : 0.78f;
+            ImGui::SameLine();
+            ImGui::TextDisabled(g_dbg.night_mode ? "(lenses glow, headlights on)"
+                                                 : "(daylight, lenses off)");
+        }
         if (ImGui::CollapsingHeader("Lighting / Fog", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::SliderFloat("ambient",   &g_dbg.ambient,   0.0f, 1.0f);
             ImGui::SliderFloat("diffuse",   &g_dbg.diffuse,   0.0f, 1.5f);

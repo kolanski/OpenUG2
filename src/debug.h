@@ -94,6 +94,8 @@ typedef struct {
                                     sine steer) instead of physics, to verify the matrices */
 
     /* --- lighting (fed to the shader as uniforms) --- */
+    int   night_mode;   /* 1 = night: low ambient + emissive light lenses + headlight
+                           pools/bloom; 0 = day: raised ambient, lenses lit normally */
     float ambient, diffuse, body_spec;
     float body_env;   /* multiplier on the body/misc env-reflection strength (clearcoat sheen) */
     float vcolor;   /* 0..1 strength of world per-vertex prelight (baked AO/tint) */

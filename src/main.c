@@ -45,7 +45,8 @@ DbgState g_dbg = {
     .neon_on = 1, .neon_col = { 0.15f, 0.45f, 1.0f }, .neon_str = 0.85f,
     .rim_paint = 1, .rim_color = { 0.85f, 0.88f, 0.92f },   /* silver by default */
     .tune_accel = 1.0f, .tune_brake = 1.0f, .tune_turn = 1.0f, .tune_top = 220.0f,
-    .ambient = 0.38f, .diffuse = 0.62f, .body_spec = 0.50f,   /* glossy paint */
+    .night_mode = 1,                                          /* game ships at night */
+    .ambient = 0.38f, .diffuse = 0.62f, .body_spec = 0.50f,   /* glossy paint (night) */
     .body_env = 1.0f,                                          /* 1.0 = tuned clearcoat reflection */
     .vcolor = 1.0f,   /* full source prelight on world geometry */
     /* f(700m cull range) ~= 0.07 — far batches dissolve into the sky */
@@ -1440,8 +1441,8 @@ int main(int argc, char **argv) {
 
         /* headlights: warm soft light-pools cast on the road ahead (it's night),
            three overlapping ground glows that widen + fade with distance to read
-           as a headlight cone. Additive blend. */
-        if (race_state != 3) {
+           as a headlight cone. Additive blend. Night only. */
+        if (race_state != 3 && g_dbg.night_mode) {
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
             glDepthMask(GL_FALSE);
             glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
@@ -1593,7 +1594,7 @@ int main(int argc, char **argv) {
                    emissive channel -- uColor = light colour, its magnitude = the
                    emissive intensity. Headlights glow at night; tail/brake lenses
                    glow red (brighter on the brakes). Everything else stays lit. */
-                glUniform1f(uUnlit, is_light ? 1.0f : 0.0f);
+                glUniform1f(uUnlit, (is_light && g_dbg.night_mode) ? 1.0f : 0.0f);
                 /* plastic trim (bumpers/skirts, real per-part name tokens —
                    see n2_car_is_trim): duller and broader than the metallic
                    paint around it, so it doesn't read as the same "sticker"
@@ -1748,7 +1749,7 @@ int main(int argc, char **argv) {
                so the halo has a soft edge; plain ONE/ONE would be a hard disc).
                Depth-tested (occluded by nearer body) but no depth write; nudged
                slightly toward the camera so it sits over its own lens. */
-            if (g_dbg.show_lights) {
+            if (g_dbg.show_lights && g_dbg.night_mode) {   /* lens bloom: night only */
                 glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
                 glDepthMask(GL_FALSE);
                 glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
