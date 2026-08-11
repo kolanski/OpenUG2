@@ -1097,7 +1097,8 @@ int main(int argc, char **argv) {
         if (g_dbg.auto_drive && !shot) {
             static float adt = 0.0f; adt += 0.02f;      /* ~5 s period at 60 Hz */
             throttle = 1.0f;
-            steer = sinf(adt) * 0.9f;                   /* near-full-lock S-curve */
+            steer = sinf(adt) * 0.35f;                  /* gentle S -- hard lock scrubs
+                                                           off all the speed and it creeps */
         }
         /* push the ImGui handling sliders into the physics tune (stock when untouched) */
         g_phys_tune.accel = g_dbg.tune_accel; g_phys_tune.brake = g_dbg.tune_brake;
