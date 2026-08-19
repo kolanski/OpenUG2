@@ -1,8 +1,8 @@
-/* resource.h — OpenUG ResourceManager module: file mapping and asset
+/* resource.h — OpenUG2 ResourceManager module: file mapping and asset
  * discovery (which tracks / cars / circuits exist on disk). Chunk PARSING
  * stays in nfsu2.h — the ground-truth parser this module feeds. */
-#ifndef OPENUG_RESOURCE_H
-#define OPENUG_RESOURCE_H
+#ifndef OPENUG2_RESOURCE_H
+#define OPENUG2_RESOURCE_H
 
 #include "nfsu2.h"
 

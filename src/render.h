@@ -1,4 +1,4 @@
-/* render.h — OpenUG Renderer module: GL context-level state (shaders, buffers,
+/* render.h — OpenUG2 Renderer module: GL context-level state (shaders, buffers,
  * textures), the tiny column-major matrix library, the 3x5 bitmap font and the
  * dev PNG screenshot writer. Owns every gl* call that creates GPU objects;
  * main.c only binds/draws through GpuMesh + the RProg uniform handles.
@@ -6,8 +6,8 @@
  * Also the single home of the GL headers: desktop legacy GL 2.1 + GLSL 120, or
  * OpenGL ES 2.0 + GLSL 100 with -DN2_GLES — every module includes GL via here.
  */
-#ifndef OPENUG_RENDER_H
-#define OPENUG_RENDER_H
+#ifndef OPENUG2_RENDER_H
+#define OPENUG2_RENDER_H
 
 #include <SDL.h>
 #ifdef N2_GLES
@@ -44,6 +44,9 @@ typedef struct {
     uint32_t texkey;          /* first member mesh's TPK key (debugging) */
     GLuint tex;               /* resolved GL texture (0 = untextured fallback) */
     int nmesh;                /* source meshes merged in (drawn-mesh metric) */
+    int emit_idx;             /* pre-sort emission index: upload_world_batches
+                                 re-sorts by texture, so the draw-time array
+                                 index is NOT the index batch_emit saw (M79) */
     float bbox_min[3];        /* culling bounds */
     float bbox_max[3];
 } N2Batch;
@@ -93,8 +96,13 @@ void     draw_gpumesh(GpuMesh *g);
  * mtex = per-mesh resolved GL texture, texTerr = grass fallback for terrain
  * meshes without one. Sorted by texture so binds are rare. The CPU-side scene
  * is left untouched (physics reads it). Returns the batch count. */
+/* `audit` (Milestone 75): when non-NULL, the batch that swallows the source
+ * mesh of that sname is additionally verified vertex-by-vertex and reported on
+ * stdout. Purely additive — the GL upload is identical either way, so the audit
+ * observes the production path rather than a parallel reimplementation. */
 int  upload_world_batches(const N2Scene *s, const float (*mbb)[4],
-                          const GLuint *mtex, GLuint texTerr, N2Batch **out);
+                          const GLuint *mtex, GLuint texTerr, N2Batch **out,
+                          const char *audit);
 /* Same merge, but for one category (N2_SKY / N2_GLOW) pulled out of the main
  * batching pass above — grouped by texture only, no spatial cell/cull grid,
  * since there are only ever a handful of skybox/neon meshes per city. */

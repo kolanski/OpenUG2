@@ -1,4 +1,4 @@
-/* render.c — OpenUG Renderer module implementation. Everything here was
+/* render.c — OpenUG2 Renderer module implementation. Everything here was
  * extracted verbatim from the original monolithic main.c; the parsing logic
  * (nfsu2.h) is untouched ground truth. */
 #include <stdio.h>
@@ -303,9 +303,110 @@ static int btex_cmp(const void *a, const void *b) {   /* final texture order */
 #define BATCH_CELL     256.0f   /* grid cell edge, metres */
 #define BATCH_MAXVERTS 65535    /* u16 indices (GLES2: no u32 without ext) */
 
+/* Milestone 75: the VBO layout draw_batch() hardcodes must equal the struct's
+ * real layout. Compile-time (C99: negative array size, not C11 _Static_assert),
+ * so a field reorder becomes a build error instead of scrambled attributes. */
+typedef char n2_batchvertex_layout_check[
+    (offsetof(BatchedVertex, pos)    ==  0 &&
+     offsetof(BatchedVertex, uv)     == 12 &&
+     offsetof(BatchedVertex, normal) == 20 &&
+     offsetof(BatchedVertex, col)    == 32 &&
+     sizeof(BatchedVertex)           == 36) ? 1 : -1];
+
+/* Milestone 79: dump one batch's member list, in the exact order
+ * upload_world_batches partitioned it -- this runs inside batch_emit, so the
+ * (ent, i0, i1) run IS the production run; nothing is re-sorted or re-derived. */
+static void batch_members_report(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
+                                 int bidx, GLuint tex, const N2Batch *bref) {
+    (void)bref;
+    printf("MILESTONE: 79\n");
+    printf("batch index   %d\n", bidx);
+    printf("texkey        %08x   gl_tex %u   nmesh %d\n",
+           s->meshes[ent[i0].idx].texkey, (unsigned)tex, i1 - i0);
+    float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
+    for (int k = i0; k < i1; k++) {
+        const N2Mesh *m = &s->meshes[ent[k].idx];
+        for (int v = 0; v < m->nverts; v++)
+            for (int c = 0; c < 3; c++) {
+                float p = m->verts[v*5+c];
+                if (p < mn[c]) mn[c] = p; if (p > mx[c]) mx[c] = p;
+            }
+    }
+    printf("bounds        x[%.1f %.1f] y[%.1f %.1f] z[%.1f %.1f]\n",
+           mn[0], mx[0], mn[1], mx[1], mn[2], mx[2]);
+    printf("%5s  %-30s %-9s %-44s %8s\n",
+           "mesh", "asset name", "class", "bounds x/y/z", "tris");
+    for (int k = i0; k < i1; k++) {
+        const N2Mesh *m = &s->meshes[ent[k].idx];
+        float a[3] = {1e30f,1e30f,1e30f}, b[3] = {-1e30f,-1e30f,-1e30f};
+        for (int v = 0; v < m->nverts; v++)
+            for (int c = 0; c < 3; c++) {
+                float p = m->verts[v*5+c];
+                if (p < a[c]) a[c] = p; if (p > b[c]) b[c] = p;
+            }
+        char bb[64];
+        snprintf(bb, sizeof bb, "[%.0f %.0f][%.0f %.0f][%.1f %.1f]",
+                 a[0], b[0], a[1], b[1], a[2], b[2]);
+        printf("%5d  %-30s %-9s %-44s %8d\n",
+               ent[k].idx, m->sname[0] ? m->sname : "(unnamed)",
+               n2_scen_name(m->scen), bb, m->nidx / 3);
+    }
+}
+
+/* Verify one source mesh survived the merge into `bv`/`bi` byte-exactly. */
+static void batch_audit_report(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
+                               const BatchedVertex *bv, const uint16_t *bi,
+                               int bidx, const char *want) {
+    int vo = 0, io = 0;
+    for (int k = i0; k < i1; k++) {
+        const N2Mesh *m = &s->meshes[ent[k].idx];
+        if (strcmp(m->sname, want)) { vo += m->nverts; io += m->nidx; continue; }
+
+        int bad_pos = 0, bad_idx = 0, first_bad = -1;
+        for (int v = 0; v < m->nverts; v++) {
+            const float *p = m->verts + v*5;
+            const BatchedVertex *o = &bv[vo + v];
+            if (memcmp(o->pos, p, 3*sizeof(float))) {
+                bad_pos++; if (first_bad < 0) first_bad = v;
+            }
+        }
+        for (int t = 0; t < m->nidx; t++)
+            if (bi[io + t] != (uint16_t)(m->idx[t] + vo)) bad_idx++;
+
+        printf("MILESTONE: 75\n");
+        printf("mesh name                        %s\n", m->sname);
+        printf("source mesh index                %d\n", ent[k].idx);
+        printf("source vertex count / index count %d / %d\n", m->nverts, m->nidx);
+        printf("source first 3 position vertices ");
+        for (int v = 0; v < 3 && v < m->nverts; v++)
+            printf("(%.4f %.4f %.4f) ", m->verts[v*5], m->verts[v*5+1], m->verts[v*5+2]);
+        printf("\nsource first 3 indices           ");
+        for (int t = 0; t < 3 && t < m->nidx; t++) printf("%u ", m->idx[t]);
+        printf("\nselected batch index             %d\n", bidx);
+        printf("batch source-mesh count          %d\n", i1 - i0);
+        printf("batched vertex offset            %d\n", vo);
+        printf("batched first 3 corresponding position vertices ");
+        for (int v = 0; v < 3 && v < m->nverts; v++)
+            printf("(%.4f %.4f %.4f) ", bv[vo+v].pos[0], bv[vo+v].pos[1], bv[vo+v].pos[2]);
+        printf("\nbatched remapped first 3 indices ");
+        for (int t = 0; t < 3 && t < m->nidx; t++) printf("%u ", bi[io + t]);
+        printf("\nvertex layout   pos@%d uv@%d normal@%d col@%d stride %d\n",
+               (int)offsetof(BatchedVertex, pos), (int)offsetof(BatchedVertex, uv),
+               (int)offsetof(BatchedVertex, normal), (int)offsetof(BatchedVertex, col),
+               (int)sizeof(BatchedVertex));
+        printf("positions mismatched %d/%d   indices mismatched %d/%d",
+               bad_pos, m->nverts, bad_idx, m->nidx);
+        if (first_bad >= 0) printf("   (first bad vertex %d)", first_bad);
+        printf("\nmax remapped index %d vs batch vertex ceiling %d\n",
+               (int)(m->idx[0] + vo), BATCH_MAXVERTS);
+        printf("RESULT: %s\n", (bad_pos || bad_idx) ? "MISMATCH" : "MATCH");
+        return;
+    }
+}
+
 /* merge meshes [i0,i1) of the sort array into one uploaded batch */
 static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
-                       GLuint tex, N2Batch *b) {
+                       GLuint tex, N2Batch *b, int bidx, const char *audit) {
     int nv = 0, ni = 0;
     for (int k = i0; k < i1; k++) {
         nv += s->meshes[ent[k].idx].nverts; ni += s->meshes[ent[k].idx].nidx;
@@ -335,19 +436,21 @@ static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
         vo += m->nverts; io += m->nidx;
         free(nor);
     }
+    if (audit && audit[0] != '#') batch_audit_report(s, ent, i0, i1, bv, bi, bidx, audit);
     memset(b, 0, sizeof *b);
     glGenBuffers(1, &b->vbo); glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
     glBufferData(GL_ARRAY_BUFFER, (long)nv * (long)sizeof *bv, bv, GL_STATIC_DRAW);
     glGenBuffers(1, &b->ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->ibo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, (long)ni * 2, bi, GL_STATIC_DRAW);
-    b->index_count = ni; b->tex = tex; b->nmesh = i1 - i0;
+    b->index_count = ni; b->tex = tex; b->nmesh = i1 - i0; b->emit_idx = bidx;
     b->texkey = s->meshes[ent[i0].idx].texkey;
     for (int c = 0; c < 3; c++) { b->bbox_min[c] = mn[c]; b->bbox_max[c] = mx[c]; }
     free(bv); free(bi);
 }
 
 int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
-                         const GLuint *mtex, GLuint texTerr, N2Batch **out) {
+                         const GLuint *mtex, GLuint texTerr, N2Batch **out,
+                         const char *audit) {
     int n = s->count;
     /* world extent -> grid coords */
     float x0 = 1e30f, y0 = 1e30f;
@@ -375,19 +478,36 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
     /* walk key runs, splitting a run at the u16 vertex ceiling */
     int cap = 256, nb = 0;
     N2Batch *bat = (N2Batch *)malloc((size_t)cap * sizeof *bat);
+    /* run boundaries per emission index, so a post-sort audit can replay the
+       SAME partition rather than re-deriving one (M79) */
+    int *run0 = (int *)malloc((size_t)cap * sizeof *run0);
+    int *run1 = (int *)malloc((size_t)cap * sizeof *run1);
     int i0 = 0, verts = 0;
     for (int i = 0; i <= m; i++) {
         int flush = (i == m) || (i > i0 && ent[i].key != ent[i0].key) ||
                     (i > i0 && verts + s->meshes[ent[i].idx].nverts > BATCH_MAXVERTS);
         if (flush && i > i0) {
-            if (nb == cap) { cap *= 2; bat = (N2Batch *)realloc(bat, (size_t)cap * sizeof *bat); }
-            batch_emit(s, ent, i0, i, (GLuint)(ent[i0].key & 0xffffffffu), &bat[nb++]);
+            if (nb == cap) { cap *= 2; bat = (N2Batch *)realloc(bat, (size_t)cap * sizeof *bat);
+                run0 = (int *)realloc(run0, (size_t)cap * sizeof *run0);
+                run1 = (int *)realloc(run1, (size_t)cap * sizeof *run1); }
+            batch_emit(s, ent, i0, i, (GLuint)(ent[i0].key & 0xffffffffu), &bat[nb], nb, audit);
+            run0[nb] = i0; run1[nb] = i; nb++;
             i0 = i; verts = 0;
         }
         if (i < m) verts += s->meshes[ent[i].idx].nverts;
     }
-    free(ent);
     qsort(bat, (size_t)nb, sizeof *bat, btex_cmp);   /* minimise texture binds */
+    /* "#N" audits the batch the RENDERER calls N, i.e. wbatch[N] after this
+       sort. Membership is replayed from that batch's own recorded emission run,
+       so it is the production partition, not a second derivation. */
+    if (audit && audit[0] == '#') {
+        int want = atoi(audit + 1);
+        if (want >= 0 && want < nb) {
+            int e = bat[want].emit_idx;
+            batch_members_report(s, ent, run0[e], run1[e], want, bat[want].tex, &bat[want]);
+        } else fprintf(stderr, "batch audit: #%d out of range (0..%d)\n", want, nb-1);
+    }
+    free(ent); free(run0); free(run1);
     *out = bat;
     return nb;
 }
@@ -410,7 +530,8 @@ int upload_cat_batches(const N2Scene *s, int cat, const GLuint *mtex, N2Batch **
                     (i > i0 && verts + s->meshes[ent[i].idx].nverts > BATCH_MAXVERTS);
         if (flush && i > i0) {
             if (nb == cap) { cap *= 2; bat = (N2Batch *)realloc(bat, (size_t)cap * sizeof *bat); }
-            batch_emit(s, ent, i0, i, (GLuint)ent[i0].key, &bat[nb++]);
+            batch_emit(s, ent, i0, i, (GLuint)ent[i0].key, &bat[nb], nb, NULL);
+            nb++;
             i0 = i; verts = 0;
         }
         if (i < m) verts += s->meshes[ent[i].idx].nverts;

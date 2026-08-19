@@ -6,8 +6,8 @@
  *     float normal[3];@20    unsigned char col[4]; @32  (RGBA8 prelight, normalized)
  * Attribute state is (re)specified per draw, exactly like render.c's draw_batch.
  * Indices are u16 to match the engine's 65535-vertex batch ceiling. */
-#ifndef OPENUG_WORLD_MESH_H
-#define OPENUG_WORLD_MESH_H
+#ifndef OPENUG2_WORLD_MESH_H
+#define OPENUG2_WORLD_MESH_H
 
 #include <stdint.h>
 #include "render.h"   /* BatchedVertex + the GL headers (single home) */
@@ -38,4 +38,4 @@ void destroy_world_mesh_batch(WorldMeshBatch *b);
    Binds a_Position/a_Normal/a_UV0/a_Color to locations 0..3. */
 GLuint world_debug_program_load(const char *vert_path, const char *frag_path);
 
-#endif /* OPENUG_WORLD_MESH_H */
+#endif /* OPENUG2_WORLD_MESH_H */

@@ -1,8 +1,8 @@
-/* audio.h — OpenUG Audio module: a procedural engine/road/skid/thud synth
+/* audio.h — OpenUG2 Audio module: a procedural engine/road/skid/thud synth
  * (no audio assets). The main thread writes the g_* controls, the SDL audio
  * thread reads them — benign float races. */
-#ifndef OPENUG_AUDIO_H
-#define OPENUG_AUDIO_H
+#ifndef OPENUG2_AUDIO_H
+#define OPENUG2_AUDIO_H
 
 #include <SDL.h>
 #include <stdint.h>

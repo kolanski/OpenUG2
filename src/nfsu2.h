@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 /* One drawable submesh: interleaved [px,py,pz,u,v] verts + u16 triangle list. */
 enum { N2_ROAD = 0, N2_TERRAIN = 1, N2_OTHER = 2, N2_SKY = 3, N2_GLOW = 4,
@@ -370,6 +371,121 @@ static void n2_mesh_name(const unsigned char *d, long beg, long end,
     }
 }
 
+/* ---- --vista-census (Milestone 76): measured backdrop-impostor evidence ----
+ * Same traversal boundaries as n2_walk_meshes. For every object it measures the
+ * world-space geometry the renderer would actually draw, so impostor detection
+ * can rest on measurement instead of spelling. Diagnostic; the classifier below
+ * is what the parser consults. */
+typedef struct {
+    float xyspan, zspan;      /* world AABB extents */
+    long  tris;
+    float dom[3];             /* area-weighted mean normal, normalized */
+    float planarity;          /* area-weighted mean |dot(n_i, dom)|: 1 = one flat sheet */
+    float area;
+} N2Geom;
+
+/* Measure one 0x80134010 object exactly as n2_walk_meshes would build it:
+ * every 0x134B01/0x134B03 leaf pair, stride 24, placed by the object matrix. */
+static int n2_obj_geom(const unsigned char *d, long beg, long end,
+                       const float *m, N2Geom *g) {
+    memset(g, 0, sizeof *g);
+    float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
+    double nsum[3] = {0,0,0}, asum = 0;
+    N2Leaf vtx[64], idx[64]; int nv = 0, ni = 0;
+    n2_find_leaves(d, beg, end, 0x00134B01u, vtx, &nv, 64);
+    n2_find_leaves(d, beg, end, 0x00134B03u, idx, &ni, 64);
+    int pairs = nv < ni ? nv : ni;
+    if (!pairs) return 0;
+
+    /* two passes over each pair: positions first (bbox), then triangles */
+    for (int k = 0; k < pairs; k++) {
+        const unsigned char *vb = d + vtx[k].off;
+        int pad = n2_skip_filler(vb, (int)vtx[k].size), body = (int)vtx[k].size - pad;
+        if (body <= 0 || body % 24) continue;
+        int n = body / 24; const unsigned char *rec = vb + pad;
+        float *wp = (float *)malloc((size_t)n * 3 * sizeof(float));
+        if (!wp) continue;
+        for (int i = 0; i < n; i++) {
+            float px, py, pz;
+            memcpy(&px, rec+i*24,   4);
+            memcpy(&py, rec+i*24+4, 4);
+            memcpy(&pz, rec+i*24+8, 4);
+            wp[i*3+0] = px*m[0]+py*m[4]+pz*m[8] +m[12];
+            wp[i*3+1] = px*m[1]+py*m[5]+pz*m[9] +m[13];
+            wp[i*3+2] = px*m[2]+py*m[6]+pz*m[10]+m[14];
+            for (int c = 0; c < 3; c++) {
+                if (wp[i*3+c] < mn[c]) mn[c] = wp[i*3+c];
+                if (wp[i*3+c] > mx[c]) mx[c] = wp[i*3+c];
+            }
+        }
+        const unsigned char *ib0 = d + idx[k].off;
+        int ibytes = (int)idx[k].size, ip = 0;
+        while (ip + 2 <= ibytes && ib0[ip] == 0x11 && ib0[ip+1] == 0x11) ip += 2;
+        const unsigned char *ib = ib0 + ip;
+        int nidx = (ibytes - ip) / 2;
+        for (int t = 0; t + 2 < nidx; t += 3) {
+            unsigned a = (unsigned)(ib[t*2] | ib[t*2+1] << 8);
+            unsigned b = (unsigned)(ib[(t+1)*2] | ib[(t+1)*2+1] << 8);
+            unsigned c = (unsigned)(ib[(t+2)*2] | ib[(t+2)*2+1] << 8);
+            if ((int)a >= n || (int)b >= n || (int)c >= n) continue;
+            float e1[3], e2[3], nr[3];
+            for (int j = 0; j < 3; j++) { e1[j] = wp[b*3+j]-wp[a*3+j];
+                                          e2[j] = wp[c*3+j]-wp[a*3+j]; }
+            nr[0] = e1[1]*e2[2]-e1[2]*e2[1];
+            nr[1] = e1[2]*e2[0]-e1[0]*e2[2];
+            nr[2] = e1[0]*e2[1]-e1[1]*e2[0];
+            float len = sqrtf(nr[0]*nr[0]+nr[1]*nr[1]+nr[2]*nr[2]);
+            if (len < 1e-9f) continue;                 /* degenerate sliver */
+            float ar = len * 0.5f;
+            for (int j = 0; j < 3; j++) nsum[j] += (double)(nr[j]/len) * ar;
+            asum += ar; g->tris++;
+        }
+        free(wp);
+    }
+    if (mn[0] > mx[0] || asum <= 0) return 0;
+    float sx = mx[0]-mn[0], sy = mx[1]-mn[1];
+    g->xyspan = sx > sy ? sx : sy;
+    g->zspan  = mx[2]-mn[2];
+    g->area   = (float)asum;
+    double dl = sqrt(nsum[0]*nsum[0]+nsum[1]*nsum[1]+nsum[2]*nsum[2]);
+    if (dl < 1e-12) return 1;                          /* normals cancel: a shell */
+    for (int j = 0; j < 3; j++) g->dom[j] = (float)(nsum[j]/dl);
+    /* |mean normal| / total area is already the area-weighted coherence: a single
+       flat sheet keeps its full length, a closed shell cancels to ~0. */
+    g->planarity = (float)(dl / asum);
+    return 1;
+}
+
+/* Confirmed vista-impostor families, measured across all eight shipped bundles
+ * (see --vista-census). These are the backdrop asset families, NOT a substring
+ * net: each is anchored so it cannot swallow an ordinary asset that merely
+ * contains the letters. PANARAMA is retail's own misspelling of "panorama". */
+static int n2_vista_family(const char *nm) {
+    /* NOT PAN_: those keep their own unconditional cull in n2_walk_meshes. The
+       census proves 27 of the 38 PAN_ assets are small modelled backdrop blocks
+       (spans 69..2265 m, planarity down to 0.005 -- closed shells, not sheets),
+       so routing them through a size test would put them all back in the world. */
+    if (!strncmp(nm, "TRN_PANARAMA", 12)) return 1;           /* L4RB/L4RG naming */
+    { size_t L = strlen(nm);                                  /* ..._WORLD_LOD tail */
+      if (L >= 10 && !strcmp(nm + L - 10, "_WORLD_LOD")) return 1; }
+    return 0;
+}
+
+/* A backdrop impostor is a confirmed-family asset that ALSO measures as a giant
+ * billboard: city-scale footprint, a real vertical wall of geometry, and near-
+ * planar (one dominant normal). Both halves are required -- family alone would
+ * trust spelling, geometry alone would eat legitimate large terrain sheets. */
+#define N2_VISTA_XY     3000.0f   /* footprint larger than any real ground sheet */
+#define N2_VISTA_Z       300.0f   /* a backdrop is a tall wall, terrain is not */
+/* Measured: the three leaking backdrops sit at 0.707/0.759/0.904. The nearest
+   non-family object at this scale is SKYDOME at 0.637 (a closed shell, whose
+   normals cancel), so 0.65 separates sheet from shell with the sample's own gap. */
+#define N2_VISTA_PLANAR    0.65f
+static int n2_is_vista_impostor(const char *nm, const N2Geom *g) {
+    return n2_vista_family(nm) && g->xyspan >= N2_VISTA_XY &&
+           g->zspan >= N2_VISTA_Z && g->planarity >= N2_VISTA_PLANAR;
+}
+
 static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *scene,
                            const uint32_t *keys, int nkeys) {
     long o = beg;
@@ -392,6 +508,16 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
             if (!strncmp(anm, "PAN", 3)) { o = ds + size; continue; }
             uint32_t tk = n2_mesh_texkey_cat(d, ds, ds + size, cat, keys, nkeys);
             float objm[16]; n2_obj_matrix(d, ds, ds + size, objm);   /* world placement */
+            /* Backdrop impostors the PAN_ prefix above does not catch: retail
+               names the same job TRN_PANARAMA* / *_WORLD_LOD in some bundles, so
+               they were reaching the world as ordinary opaque TERRAIN and walling
+               the camera in (Milestone 75). Family test first -- it is free, and
+               the geometry measure below allocates. */
+            if (n2_vista_family(anm)) {
+                N2Geom vg;
+                if (n2_obj_geom(d, ds, ds + size, objm, &vg) &&
+                    n2_is_vista_impostor(anm, &vg)) { o = ds + size; continue; }
+            }
             N2Leaf vtx[64], idx[64]; int nv = 0, ni = 0;
             n2_find_leaves(d, ds, ds + size, 0x00134B01u, vtx, &nv, 64);
             n2_find_leaves(d, ds, ds + size, 0x00134B03u, idx, &ni, 64);
@@ -414,6 +540,193 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
         }
         o = ds + size;
     }
+}
+
+/* ---- --transform-audit (Milestone 74): GL-free placement forensics ----
+ * Mirrors n2_walk_meshes' traversal boundaries exactly (same magics, same
+ * recursion rule, same leaf finder, same 24B/uv@16 vertex convention) but
+ * builds no scene: it prints each object's placement evidence so the current
+ * transform convention can be checked against the alternatives. Diagnostic
+ * only -- nothing here is on the render path. */
+typedef struct {
+    int quota[3];          /* remaining prints: 0 terrain/road, 1 XB, 2 prop */
+    int nobj, nmtx;        /* objects seen / with a matrix that passed w-check */
+    int n11_hist[5];       /* how many 0x134011 leaves each object owns (4+ = [4]) */
+    int nested;            /* objects containing a nested 0x80134010 */
+    int bycls[8], mtxbycls[8];
+    int rot3x3, trans_only, ident;   /* 3x3 is rotated/scaled / pure translation / full identity */
+    float maxdet;
+} N2Audit;
+
+static void n2_aabb_local(const unsigned char *d, N2Leaf v, float *mn, float *mx,
+                          int *nvert, long *vtxoff) {
+    mn[0]=mn[1]=mn[2]=1e30f; mx[0]=mx[1]=mx[2]=-1e30f; *nvert = 0;
+    const unsigned char *vb = d + v.off;
+    int pad = n2_skip_filler(vb, (int)v.size), body = (int)v.size - pad;
+    *vtxoff = v.off + pad;
+    if (body <= 0 || body % 24) return;
+    int n = body / 24; const unsigned char *rec = vb + pad;
+    for (int i = 0; i < n; i++)
+        for (int c = 0; c < 3; c++) {
+            float f; memcpy(&f, rec + i*24 + c*4, 4);
+            if (f < mn[c]) mn[c] = f; if (f > mx[c]) mx[c] = f;
+        }
+    *nvert = n;
+}
+
+/* AABB of the local box's 8 corners under a transform. conv 0 = current
+ * (row-vector: v*M, translation m[12..14]); conv 1 = transposed (M*v,
+ * translation m[3,7,11]). */
+static void n2_aabb_xform(const float *lmn, const float *lmx, const float *m,
+                          int conv, float *mn, float *mx) {
+    mn[0]=mn[1]=mn[2]=1e30f; mx[0]=mx[1]=mx[2]=-1e30f;
+    for (int k = 0; k < 8; k++) {
+        float p[3] = { (k&1)?lmx[0]:lmn[0], (k&2)?lmx[1]:lmn[1], (k&4)?lmx[2]:lmn[2] }, w[3];
+        if (conv == 0) {
+            w[0] = p[0]*m[0]+p[1]*m[4]+p[2]*m[8] +m[12];
+            w[1] = p[0]*m[1]+p[1]*m[5]+p[2]*m[9] +m[13];
+            w[2] = p[0]*m[2]+p[1]*m[6]+p[2]*m[10]+m[14];
+        } else {
+            w[0] = p[0]*m[0]+p[1]*m[1]+p[2]*m[2] +m[3];
+            w[1] = p[0]*m[4]+p[1]*m[5]+p[2]*m[6] +m[7];
+            w[2] = p[0]*m[8]+p[1]*m[9]+p[2]*m[10]+m[11];
+        }
+        for (int c = 0; c < 3; c++) { if (w[c]<mn[c]) mn[c]=w[c]; if (w[c]>mx[c]) mx[c]=w[c]; }
+    }
+}
+
+static void n2_audit_meshes(const unsigned char *d, long beg, long end, N2Audit *a) {
+    long o = beg;
+    while (o + 8 <= end) {
+        uint32_t magic = n2_u32(d + o), size = n2_u32(d + o + 4);
+        long ds = o + 8;
+        if (magic == 0x80134010u) {
+            char anm[40]; n2_mesh_name(d, ds, ds + size, anm, sizeof anm);
+            int sc = n2_scen_class(anm);
+            float m[16]; int has = n2_obj_matrix(d, ds, ds + size, m);
+            N2Leaf h[2]; int n11 = 0;
+            n2_find_leaves(d, ds, ds + size, 0x00134011u, h, &n11, 2);
+            /* an object is "nested" if a child 0x80134010 lives inside it */
+            int nest = 0;
+            for (long q = ds; q + 8 <= ds + size; ) {
+                uint32_t mg = n2_u32(d+q), sz = n2_u32(d+q+4);
+                if (mg == 0x80134010u) { nest = 1; break; }
+                if (mg != 0 && (mg >> 28) == 8) { q += 8; continue; }   /* descend */
+                q += 8 + sz;
+            }
+            N2Leaf vtx[64], idx[64]; int nv = 0, ni = 0;
+            n2_find_leaves(d, ds, ds + size, 0x00134B01u, vtx, &nv, 64);
+            n2_find_leaves(d, ds, ds + size, 0x00134B03u, idx, &ni, 64);
+
+            /* is the 3x3 anything other than identity? If placement were only
+               ever a translation, the rotation half would be read from the
+               wrong offset (or not stored here at all). */
+            { float dev = 0;
+              for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) {
+                  float e = m[r*4+c] - (r == c ? 1.0f : 0.0f);
+                  if (e < 0) e = -e; if (e > dev) dev = e; }
+              float det = m[0]*(m[5]*m[10]-m[6]*m[9]) - m[1]*(m[4]*m[10]-m[6]*m[8])
+                        + m[2]*(m[4]*m[9]-m[5]*m[8]);
+              if (det > a->maxdet) a->maxdet = det;
+              if (dev > 1e-3f) a->rot3x3++;
+              else if (m[12] || m[13] || m[14]) a->trans_only++;
+              else a->ident++; }
+
+            a->nobj++; a->nmtx += has; a->nested += nest;
+            a->n11_hist[n11 > 4 ? 4 : n11]++;
+            if (sc >= 0 && sc < 8) { a->bycls[sc]++; a->mtxbycls[sc] += has; }
+
+            int b = (sc == N2_SC_TERRAIN) ? 0 : (sc == N2_SC_BUILDING) ? 1 :
+                    (sc == N2_SC_PROP || sc == N2_SC_STRUCT || sc == N2_SC_WALL) ? 2 : -1;
+            if (b >= 0 && a->quota[b] > 0 && nv > 0) {
+                a->quota[b]--;
+                float lmn[3], lmx[3], cmn[3], cmx[3], tmn[3], tmx[3];
+                int nvert; long voff;
+                n2_aabb_local(d, vtx[0], lmn, lmx, &nvert, &voff);
+                n2_aabb_xform(lmn, lmx, m, 0, cmn, cmx);
+                n2_aabb_xform(lmn, lmx, m, 1, tmn, tmx);
+                printf("\n%-28s %-8s objoff=0x%08lx vtxoff=0x%08lx nvert=%d "
+                       "leaves(11/4B01/4B03)=%d/%d/%d nested=%d\n",
+                       anm[0] ? anm : "(unnamed)", n2_scen_name(sc), o, voff, nvert,
+                       n11, nv, ni, nest);
+                printf("  local   AABB   x[%9.2f %9.2f] y[%9.2f %9.2f] z[%9.2f %9.2f]\n",
+                       lmn[0], lmx[0], lmn[1], lmx[1], lmn[2], lmx[2]);
+                printf("  matrix present=%d   m[12..14]=(%10.2f %10.2f %10.2f)  "
+                       "m[3,7,11]=(%10.2f %10.2f %10.2f)\n",
+                       has, m[12], m[13], m[14], m[3], m[7], m[11]);
+                printf("  world(current) x[%9.2f %9.2f] y[%9.2f %9.2f] z[%9.2f %9.2f]\n",
+                       cmn[0], cmx[0], cmn[1], cmx[1], cmn[2], cmx[2]);
+                printf("  world(transp)  x[%9.2f %9.2f] y[%9.2f %9.2f] z[%9.2f %9.2f]\n",
+                       tmn[0], tmx[0], tmn[1], tmx[1], tmn[2], tmx[2]);
+            }
+        } else if (magic != 0 && (magic >> 28) == 8) {
+            n2_audit_meshes(d, ds, ds + size, a);
+        }
+        o = ds + size;
+    }
+}
+
+static void n2_transform_audit(const unsigned char *d, long len, const char *rn) {
+    N2Audit a; memset(&a, 0, sizeof a);
+    a.quota[0] = a.quota[1] = a.quota[2] = 3;
+    printf("transform-audit: %s (%ld MB)\n", rn, len >> 20);
+    n2_audit_meshes(d, 0, len, &a);
+    printf("\n-- summary --------------------------------------------------\n");
+    printf("objects=%d  matrix-passed-w-check=%d (%.1f%%)  nested 0x80134010=%d\n",
+           a.nobj, a.nmtx, a.nobj ? 100.0*a.nmtx/a.nobj : 0.0, a.nested);
+    printf("0x134011 leaves per object: 0=%d 1=%d 2=%d 3=%d 4+=%d\n",
+           a.n11_hist[0], a.n11_hist[1], a.n11_hist[2], a.n11_hist[3], a.n11_hist[4]);
+    printf("3x3: rotated/scaled=%d  translation-only=%d  full identity=%d  max det=%.4f\n",
+           a.rot3x3, a.trans_only, a.ident, a.maxdet);
+    for (int c = 1; c <= N2_SC_OTHER; c++)
+        if (a.bycls[c]) printf("  %-9s objects=%5d  with matrix=%5d (%.1f%%)\n",
+                               n2_scen_name(c), a.bycls[c], a.mtxbycls[c],
+                               100.0*a.mtxbycls[c]/a.bycls[c]);
+}
+
+static void n2_census_walk(const unsigned char *d, long beg, long end,
+                           const char *rn, float thresh, int *nobj, int *nbig) {
+    long o = beg;
+    while (o + 8 <= end) {
+        uint32_t magic = n2_u32(d + o), size = n2_u32(d + o + 4);
+        long ds = o + 8;
+        if (magic == 0x80134010u) {
+            char anm[40]; n2_mesh_name(d, ds, ds + size, anm, sizeof anm);
+            (*nobj)++;
+            float m[16]; n2_obj_matrix(d, ds, ds + size, m);
+            N2Geom g;
+            if (n2_obj_geom(d, ds, ds + size, m, &g) && g.xyspan >= thresh) {
+                (*nbig)++;
+                int cat = n2_mesh_category(d, ds, ds + size);
+                /* order must match the enum at the top: ROAD=0 TERRAIN=1 OTHER=2 SKY=3 GLOW=4 */
+                static const char *cn[] = { "ROAD","TERRAIN","OTHER","SKY","GLOW" };
+                printf("%-11s %-28s %-7s %-8s %8.0f %8.0f %7ld  "
+                       "dom(%5.2f %5.2f %5.2f) planar %.3f  %s\n",
+                       rn, anm[0] ? anm : "(unnamed)",
+                       (cat >= 0 && cat <= 4) ? cn[cat] : "?",
+                       n2_scen_name(n2_scen_class(anm)),
+                       g.xyspan, g.zspan, g.tris,
+                       g.dom[0], g.dom[1], g.dom[2], g.planarity,
+                       !strncmp(anm, "PAN", 3) ? "PAN_ (culled by prefix)" :
+                       n2_is_vista_impostor(anm, &g) ? "IMPOSTOR (culled)" :
+                         (n2_vista_family(anm) ? "family, geometry-failed" : "retained"));
+            }
+        } else if (magic != 0 && (magic >> 28) == 8) {
+            n2_census_walk(d, ds, ds + size, rn, thresh, nobj, nbig);
+        }
+        o = ds + size;
+    }
+}
+
+static void n2_vista_census(const unsigned char *d, long len, const char *rn,
+                            float thresh, int hdr) {
+    if (hdr)
+        printf("%-11s %-28s %-7s %-8s %8s %8s %7s  %-24s %-12s %s\n",
+               "region","asset name","cat","class","XYspan","Zspan","tris",
+               "dominant normal","planarity","verdict");
+    int nobj = 0, nbig = 0;
+    n2_census_walk(d, 0, len, rn, thresh, &nobj, &nbig);
+    fprintf(stderr, "  %s: %d objects, %d over %.0f m\n", rn, nobj, nbig, thresh);
 }
 
 /* Parse a STREAM .BUN into categorized world-space meshes. Returns mesh count. */

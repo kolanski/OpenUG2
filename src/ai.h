@@ -1,8 +1,8 @@
-/* ai.h — OpenUG AI module: opponents that follow the game's own racing line
+/* ai.h — OpenUG2 AI module: opponents that follow the game's own racing line
  * (the ROUTES Paths .bin waypoints), with corner-aware pacing and mild
  * rubber-banding toward the player. Also loads/grids a circuit. */
-#ifndef OPENUG_AI_H
-#define OPENUG_AI_H
+#ifndef OPENUG2_AI_H
+#define OPENUG2_AI_H
 
 #include "nfsu2.h"
 

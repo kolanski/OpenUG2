@@ -1,8 +1,8 @@
-/* physics.h — OpenUG Physics module: arcade car kinematics (heading-frame
+/* physics.h — OpenUG2 Physics module: arcade car kinematics (heading-frame
  * velocity with lateral tyre scrub → drift), wall AABB collision, and
  * car-to-car circle separation. No GL, no SDL, no file IO. */
-#ifndef OPENUG_PHYSICS_H
-#define OPENUG_PHYSICS_H
+#ifndef OPENUG2_PHYSICS_H
+#define OPENUG2_PHYSICS_H
 
 #include "nfsu2.h"
 #include "ai.h"

@@ -45,3 +45,6 @@ ghidra/
 # --- Python cache ---
 __pycache__/
 *.pyc
+
+# --- Agent session context (regenerated per session) ---
+AGENTS.md

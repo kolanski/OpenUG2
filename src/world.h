@@ -1,9 +1,9 @@
-/* world.h — OpenUG World module: multi-region city loading (STREAM .BUN
+/* world.h — OpenUG2 World module: multi-region city loading (STREAM .BUN
  * stitching into one scene), per-region texture binding, per-mesh bounds
  * for draw culling, and a grid-accelerated ground query. Owns the region
  * file buffers between load and texture upload. */
-#ifndef OPENUG_WORLD_H
-#define OPENUG_WORLD_H
+#ifndef OPENUG2_WORLD_H
+#define OPENUG2_WORLD_H
 
 #include "nfsu2.h"
 #include "render.h"

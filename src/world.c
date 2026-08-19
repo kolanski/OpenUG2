@@ -1,4 +1,4 @@
-/* world.c — OpenUG World module implementation. */
+/* world.c — OpenUG2 World module implementation. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1021,6 +1021,11 @@ int world_build_districts(World *w) {
 }
 
 int world_district_at(const World *w, float x, float y, float maxdist) {
+    /* world_build_districts() returns early (leaving navcomp NULL) when a region
+       has nav nodes but no district-tokened terrain -- L4RB names its ground
+       TRN_RDP_ and TRN_ROADDRAG_, three-letter tokens the slot parser skips. No
+       districts means no district here. */
+    if (!w->navcomp) return -1;
     int best = -1; float bd = maxdist*maxdist;
     for (int i = 0; i < w->nnav; i++) {
         float dx = w->nav[i*2]-x, dy = w->nav[i*2+1]-y;

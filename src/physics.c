@@ -1,4 +1,4 @@
-/* physics.c — OpenUG Physics module implementation. */
+/* physics.c — OpenUG2 Physics module implementation. */
 #include <math.h>
 #include <assert.h>
 

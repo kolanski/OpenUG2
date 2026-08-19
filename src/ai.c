@@ -1,4 +1,4 @@
-/* ai.c — OpenUG AI module implementation. */
+/* ai.c — OpenUG2 AI module implementation. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,4 +1,4 @@
-# OpenUG — build
+# OpenUG2 — build
 #
 #   make               desktop build (x86/ARM · Linux/macOS/Windows): SDL2 + OpenGL
 #   make gles          OpenGL ES 2.0 build (embedded/mobile ARM)

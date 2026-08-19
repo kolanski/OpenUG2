@@ -1,19 +1,16 @@
-# OpenUG
+# OpenUG2
 
-An open, from-scratch reimplementation of the **Need for Speed: Underground**
+An open, from-scratch reimplementation of the **Need for Speed: Underground 2**
 engine. It reads the *original* game's data files directly — no Wine, no box64,
 no x86 emulation — parses the geometry, textures and racing lines, and runs a
 native racing scene: a textured car you drive around a real circuit against AI
 opponents, with laps and standings.
 
-Current focus is **Underground 2**; the format work and engine are meant to
-generalise to the rest of the Underground series over time.
-
 Portable across **x86 and ARM** (Linux, macOS, Windows; desktop OpenGL and
 OpenGL ES). In the spirit of OpenMW / OpenRW / OpenRCT2: **the engine is open
 source; you bring your own copy of the game.**
 
-> ⚠️ OpenUG contains **no game assets** and no EA code. You need a legally
+> ⚠️ OpenUG2 contains **no game assets** and no EA code. You need a legally
 > acquired copy of NFS: Underground 2 and point the engine at its data
 > directory. Not affiliated with, authorized, or endorsed by Electronic Arts —
 > see [Legal Notice & Disclaimer](#legal-notice--disclaimer).
@@ -143,7 +140,7 @@ by Omar Cornut — MIT-licensed, vendored under `third_party/imgui/`.
 
 ## Legal Notice & Disclaimer
 
-OpenUG is an open-source, non-profit game engine recreation project built from
+OpenUG2 is an open-source, non-profit game engine recreation project built from
 scratch using OpenGL. It does not contain any copyrighted material, assets, or
 original code from Electronic Arts (EA). To run this engine, users must possess
 a legally acquired copy of Need for Speed Underground 2. "Need for Speed" and
@@ -157,7 +154,7 @@ files are excluded from the repository (see [`.gitignore`](.gitignore)).
 
 ### Licensing
 
-- OpenUG engine code is **MIT-licensed** — see [`LICENSE`](LICENSE).
+- OpenUG2 engine code is **MIT-licensed** — see [`LICENSE`](LICENSE).
 - Bundled dependency **Dear ImGui** (dev builds only) is MIT-licensed — see
   [`third_party/imgui/LICENSE.txt`](third_party/imgui/LICENSE.txt).
 - The reverse-engineering references credited above are independent third-party

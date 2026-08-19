@@ -1,4 +1,4 @@
-/* resource.c — OpenUG ResourceManager module implementation. */
+/* resource.c — OpenUG2 ResourceManager module implementation. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

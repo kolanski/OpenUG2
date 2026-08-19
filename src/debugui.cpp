@@ -1,4 +1,4 @@
-/* OpenUG debug overlay — Dear ImGui panel, compiled only into `make debug`.
+/* OpenUG2 debug overlay — Dear ImGui panel, compiled only into `make debug`.
  * Thin C-callable wrapper (declared in debug.h) so main.c stays plain C.
  * Backends: SDL2 + legacy OpenGL2 (matches the app's 2.1/compat GL context). */
 #include <cstdio>

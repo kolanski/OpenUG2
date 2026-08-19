@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 OpenUG contributors
+Copyright (c) 2026 OpenUG2 contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -22,7 +22,7 @@ SOFTWARE.
 
 ---
 
-OpenUG is an unofficial, fan-made reimplementation of the game engine only.
+OpenUG2 is an unofficial, fan-made reimplementation of the game engine only.
 It ships NO game assets. "Need for Speed: Underground 2" and all its data are
 property of Electronic Arts Inc. You must own an original copy of the game to
 use this software; point it at your own installation's data files. This project

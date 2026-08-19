@@ -1,9 +1,9 @@
-/* OpenUG debug tunables — shared between the C engine (main.c) and the optional
+/* OpenUG2 debug tunables — shared between the C engine (main.c) and the optional
  * Dear ImGui panel (debugui.cpp, built only with `make debug` / -DDEBUG_UI).
  * g_dbg is defined once in main.c and exists in every build; without the UI it
  * just holds its defaults, so the engine reads it the same either way. */
-#ifndef OPENUG_DEBUG_H
-#define OPENUG_DEBUG_H
+#ifndef OPENUG2_DEBUG_H
+#define OPENUG2_DEBUG_H
 #ifdef __cplusplus
 extern "C" {
 #endif

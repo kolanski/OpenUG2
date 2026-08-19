@@ -1,4 +1,4 @@
-/* audio.c — OpenUG Audio module implementation. */
+/* audio.c — OpenUG2 Audio module implementation. */
 #include "audio.h"
 #include <assert.h>
 #include <math.h>
