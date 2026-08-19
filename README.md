@@ -72,11 +72,12 @@ make run DATA=/path/to/nfsu2/data
 Pick the car, track and circuit (defaults shown):
 
 ```sh
-./nfsu2 DATA --car HUMMER --track STREAML4RH --circuit ROUTESL4RF/Paths4602.bin
+./nfsu2 DATA --car HUMMER --track ALL --circuit ROUTESL4RF/Paths4602.bin
 ```
 
 - `--car NAME` — a folder under `CARS/` (needs a `GEOMETRY.BIN`).
-- `--track NAME` — a `STREAM*.BUN` under `TRACKS/` (e.g. `STREAML4RR`).
+- `--track NAME` — `ALL` (the default: every STREAM region stitched into one
+  city) or a single `STREAM*.BUN` under `TRACKS/` (e.g. `STREAML4RR`).
 - `--circuit PATH` — a closed-loop `Paths*.bin` under `TRACKS/`.
 
 It opens on a **pre-race menu**: the car orbits amid the city while you pick a
@@ -108,17 +109,35 @@ src/
   audio.*     procedural engine/road/skid synth (no audio assets)
   resource.*  file mapping + track/car/circuit discovery
   debug.*     optional Dear ImGui dev overlay (`make debug`)
+  world_mesh.* batch uploader for the world render debug pipeline
+  attrib.h    GLOBAL AttribSys reader (real per-car wheel/axle geometry)
 tools/   Python utilities used to reverse-engineer & inspect the data formats
-docs/    format documentation + engine architecture brief (INIT.md)
+docs/    format documentation (FORMATS.md)
 ```
 
 ## Contributing
 
 Reverse-engineering notes live in `docs/FORMATS.md`; the `tools/` scripts are
-handy for poking at the data. The whole city now loads by default (`--track ALL`
-stitches every STREAM region); good next steps: batching world meshes into
-per-texture VBOs (draw count is the frame-time ceiling), distance fog to hide
-the view-range pop-in, and a proper front-end menu.
+handy for poking at the data. Please keep new format facts documented there.
+
+The whole city loads by default (`--track ALL` stitches all 8 STREAM regions,
+deduped to ~13.9k meshes), batched into per-texture VBOs and fogged at the cull
+edge — about 6.8 ms/frame. Good next steps:
+
+- **A proper front-end menu** — the pre-race selector is still minimal
+  key-based navigation; a real menu flow on the built-in procedural bitmap
+  font, with an in-process reload instead of the current re-exec on car/track
+  change.
+- **Deeper race modes** — sprints are parsed alongside circuits (42 and 63 of
+  them) but only circuits are raceable; opponent difficulty and better start
+  grids are open too.
+- **Animated props** — the `ANM_*` chunks are identified but undecoded.
+- **Sound design** beyond the procedural engine drone.
+
+When you send a change: build clean (`-Wall -Wextra`, zero warnings), keep
+`make gles` compiling (every shader exists in both GLSL 120 and 100), keep the
+boot self-tests passing, and prove any rendering change with a `--shot`
+before/after PNG pair.
 
 ## Credits
 

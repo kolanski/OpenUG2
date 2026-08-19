@@ -24,7 +24,7 @@ else
   GL_LIBS := -lGL
 endif
 
-# engine modules (see docs/INIT.md): orchestrator + Renderer/Physics/AI/Audio/Resources
+# engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
 SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_mesh.c
 HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world_mesh.h
 
