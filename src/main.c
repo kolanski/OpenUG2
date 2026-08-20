@@ -18,6 +18,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 #include <math.h>
 #include <assert.h>
 #include <unistd.h>   /* execvp: menu track-switch re-launches the process */
@@ -550,6 +551,17 @@ static int m100_find(const unsigned char *d, long beg, long end, const char *wan
     return 0;
 }
 
+/* Squared XY distance from a point to a segment (M112 probe; world.c has its
+ * own copy for the rail push -- this one is diagnostic and stays local). */
+static float seg_d2_m112(float px,float py,float ax,float ay,float bx,float by,
+                         float *ox,float *oy){
+    float dx=bx-ax, dy=by-ay, L2=dx*dx+dy*dy;
+    float t = L2>1e-9f ? ((px-ax)*dx+(py-ay)*dy)/L2 : 0.0f;
+    if (t<0) t=0; if (t>1) t=1;
+    *ox = ax+dx*t; *oy = ay+dy*t;
+    float qx=px-*ox, qy=py-*oy; return qx*qx+qy*qy;
+}
+
 /* Inside any building/wall footprint (same rects collide_walls uses)? */
 static int ss_in_wall(const float obst[][4], int nobst, float x, float y, float r) {
     for (int o = 0; o < nobst; o++)
@@ -996,6 +1008,7 @@ int main(int argc, char **argv) {
     const char *b02probe = NULL;   /* --b02-probe NAME (M104): stride/field search */
     const char *shaudit = NULL;    /* --showcase-audit PREFIX [X Y] (M106) */
     int cprobe = 0; float cpx = 0, cpy = 0;   /* --cover-probe X Y (M110v) */
+    const char *wprobe = NULL; float wpx = 0, wpy = 0, wpz = 0; int wpzset = 0;
     int shovr = 0; float shx = 0, shy = 0;
     const char *baudit = NULL, *bmesh = NULL;   /* --batch-audit REGION MESHNAME */
     int vcensus = 0;   /* --vista-census: measure every region's backdrop candidates */
@@ -1044,6 +1057,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--race-audit")  && i+1 < argc) raudit = argv[++i];
         else if (!strcmp(argv[i], "--startline-audit")) slaudit = 1;
         else if (!strcmp(argv[i], "--fallback-census")) { fbcensus = 1; n2_m102 = 1; }
+        else if (!strcmp(argv[i], "--wall-probe") && i+3 < argc) {
+            wprobe = argv[++i]; wpx = (float)atof(argv[++i]); wpy = (float)atof(argv[++i]);
+            if (i+1 < argc && (isdigit((unsigned char)argv[i+1][0]) ||
+                               ((argv[i+1][0]=='-' || argv[i+1][0]=='+') &&
+                                (isdigit((unsigned char)argv[i+1][1]) || argv[i+1][1]=='.')) ||
+                               argv[i+1][0]=='.'))
+                { wpz = (float)atof(argv[++i]); wpzset = 1; } }
         else if (!strcmp(argv[i], "--cover-probe") && i+2 < argc) {
             cprobe = 1; cpx = (float)atof(argv[++i]); cpy = (float)atof(argv[++i]); }
         else if (!strcmp(argv[i], "--showcase-audit") && i+1 < argc) {
@@ -2694,6 +2714,116 @@ int main(int argc, char **argv) {
     if (nai) printf("circuit: %d-waypoint loop; %d AI racers, lap system on\n",
                     aipath.n, nai);
 
+    /* --wall-probe (M112): is a building collider a real wall at this XY, or only
+       the coarse full-XY AABB that phys_collect_walls stores? Read-only. */
+    if (wprobe) {
+        printf("\nM112 wall-probe  mesh \"%s\"  at (%.3f, %.3f)  track=%s\n",
+               wprobe, wpx, wpy, trackname);
+        for (int i = 0; i < nm; i++) {
+            const N2Mesh *m = &scene.meshes[i];
+            if (strcmp(m->sname, wprobe)) continue;
+            float bb[6] = {1e30f,-1e30f,1e30f,-1e30f,1e30f,-1e30f};
+            for (int q = 0; q < m->nverts; q++) { const float *p2 = m->verts + q*5;
+                if(p2[0]<bb[0])bb[0]=p2[0]; if(p2[0]>bb[1])bb[1]=p2[0];
+                if(p2[1]<bb[2])bb[2]=p2[1]; if(p2[1]>bb[3])bb[3]=p2[1];
+                if(p2[2]<bb[4])bb[4]=p2[2]; if(p2[2]>bb[5])bb[5]=p2[2]; }
+            printf("  mesh %d  class %s  cat %s  verts %d  tris %d  texkey %08x\n",
+                   i, n2_scen_name(m->scen), bc_cat(m->cat), m->nverts, m->nidx/3, m->texkey);
+            printf("  AABB XY[%.1f %.1f][%.1f %.1f] Z[%.1f %.1f]  = %.1f x %.1f x %.1f m\n",
+                   bb[0],bb[1], bb[2],bb[3], bb[4],bb[5],
+                   bb[1]-bb[0], bb[3]-bb[2], bb[5]-bb[4]);
+            /* nearest triangle in XY, and whether its face is a wall */
+            float bnear = 1e30f, bnz = 0, bz0 = 0, bz1 = 0; int btri = -1;
+            float bnearw = 1e30f; int btriw = -1; float bwz0 = 0, bwz1 = 0;
+            for (int t = 0; t + 2 < m->nidx; t += 3) {
+                const float *A = m->verts + m->idx[t]*5;
+                const float *B = m->verts + m->idx[t+1]*5;
+                const float *C = m->verts + m->idx[t+2]*5;
+                float e1[3], e2[3], n3[3];
+                for (int a = 0; a < 3; a++) { e1[a]=B[a]-A[a]; e2[a]=C[a]-A[a]; }
+                n3[0]=e1[1]*e2[2]-e1[2]*e2[1]; n3[1]=e1[2]*e2[0]-e1[0]*e2[2];
+                n3[2]=e1[0]*e2[1]-e1[1]*e2[0];
+                float L = sqrtf(n3[0]*n3[0]+n3[1]*n3[1]+n3[2]*n3[2]); if (L<1e-9f) continue;
+                float nz = n3[2]/L;
+                float ox, oy, d2 = 1e30f, o2;
+                o2 = seg_d2_m112(wpx,wpy,A[0],A[1],B[0],B[1],&ox,&oy); if(o2<d2)d2=o2;
+                o2 = seg_d2_m112(wpx,wpy,B[0],B[1],C[0],C[1],&ox,&oy); if(o2<d2)d2=o2;
+                o2 = seg_d2_m112(wpx,wpy,C[0],C[1],A[0],A[1],&ox,&oy); if(o2<d2)d2=o2;
+                float zlo=A[2],zhi=A[2];
+                if(B[2]<zlo)zlo=B[2]; if(C[2]<zlo)zlo=C[2];
+                if(B[2]>zhi)zhi=B[2]; if(C[2]>zhi)zhi=C[2];
+                if (d2 < bnear) { bnear = d2; btri = t/3; bnz = nz; bz0 = zlo; bz1 = zhi; }
+                if (fabsf(nz) < 0.30f && d2 < bnearw) { bnearw = d2; btriw = t/3;
+                                                       bwz0 = zlo; bwz1 = zhi; }
+            }
+            if (btri >= 0)
+                printf("  nearest triangle       %.3f m  tri %d  nz %+.3f  triZ[%.2f %.2f]\n",
+                       sqrtf(bnear), btri, bnz, bz0, bz1);
+            if (wpzset) {   /* the decisive test: wall faces AT THE CAR'S HEIGHT */
+                float cz0 = wpz + carprof.ride + carbb[2];
+                float cz1 = wpz + carprof.ride + carbb[5];
+                float bz = 1e30f; int bt = -1; float b0 = 0, b1 = 0;
+                for (int t = 0; t + 2 < m->nidx; t += 3) {
+                    const float *A = m->verts + m->idx[t]*5;
+                    const float *B = m->verts + m->idx[t+1]*5;
+                    const float *C = m->verts + m->idx[t+2]*5;
+                    float e1[3], e2[3], n3[3];
+                    for (int a = 0; a < 3; a++) { e1[a]=B[a]-A[a]; e2[a]=C[a]-A[a]; }
+                    n3[0]=e1[1]*e2[2]-e1[2]*e2[1]; n3[1]=e1[2]*e2[0]-e1[0]*e2[2];
+                    n3[2]=e1[0]*e2[1]-e1[1]*e2[0];
+                    float L = sqrtf(n3[0]*n3[0]+n3[1]*n3[1]+n3[2]*n3[2]); if (L<1e-9f) continue;
+                    if (fabsf(n3[2]/L) >= 0.30f) continue;
+                    float zlo=A[2], zhi=A[2];
+                    if(B[2]<zlo)zlo=B[2]; if(C[2]<zlo)zlo=C[2];
+                    if(B[2]>zhi)zhi=B[2]; if(C[2]>zhi)zhi=C[2];
+                    if (zhi < cz0 || zlo > cz1) continue;
+                    float ox, oy, d2 = 1e30f, o2;
+                    o2 = seg_d2_m112(wpx,wpy,A[0],A[1],B[0],B[1],&ox,&oy); if(o2<d2)d2=o2;
+                    o2 = seg_d2_m112(wpx,wpy,B[0],B[1],C[0],C[1],&ox,&oy); if(o2<d2)d2=o2;
+                    o2 = seg_d2_m112(wpx,wpy,C[0],C[1],A[0],A[1],&ox,&oy); if(o2<d2)d2=o2;
+                    if (d2 < bz) { bz = d2; bt = t/3; b0 = zlo; b1 = zhi; }
+                }
+                printf("  car envelope Z[%.3f %.3f] (contact %.3f + ride %.3f + body)\n",
+                       cz0, cz1, wpz, carprof.ride);
+                if (bt >= 0)
+                    printf("  nearest wall face AT CAR HEIGHT  %.3f m  tri %d  triZ[%.2f %.2f]"
+                           "  -> %s\n", sqrtf(bz), bt, b0, b1,
+                           sqrtf(bz) <= 1.3f ? "REAL CONTACT (within r=1.3)"
+                                             : "no contact at r=1.3");
+                else
+                    printf("  nearest wall face AT CAR HEIGHT  none -- the rect here is a "
+                           "FALSE POSITIVE\n");
+            }
+            if (btriw >= 0)
+                printf("  nearest WALL face      %.3f m  tri %d  triZ[%.2f %.2f]  (|nz| < 0.30)\n",
+                       sqrtf(bnearw), btriw, bwz0, bwz1);
+            else printf("  nearest WALL face      none in this mesh\n");
+            /* how much of the stored AABB footprint the geometry actually occupies */
+            const int G = 64; int hit = 0;
+            for (int gy = 0; gy < G; gy++) for (int gx = 0; gx < G; gx++) {
+                float sx = bb[0] + (bb[1]-bb[0]) * (gx+0.5f)/G;
+                float sy = bb[2] + (bb[3]-bb[2]) * (gy+0.5f)/G;
+                for (int t = 0; t + 2 < m->nidx; t += 3) {
+                    const float *A = m->verts + m->idx[t]*5;
+                    const float *B = m->verts + m->idx[t+1]*5;
+                    const float *C = m->verts + m->idx[t+2]*5;
+                    float d = (B[1]-C[1])*(A[0]-C[0]) + (C[0]-B[0])*(A[1]-C[1]);
+                    if (d > -1e-9f && d < 1e-9f) continue;
+                    float u = ((B[1]-C[1])*(sx-C[0]) + (C[0]-B[0])*(sy-C[1])) / d;
+                    float v = ((C[1]-A[1])*(sx-C[0]) + (A[0]-C[0])*(sy-C[1])) / d;
+                    if (u < 0 || v < 0 || 1.0f-u-v < 0) continue;
+                    hit++; break;
+                }
+            }
+            printf("  AABB footprint occupancy %.1f%% (%d of %d sample cells contain "
+                   "projected geometry)\n", 100.0*hit/(G*G), hit, G*G);
+            printf("  probe point is %s the stored rect (r=0 test)\n",
+                   (wpx > bb[0] && wpx < bb[1] && wpy > bb[2] && wpy < bb[3])
+                     ? "INSIDE" : "outside");
+        }
+        printf("\n");
+    }
+
     /* --cover-probe (M110 visual recovery): every mesh with a triangle covering
        one XY, regardless of category -- so ground that exists but is not
        classified as ground is visible in the evidence. Read-only. */
@@ -3599,12 +3729,17 @@ int main(int argc, char **argv) {
                     carpos[1] <= obst[o][1]-R || carpos[1] >= obst[o][3]+R) continue;
                 float z0 = car_z0, z1 = car_z1;
                 if (obstz[o][1] < z0 || obstz[o][0] > z1) continue;   /* same gate */
+                /* mirror the narrow phase too, so the attribution counts real
+                   responses and not broad-phase rect overlaps (M112) */
+                if (!cw_probe_contact(&scene, obstsrc[o], carpos[0], carpos[1],
+                                      R, z0, z1)) continue;
                 m94_wall(o, obstsrc[o], &scene, carpos, &aipath, ra_f);
             }
         }
 
         if (race_state == 1 && !race_auto && !sstatic &&
-            collide_walls(carpos, vel, obst, obstz, nobst, 1.3f, car_z0, car_z1)) {
+            collide_walls(carpos, vel, obst, obstz, nobst, 1.3f, car_z0, car_z1,
+                          &scene, obstsrc)) {
             g_hit = 0.5f; da_walls++; ra_walls++; }
         /* guardrail/fence collision: push out of near-vertical road/terrain faces */
         { WRailHit rh; rh.mesh = -1;

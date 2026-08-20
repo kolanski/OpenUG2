@@ -75,14 +75,59 @@ void phys_selftest(void) {
     assert(tstop > 0 && tstop < 5*60);
 }
 
+/* Does this mesh present an actual wall to the car here? Near-vertical face,
+ * height span overlapping the car, XY projection within r. */
+int cw_probe_contact(const N2Scene *s, int mi, float px, float py,
+                     float r, float cz0, float cz1);
+static int cw_mesh_contact(const N2Scene *s, int mi, float px, float py,
+                           float r, float cz0, float cz1) {
+    if (mi < 0 || mi >= s->count) return 1;          /* no source: keep the rect */
+    const N2Mesh *m = &s->meshes[mi];
+    float r2 = r*r;
+    for (int t = 0; t + 2 < m->nidx; t += 3) {
+        const float *A = m->verts + m->idx[t]*5;
+        const float *B = m->verts + m->idx[t+1]*5;
+        const float *C = m->verts + m->idx[t+2]*5;
+        float e1[3], e2[3], n[3];
+        for (int a = 0; a < 3; a++) { e1[a] = B[a]-A[a]; e2[a] = C[a]-A[a]; }
+        n[0]=e1[1]*e2[2]-e1[2]*e2[1]; n[1]=e1[2]*e2[0]-e1[0]*e2[2];
+        n[2]=e1[0]*e2[1]-e1[1]*e2[0];
+        float L = sqrtf(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]); if (L < 1e-9f) continue;
+        if (fabsf(n[2]/L) >= 0.30f) continue;                 /* not a wall face */
+        float zlo = A[2], zhi = A[2];
+        if (B[2]<zlo) zlo=B[2]; if (C[2]<zlo) zlo=C[2];
+        if (B[2]>zhi) zhi=B[2]; if (C[2]>zhi) zhi=C[2];
+        if (zhi < cz0 || zlo > cz1) continue;                 /* not at car height */
+        const float *P[3] = { A, B, C };
+        for (int e = 0; e < 3; e++) {
+            const float *p0 = P[e], *p1 = P[(e+1)%3];
+            float dx = p1[0]-p0[0], dy = p1[1]-p0[1], l2 = dx*dx+dy*dy;
+            float u = l2 > 1e-9f ? ((px-p0[0])*dx + (py-p0[1])*dy) / l2 : 0.0f;
+            if (u < 0) u = 0; if (u > 1) u = 1;
+            float qx = px - (p0[0]+dx*u), qy = py - (p0[1]+dy*u);
+            if (qx*qx + qy*qy <= r2) return 1;
+        }
+    }
+    return 0;
+}
+
+int cw_probe_contact(const N2Scene *s, int mi, float px, float py,
+                     float r, float cz0, float cz1) {
+    return cw_mesh_contact(s, mi, px, py, r, cz0, cz1);
+}
+
 int collide_walls(float *pos, float *vel, const float obst[][4],
-                  const float obz[][2], int nobst, float r, float cz0, float cz1) {
+                  const float obz[][2], int nobst, float r, float cz0, float cz1,
+                  const N2Scene *scene, const int *src) {
     int hits = 0;
     for (int o = 0; o < nobst; o++) {
         float x0=obst[o][0]-r, y0=obst[o][1]-r, x1=obst[o][2]+r, y1=obst[o][3]+r;
         if (pos[0]<=x0 || pos[0]>=x1 || pos[1]<=y0 || pos[1]>=y1) continue;
         /* vertical volumes must actually overlap for this to be a collision */
         if (obz && (obz[o][1] < cz0 || obz[o][0] > cz1)) continue;
+        /* the rect was only broad phase: confirm against the mesh's own faces */
+        if (scene && src && !cw_mesh_contact(scene, src[o], pos[0], pos[1], r, cz0, cz1))
+            continue;
         float pl=pos[0]-x0, pr=x1-pos[0], pd=pos[1]-y0, pu=y1-pos[1], m=pl; int ax=0;
         if (pr<m){m=pr;ax=1;} if (pd<m){m=pd;ax=2;} if (pu<m){m=pu;ax=3;}
         if      (ax==0){ pos[0]=x0; if(vel[0]>0)vel[0]=0; }
@@ -96,31 +141,31 @@ int collide_walls(float *pos, float *vel, const float obst[][4],
 void collide_walls_selftest(void) {
     float obst[1][4] = {{0,0,10,10}};
     float p[3]={5,5,0}, v[2]={1,1};
-    assert(collide_walls(p, v, obst, NULL, 1, 1.0f, 0, 0) == 1); /* deep inside -> resolved */
+    assert(collide_walls(p, v, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL) == 1); /* deep inside -> resolved */
     assert(p[0]<=0 || p[0]>=10 || p[1]<=0 || p[1]>=10);    /* ...and now outside the box */
     float p2[3]={0.5f,5,0}, v2[2]={2,0};                   /* near left face, moving +x */
-    collide_walls(p2, v2, obst, NULL, 1, 1.0f, 0, 0);
+    collide_walls(p2, v2, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL);
     assert(p2[0] <= -1.0f + 1e-4f && v2[0] == 0.0f);       /* pushed left, +x vel killed */
     float p3[3]={100,100,0}, v3[2]={1,0};
-    assert(collide_walls(p3, v3, obst, NULL, 1, 1.0f, 0, 0) == 0); /* far outside */
+    assert(collide_walls(p3, v3, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL) == 0); /* far outside */
 
     /* --- Z overlap gate (M95) --- */
     float obz[1][2] = {{204.4f, 210.5f}};                  /* the M94 slab */
     float q[3]={5,5,199.08f}, qv[2]={1,1};                 /* car 5.3 m BELOW it */
-    assert(collide_walls(q, qv, obst, obz, 1, 1.0f, 199.08f, 200.55f) == 0);
+    assert(collide_walls(q, qv, obst, obz, 1, 1.0f, 199.08f, 200.55f, NULL, NULL) == 0);
     assert(q[0]==5.0f && q[1]==5.0f && qv[0]==1.0f && qv[1]==1.0f);  /* untouched */
     float u[3]={5,5,215.0f}, uv[2]={1,1};                  /* car ABOVE it */
-    assert(collide_walls(u, uv, obst, obz, 1, 1.0f, 215.0f, 216.5f) == 0);
+    assert(collide_walls(u, uv, obst, obz, 1, 1.0f, 215.0f, 216.5f, NULL, NULL) == 0);
     /* XY + Z overlap still resolves exactly as the XY-only path does */
     float w1[3]={5,5,206.0f}, wv1[2]={1,1};
     float w2[3]={5,5,206.0f}, wv2[2]={1,1};
-    int h1 = collide_walls(w1, wv1, obst, obz,  1, 1.0f, 206.0f, 207.5f);
-    int h2 = collide_walls(w2, wv2, obst, NULL, 1, 1.0f, 0, 0);
+    int h1 = collide_walls(w1, wv1, obst, obz,  1, 1.0f, 206.0f, 207.5f, NULL, NULL);
+    int h2 = collide_walls(w2, wv2, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL);
     assert(h1 == 1 && h1 == h2);
     assert(w1[0]==w2[0] && w1[1]==w2[1] && wv1[0]==wv2[0] && wv1[1]==wv2[1]);
     /* touching spans count as overlapping (no gap) */
     float t1[3]={5,5,204.4f}, tv1[2]={1,1};
-    assert(collide_walls(t1, tv1, obst, obz, 1, 1.0f, 202.9f, 204.4f) == 1);
+    assert(collide_walls(t1, tv1, obst, obz, 1, 1.0f, 202.9f, 204.4f, NULL, NULL) == 1);
 }
 
 #define WALL_MIN_HEIGHT 2.5f    /* z-extent below this = flat prop, not a wall */

@@ -42,9 +42,24 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
  * Z span does not overlap the car's is skipped, so a deck or overhang the car
  * is under (or over) no longer blocks it in XY (M94: a 6.1 m slab 5.3 m ABOVE
  * the car produced 68 responses). Pass obz = NULL to disable the Z test and get
- * the original XY-only behaviour. */
+ * the original XY-only behaviour.
+ *
+ * scene/src (optional, NULL to skip) turn the rect into a broad phase only: a
+ * hit is confirmed against the SOURCE MESH's own geometry -- some near-vertical
+ * face within r in XY whose height span overlaps the car. The stored rect is the
+ * mesh's full XY extent at every height, which is not the building's footprint
+ * (measured: XB_HTECHTOWERQ_1B_00 occupies 37% of its 40x50 m rect, and its
+ * nearest wall face to the pinned car was 5.6 m away and 42 m up). Same
+ * near-vertical criterion world_wall_push already uses; no class, name or size
+ * is consulted, so every obstacle is treated identically. */
+/* The same narrow-phase contact test collide_walls applies, exposed so a
+ * diagnostic can count real responses rather than broad-phase rect overlaps. */
+int cw_probe_contact(const N2Scene *s, int mi, float px, float py,
+                     float r, float cz0, float cz1);
+
 int collide_walls(float *pos, float *vel, const float obst[][4],
-                  const float obz[][2], int nobst, float r, float cz0, float cz1);
+                  const float obz[][2], int nobst, float r, float cz0, float cz1,
+                  const N2Scene *scene, const int *src);
 void collide_walls_selftest(void);
 void phys_selftest(void);   /* asserts the NFSU2 velocity tuning targets */
 
