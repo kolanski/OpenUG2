@@ -194,6 +194,14 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                        -> 81 km/h). Paved is a road surface; the generic TRN_
                        ground below is not. */
                     if (L >= 7 && !memcmp(n, "TRN_RDP", 7)) return N2_ROAD;
+                    /* The airport apron the runway feeds into: paved concrete,
+                       driven continuously with the runway (measured: L4RB left
+                       TRN_RDP_RUNWAY at f302 straight onto
+                       TRN_CONCRETE_01_CHOP_A3_4 and dropped into the dirt
+                       profile mid-apron). Concrete slabs only -- TRN_FOUNDATION_,
+                       TRN_GRASS_, TRN_TRAINTRACKS_ and every unknown ground stay
+                       terrain. */
+                    if (L >= 12 && !memcmp(n, "TRN_CONCRETE", 12)) return N2_ROAD;
                     /* Ground whose asset name does not spell "TERRAIN". L4RB's
                        ground is TRN_RDP_RUNWAY_/TRN_GRASS_/TRN_CONCRETE_/
                        TRN_FOUNDATION_/TRN_TRAINTRACKS_, so the literal test left
