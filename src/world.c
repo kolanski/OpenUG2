@@ -1118,8 +1118,12 @@ static float seg_d2(float px,float py,float ax,float ay,float bx,float by,float 
  * height tests -- the candidate rail population the car actually met -- bucketed
  * by source category and by the triangle's own Z span. Diagnostic; it never
  * influences the push. Enabled by world_rail_census. */
-/* Measured barrier-face height ceiling (M113): genuine rails 1.778-1.833 m,
- * false hillside faces 3.389 m and up, with an empty gap between. */
+/* Measured barrier-face height band. Above (M113): genuine rails 1.778-1.833 m,
+ * false hillside faces 3.389 m and up. Below (M119): the drag surface's own mesh
+ * seams are 0.097-0.425 m -- 96840 such candidates on one sprint run, all under
+ * half a metre, none of them a barrier. A rail is a knee-high-or-taller wall, so
+ * take the empty band between 0.425 and 1.778 m. */
+#define WALL_RAIL_MIN_H 0.75f
 #define WALL_RAIL_MAX_H 2.5f
 int  world_rail_census = 0;
 long world_rc_cand[2][8];      /* [0]=ROAD [1]=TERRAIN, by Z-span bucket */
@@ -1163,6 +1167,11 @@ int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit) {
                 if (zs > world_rc_max[ci]) world_rc_max[ci] = zs;
             }
             if (zhi - zlo > WALL_RAIL_MAX_H) continue;
+            /* ...and a face too SHORT to be a barrier is a seam in the surface:
+               nz says vertical, but a 10 cm sliver in the drag strip pushed the
+               car 1464 times on one sprint (TRN_RDP_DRAG1_01_CHOP_B1_R2 tri 40,
+               nz 0.000, Z 2.12..2.22). Geometry only -- no names, no categories. */
+            if (zhi - zlo < WALL_RAIL_MIN_H) continue;
             /* nearest point on the tri's longest XY edge (its footprint line) */
             float ox,oy, best=1e30f, bx=0,by=0;
             float d0=seg_d2(pos[0],pos[1],a[0],a[1],b[0],b[1],&ox,&oy); if(d0<best){best=d0;bx=ox;by=oy;}

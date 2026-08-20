@@ -1060,6 +1060,7 @@ int main(int argc, char **argv) {
     int cprobe = 0; float cpx = 0, cpy = 0;   /* --cover-probe X Y (M110v) */
     const char *wprobe = NULL; float wpx = 0, wpy = 0, wpz = 0; int wpzset = 0;
     int gaudit = 0;   /* --grid-audit EVENTID (M118) */
+    int rband = 0;    /* --rail-band (M119): whole-region rail-predicate survey */
     int shovr = 0; float shx = 0, shy = 0;
     const char *baudit = NULL, *bmesh = NULL;   /* --batch-audit REGION MESHNAME */
     int vcensus = 0;   /* --vista-census: measure every region's backdrop candidates */
@@ -1110,6 +1111,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--fallback-census")) { fbcensus = 1; n2_m102 = 1; }
         else if (!strcmp(argv[i], "--rail-census")) world_rail_census = 1;
         else if (!strcmp(argv[i], "--grid-audit") && i+1 < argc) gaudit = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--rail-band")) rband = 1;
         else if (!strcmp(argv[i], "--wall-probe") && i+3 < argc) {
             wprobe = argv[++i]; wpx = (float)atof(argv[++i]); wpy = (float)atof(argv[++i]);
             if (i+1 < argc && (isdigit((unsigned char)argv[i+1][0]) ||
@@ -2784,6 +2786,57 @@ int main(int argc, char **argv) {
                                    ais, spawn, &heading0, &start_idx, densx, densy) : 0;
     if (nai) printf("circuit: %d-waypoint loop; %d AI racers, lap system on\n",
                     aipath.n, nai);
+
+    /* --rail-band (M119): every near-vertical ROAD/TERRAIN face in the region,
+       bucketed by height, with what the rail band admits. Static and geometry
+       only -- it does not need the car to drive anywhere. */
+    if (rband) {
+        static const char *bn[8] = { "<0.5","0.5-1","1-1.5","1.5-2","2-3","3-5","5-10",">=10" };
+        long cand[2][8] = {{0}}, keep[2][8] = {{0}};
+        float kmin[2] = { 1e30f, 1e30f }, kmax[2] = { -1e30f, -1e30f };
+        for (int i = 0; i < nm; i++) {
+            const N2Mesh *m = &scene.meshes[i];
+            if (m->cat != N2_ROAD && m->cat != N2_TERRAIN) continue;
+            int ci = (m->cat == N2_ROAD) ? 0 : 1;
+            for (int t = 0; t + 2 < m->nidx; t += 3) {
+                const float *A = m->verts + m->idx[t]*5;
+                const float *B = m->verts + m->idx[t+1]*5;
+                const float *C = m->verts + m->idx[t+2]*5;
+                float e1[3], e2[3], n3[3];
+                for (int a = 0; a < 3; a++) { e1[a]=B[a]-A[a]; e2[a]=C[a]-A[a]; }
+                n3[0]=e1[1]*e2[2]-e1[2]*e2[1]; n3[1]=e1[2]*e2[0]-e1[0]*e2[2];
+                n3[2]=e1[0]*e2[1]-e1[1]*e2[0];
+                float L = sqrtf(n3[0]*n3[0]+n3[1]*n3[1]+n3[2]*n3[2]); if (L<1e-9f) continue;
+                if (fabsf(n3[2]/L) >= 0.30f) continue;
+                float zlo=A[2], zhi=A[2];
+                if(B[2]<zlo)zlo=B[2]; if(C[2]<zlo)zlo=C[2];
+                if(B[2]>zhi)zhi=B[2]; if(C[2]>zhi)zhi=C[2];
+                float zs = zhi - zlo;
+                int b = zs<0.5f?0: zs<1.0f?1: zs<1.5f?2: zs<2.0f?3:
+                        zs<3.0f?4: zs<5.0f?5: zs<10.0f?6:7;
+                cand[ci][b]++;
+                if (zs >= 0.75f && zs <= 2.5f) {     /* the shipped rail band */
+                    keep[ci][b]++;
+                    if (zs < kmin[ci]) kmin[ci] = zs;
+                    if (zs > kmax[ci]) kmax[ci] = zs;
+                }
+            }
+        }
+        printf("\nMILESTONE: 119  rail-band survey  track=%s  (band 0.75 .. 2.50 m)\n",
+               trackname);
+        printf("  %-8s %-10s", "source", "");
+        for (int b = 0; b < 8; b++) printf(" %10s", bn[b]);
+        printf("   (near-vertical face Z span)\n");
+        for (int c = 0; c < 2; c++) {
+            printf("  %-8s %-10s", c ? "TERRAIN" : "ROAD", "faces");
+            for (int b = 0; b < 8; b++) printf(" %10ld", cand[c][b]);
+            printf("\n  %-8s %-10s", "", "in band");
+            for (int b = 0; b < 8; b++) printf(" %10ld", keep[c][b]);
+            printf("   kept Zspan %.3f .. %.3f\n",
+                   kmin[c] > 1e29f ? 0.0f : kmin[c], kmax[c] < -1e29f ? 0.0f : kmax[c]);
+        }
+        printf("\n");
+    }
 
     /* --grid-audit (M118): every shipped 0x34146 start-grid record for one event,
        decoded field by field, with the supporting layer under each slot. Same
@@ -5309,6 +5362,22 @@ int main(int argc, char **argv) {
                 printf("showcase audit: menu frame captured; Enter branch, route start "
                        "and --shot-static spawn were never invoked\n");
                 running = 0;
+            }
+        }
+        if (world_rail_census && shot && shotframe + 1 >= shotframes) {
+            static const char *bn2[8] = { "<0.5","0.5-1","1-1.5","1.5-2",
+                                          "2-3","3-5","5-10",">=10" };
+            printf("\nM113 RAIL CANDIDATE CENSUS  %-8s", "");
+            for (int b = 0; b < 8; b++) printf(" %9s", bn2[b]);
+            printf("\n");
+            for (int c = 0; c < 2; c++) {
+                printf("  %-8s %-8s", c ? "TERRAIN" : "ROAD", "candidates");
+                for (int b = 0; b < 8; b++) printf(" %9ld", world_rc_cand[c][b]);
+                printf("\n  %-8s %-8s", "", "pushed");
+                for (int b = 0; b < 8; b++) printf(" %9ld", world_rc_push[c][b]);
+                printf("     Zspan min %.3f max %.3f\n",
+                       world_rc_min[c] > 1e29f ? 0.0f : world_rc_min[c],
+                       world_rc_max[c] < -1e29f ? 0.0f : world_rc_max[c]);
             }
         }
         if (daudit && shotframe == 2) {   /* one normal rendered frame at spawn */
