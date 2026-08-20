@@ -715,7 +715,7 @@ int world_barrier_push(const World *w, float *pos, float r) {
    8-byte 0x11 filler, then 48-byte records — +16 f32 X, +20 f32 Y, +24 f32 Z,
    +36 u32 track id. Returns the number written. */
 static int race_load_grid(const World *w, const char *troot, int evid,
-                          float (*out)[2], int cap) {
+                          float (*out)[3], int cap) {
     int n = 0;
     for (int r = 0; r < w->nreg && n < cap; r++) {
         const char *rn = w->rgn[r].name;
@@ -735,6 +735,7 @@ static int race_load_grid(const World *w, const char *troot, int evid,
                 if ((int)tid != evid) continue;
                 memcpy(&out[n][0], d + off + 16, 4);
                 memcpy(&out[n][1], d + off + 20, 4);
+                memcpy(&out[n][2], d + off + 24, 4);   /* the slot's own Z */
                 n++;
             }
         }

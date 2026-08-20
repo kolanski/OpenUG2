@@ -568,21 +568,47 @@ static float seg_d2_m112(float px,float py,float ax,float ay,float bx,float by,
  * Returns 1 when a race is armed and a grid exists. */
 static int race_place_on_grid(const World *w, const N2Scene *sc,
                               float carpos[3], float *heading0) {
-    if (!w->race.active || w->race.ngrid <= 0) return 0;
-    /* Keep the grid slot's ACROSS-track offset (that part is shipped data) but
-       force the along-track position behind the start line -- the raw slot can
-       sit a couple of metres past gate 0 once the gate is snapped to the nearest
-       racing-line node, and a car that starts past the line can never cross it. */
+    if (!w->race.active || w->race.ngrid <= 0 || w->race.ngate <= 0) return 0;
+    /* Stand the car on a SHIPPED grid slot rather than rebuilding a position
+       around gate 0. Event 4201 ships two 10-slot grids -- one per race
+       direction, as the Phase 72 note recorded -- and the old rule kept only the
+       slot's lateral offset, then re-anchored 15 m behind gate 0 at an XY with
+       no covering ground at all, so the car started over void.
+       Selection is measured, not named: a slot qualifies when the layer under it
+       supports its OWN shipped Z (event 4201's usable grid agrees to 6 mm, the
+       other cluster's Z sits 6.6 m above its ground), and among those the one
+       nearest gate 0 wins -- that is the cluster belonging to this direction of
+       travel (260 m from gate 0 versus 1953 m for the far-end grid). */
     const WGate *g0 = &w->race.gate[0];
-    float rx = w->race.grid[0][0] - g0->x, ry = w->race.grid[0][1] - g0->y;
-    float lat = -rx*g0->dy + ry*g0->dx;
-    carpos[0] = g0->x + (-g0->dy)*lat - g0->dx*15.0f;
-    carpos[1] = g0->y + ( g0->dx)*lat - g0->dy*15.0f;
-    carpos[2] = world_ground_z(sc, carpos[0], carpos[1], carpos[2]);
-    *heading0 = atan2f(g0->dy, g0->dx);
-    printf("race start: grid slot 0 (%.1f, %.1f) -> lined up at (%.1f, %.1f), "
-           "15 m behind the start line\n", w->race.grid[0][0], w->race.grid[0][1],
-           carpos[0], carpos[1]);
+    int best = -1; float bestd = 1e30f, bestz = 0;
+    for (int pass = 0; pass < 2 && best < 0; pass++)
+        for (int i = 0; i < w->race.ngrid; i++) {
+            float gz = w->race.grid[i][2];
+            int cat = world_ground_at(sc, w->race.grid[i][0], w->race.grid[i][1],
+                                      w->race.grid[i][2], &gz);
+            if (cat == WSURF_NONE) continue;
+            if (pass == 0) {   /* first pass: the slot must sit on its own layer */
+                float dz = gz - w->race.grid[i][2]; if (dz < 0) dz = -dz;
+                if (cat != WSURF_ROAD || dz > 1.0f) continue;
+            }
+            float dx = w->race.grid[i][0] - g0->x, dy = w->race.grid[i][1] - g0->y;
+            float d2 = dx*dx + dy*dy;
+            if (d2 < bestd) { bestd = d2; best = i; bestz = gz; }
+        }
+    if (best < 0) return 0;
+    carpos[0] = w->race.grid[best][0];
+    carpos[1] = w->race.grid[best][1];
+    carpos[2] = bestz;                       /* the layer under the slot */
+    /* the records carry no orientation (their direction fields are all zero),
+       so face along the event's own route: gate 0 towards the next gate. */
+    if (w->race.ngate > 1) {
+        const WGate *g1 = &w->race.gate[1];
+        *heading0 = atan2f(g1->y - g0->y, g1->x - g0->x);
+    } else *heading0 = atan2f(g0->dy, g0->dx);
+    printf("race start: grid slot %d of %d at (%.3f, %.3f, %.3f) on its own %s "
+           "layer, %.1f m from gate 0, heading %+.4f\n",
+           best, w->race.ngrid, carpos[0], carpos[1], carpos[2], "ROAD",
+           sqrtf(bestd), *heading0);
     return 1;
 }
 
@@ -1033,6 +1059,7 @@ int main(int argc, char **argv) {
     const char *shaudit = NULL;    /* --showcase-audit PREFIX [X Y] (M106) */
     int cprobe = 0; float cpx = 0, cpy = 0;   /* --cover-probe X Y (M110v) */
     const char *wprobe = NULL; float wpx = 0, wpy = 0, wpz = 0; int wpzset = 0;
+    int gaudit = 0;   /* --grid-audit EVENTID (M118) */
     int shovr = 0; float shx = 0, shy = 0;
     const char *baudit = NULL, *bmesh = NULL;   /* --batch-audit REGION MESHNAME */
     int vcensus = 0;   /* --vista-census: measure every region's backdrop candidates */
@@ -1082,6 +1109,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--startline-audit")) slaudit = 1;
         else if (!strcmp(argv[i], "--fallback-census")) { fbcensus = 1; n2_m102 = 1; }
         else if (!strcmp(argv[i], "--rail-census")) world_rail_census = 1;
+        else if (!strcmp(argv[i], "--grid-audit") && i+1 < argc) gaudit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--wall-probe") && i+3 < argc) {
             wprobe = argv[++i]; wpx = (float)atof(argv[++i]); wpy = (float)atof(argv[++i]);
             if (i+1 < argc && (isdigit((unsigned char)argv[i+1][0]) ||
@@ -2756,6 +2784,58 @@ int main(int argc, char **argv) {
                                    ais, spawn, &heading0, &start_idx, densx, densy) : 0;
     if (nai) printf("circuit: %d-waypoint loop; %d AI racers, lap system on\n",
                     aipath.n, nai);
+
+    /* --grid-audit (M118): every shipped 0x34146 start-grid record for one event,
+       decoded field by field, with the supporting layer under each slot. Same
+       file, leaf and 48-byte stride race_load_grid walks. Read-only. */
+    if (gaudit) {
+        const char *stem = strncmp(trackname, "STREAM", 6) ? trackname : trackname + 6;
+        char gp[1024]; snprintf(gp, sizeof gp, "%s/ROUTES%s/TrackPosMarkersAll.bin",
+                                troot, stem);
+        long glen = 0; unsigned char *gd = n2_read_file(gp, &glen);
+        printf("\nMILESTONE: 118  start-grid audit  event %d  %s\n", gaudit, gp);
+        if (!gd) printf("  cannot read the marker file\n");
+        else {
+            N2Leaf lf[4]; int nl = 0;
+            n2_find_leaves(gd, 0, glen, 0x00034146u, lf, &nl, 4);
+            int slot = 0;
+            for (int L = 0; L < nl; L++) {
+                long off = lf[L].off + 8, end = lf[L].off + lf[L].size;
+                for (; off + 48 <= end; off += 48) {
+                    unsigned tid; memcpy(&tid, gd + off + 36, 4);
+                    if ((int)tid != gaudit) continue;
+                    float f[12];
+                    for (int k = 0; k < 12; k++) memcpy(&f[k], gd + off + k*4, 4);
+                    float sx = f[4], sy = f[5];
+                    float gz2 = 0;
+                    int cat = world_ground_at(&scene, sx, sy, f[6], &gz2);
+                    printf("  slot %-2d  XY(%10.3f %10.3f)  rec+24 %9.3f  "
+                           "support %-7s z %9.3f  dir(%+.4f %+.4f) hdg %+7.4f\n",
+                           slot, sx, sy, f[6],
+                           cat == WSURF_ROAD ? "ROAD" : cat == WSURF_TERRAIN ? "TERRAIN"
+                                                                             : "NONE",
+                           gz2, f[0], f[1], atan2f(f[1], f[0]));
+                    slot++;
+                }
+            }
+            printf("  %d slots for event %d\n", slot, gaudit);
+            free(gd);
+            if (world.race.active) {
+                printf("  armed race gates (%d):\n", world.race.ngate);
+                for (int g = 0; g < world.race.ngate; g++) {
+                    const WGate *G = &world.race.gate[g];
+                    float gz3 = 0;
+                    int c3 = world_ground_at(&scene, G->x, G->y, 0.0f, &gz3);
+                    printf("    gate %-2d (%10.3f %10.3f) dir(%+.4f %+.4f) hdg %+7.4f "
+                           "half %.1f  support %-7s z %9.3f\n", g, G->x, G->y,
+                           G->dx, G->dy, atan2f(G->dy, G->dx), G->half,
+                           c3 == WSURF_ROAD ? "ROAD" : c3 == WSURF_TERRAIN ? "TERRAIN"
+                                                                           : "NONE", gz3);
+                }
+            } else printf("  (no race armed: run with --event %d to see its gates)\n", gaudit);
+        }
+        printf("\n");
+    }
 
     /* --wall-probe (M112): is a building collider a real wall at this XY, or only
        the coarse full-XY AABB that phys_collect_walls stores? Read-only. */

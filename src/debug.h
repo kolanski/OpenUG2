@@ -64,7 +64,9 @@ typedef struct {
     int   finished;
     int   ngate;
     WGate gate[WORLD_MAXGATE];
-    float grid[WORLD_MAXGRID][2]; int ngrid;  /* start-grid slots (chunk 0x34146) */
+    float grid[WORLD_MAXGRID][3]; int ngrid;  /* start-grid slots (chunk 0x34146):
+                                                 XY at +16/+20, the slot's own Z
+                                                 at +24 (M118) */
     float px, py; int havep;         /* previous car XY: gates are crossed, not touched */
 } WRace;
 
