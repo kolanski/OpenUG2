@@ -1057,6 +1057,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--race-audit")  && i+1 < argc) raudit = argv[++i];
         else if (!strcmp(argv[i], "--startline-audit")) slaudit = 1;
         else if (!strcmp(argv[i], "--fallback-census")) { fbcensus = 1; n2_m102 = 1; }
+        else if (!strcmp(argv[i], "--rail-census")) world_rail_census = 1;
         else if (!strcmp(argv[i], "--wall-probe") && i+3 < argc) {
             wprobe = argv[++i]; wpx = (float)atof(argv[++i]); wpy = (float)atof(argv[++i]);
             if (i+1 < argc && (isdigit((unsigned char)argv[i+1][0]) ||
@@ -3826,6 +3827,23 @@ int main(int argc, char **argv) {
                        "status: nan=%d oob_z=%d oob_xy=%d\n", ra_stall,
                        ra_stall < 0 ? -1.0 : (ra_stall - ra_start)/60.0,
                        !!(ra_bad&1), !!(ra_bad&2), !!(ra_bad&4));
+                if (world_rail_census) {
+                    static const char *bn[8] = { "<0.5","0.5-1","1-1.5","1.5-2",
+                                                 "2-3","3-5","5-10",">=10" };
+                    printf("\nM113 RAIL CANDIDATE CENSUS (triangles passing |nz|<0.30 and the "
+                           "car-height test)\n  %-8s %-8s", "source", "");
+                    for (int b = 0; b < 8; b++) printf(" %9s", bn[b]);
+                    printf("   (triangle Z span, m)\n");
+                    for (int c = 0; c < 2; c++) {
+                        printf("  %-8s %-8s", c ? "TERRAIN" : "ROAD", "candidates");
+                        for (int b = 0; b < 8; b++) printf(" %9ld", world_rc_cand[c][b]);
+                        printf("\n  %-8s %-8s", "", "pushed");
+                        for (int b = 0; b < 8; b++) printf(" %9ld", world_rc_push[c][b]);
+                        printf("     Zspan min %.3f max %.3f\n",
+                               world_rc_min[c] > 1e29f ? 0.0f : world_rc_min[c],
+                               world_rc_max[c] < -1e29f ? 0.0f : world_rc_max[c]);
+                    }
+                }
                 /* ---- M94 attribution report ---- */
                 printf("\nM94 COLLISION ATTRIBUTION  (%d distinct sources, %d recorded events)\n",
                        m94n, m94nev);

@@ -1070,6 +1070,23 @@ static float seg_d2(float px,float py,float ax,float ay,float bx,float by,float 
     *ox=ax+t*dx; *oy=ay+t*dy;
     float ex=px-*ox, ey=py-*oy; return ex*ex+ey*ey;
 }
+/* M113 census: every triangle that PASSES world_wall_push's near-vertical and
+ * height tests -- the candidate rail population the car actually met -- bucketed
+ * by source category and by the triangle's own Z span. Diagnostic; it never
+ * influences the push. Enabled by world_rail_census. */
+/* Measured barrier-face height ceiling (M113): genuine rails 1.778-1.833 m,
+ * false hillside faces 3.389 m and up, with an empty gap between. */
+#define WALL_RAIL_MAX_H 2.5f
+int  world_rail_census = 0;
+long world_rc_cand[2][8];      /* [0]=ROAD [1]=TERRAIN, by Z-span bucket */
+long world_rc_push[2][8];      /* same, restricted to triangles that pushed */
+float world_rc_min[2] = { 1e30f, 1e30f }, world_rc_max[2] = { -1e30f, -1e30f };
+static int wrc_bucket(float zs) {
+    if (zs < 0.5f) return 0; if (zs < 1.0f) return 1; if (zs < 1.5f) return 2;
+    if (zs < 2.0f) return 3;  if (zs < 3.0f) return 4; if (zs < 5.0f) return 5;
+    if (zs < 10.0f) return 6; return 7;
+}
+
 int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit) {
     if (s->meshes != g_grid.meshes) return 0;
     int cx = (int)((pos[0]-g_grid.x0)/GCELL), cy = (int)((pos[1]-g_grid.y0)/GCELL);
@@ -1086,11 +1103,29 @@ int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit) {
             float zlo=a[2],zhi=a[2];                            /* rail height span */
             if(b[2]<zlo)zlo=b[2]; if(cc[2]<zlo)zlo=cc[2]; if(b[2]>zhi)zhi=b[2]; if(cc[2]>zhi)zhi=cc[2];
             if (pos[2] < zlo-0.5f || pos[2] > zhi+0.5f) continue;   /* car not at rail height */
+            /* A rail is a LOW barrier. |nz| alone also selects hillsides: the
+               L4RA route's near-vertical faces are 3.389-44.343 m tall and one
+               9.4 m slope pushed the car 36 times, while every genuine road-side
+               barrier met on L4RB measured 1.778-1.833 m. Nothing lies between
+               those ranges across ~16000 candidate triangles, so cap the face
+               height; the geometry decides, not the mesh's category. Taller
+               vertical faces are buildings or terrain, which collide_walls and
+               the ground query already own. */
+            if (world_rail_census) {   /* population BEFORE the height cap */
+                int ci = (m->cat == N2_ROAD) ? 0 : 1;
+                float zs = zhi - zlo;
+                world_rc_cand[ci][wrc_bucket(zs)]++;
+                if (zs < world_rc_min[ci]) world_rc_min[ci] = zs;
+                if (zs > world_rc_max[ci]) world_rc_max[ci] = zs;
+            }
+            if (zhi - zlo > WALL_RAIL_MAX_H) continue;
             /* nearest point on the tri's longest XY edge (its footprint line) */
             float ox,oy, best=1e30f, bx=0,by=0;
             float d0=seg_d2(pos[0],pos[1],a[0],a[1],b[0],b[1],&ox,&oy); if(d0<best){best=d0;bx=ox;by=oy;}
             float d1=seg_d2(pos[0],pos[1],b[0],b[1],cc[0],cc[1],&ox,&oy); if(d1<best){best=d1;bx=ox;by=oy;}
             float d2=seg_d2(pos[0],pos[1],cc[0],cc[1],a[0],a[1],&ox,&oy); if(d2<best){best=d2;bx=ox;by=oy;}
+            if (world_rail_census && best < r*r)
+                world_rc_push[(m->cat == N2_ROAD) ? 0 : 1][wrc_bucket(zhi - zlo)]++;
             if (best >= r*r) continue;
             if (hit && !pushed) { hit->mesh = g_grid.list[k]; hit->tri = t/3;
                                   hit->nz = nz/L; hit->zlo = zlo; hit->zhi = zhi;

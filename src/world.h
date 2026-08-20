@@ -186,6 +186,10 @@ void world_ground_normal(const N2Scene *s, float x, float y, float n[3]);
  * the push itself is unchanged. */
 typedef struct { int mesh, tri; float nz, zlo, zhi, edged; } WRailHit;
 int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit);
+/* M113 rail-candidate census (diagnostic; see world.c). */
+extern int  world_rail_census;
+extern long world_rc_cand[2][8], world_rc_push[2][8];
+extern float world_rc_min[2], world_rc_max[2];
 
 /* Decode the scripted-object entity DEFINITIONS (name + FNV-32 hash + local
  * OBB extents) from each loaded district's companion L4R*.BUN, deduped by
