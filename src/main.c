@@ -562,6 +562,30 @@ static float seg_d2_m112(float px,float py,float ax,float ay,float bx,float by,
     float qx=px-*ox, qy=py-*oy; return qx*qx+qy*qy;
 }
 
+/* Put the player on the armed race's own start grid, facing through the start
+ * line. Lifted unchanged from the --event boot path so the menu Enter and the
+ * command-line arm place the car identically -- one grid rule, not two.
+ * Returns 1 when a race is armed and a grid exists. */
+static int race_place_on_grid(const World *w, const N2Scene *sc,
+                              float carpos[3], float *heading0) {
+    if (!w->race.active || w->race.ngrid <= 0) return 0;
+    /* Keep the grid slot's ACROSS-track offset (that part is shipped data) but
+       force the along-track position behind the start line -- the raw slot can
+       sit a couple of metres past gate 0 once the gate is snapped to the nearest
+       racing-line node, and a car that starts past the line can never cross it. */
+    const WGate *g0 = &w->race.gate[0];
+    float rx = w->race.grid[0][0] - g0->x, ry = w->race.grid[0][1] - g0->y;
+    float lat = -rx*g0->dy + ry*g0->dx;
+    carpos[0] = g0->x + (-g0->dy)*lat - g0->dx*15.0f;
+    carpos[1] = g0->y + ( g0->dx)*lat - g0->dy*15.0f;
+    carpos[2] = world_ground_z(sc, carpos[0], carpos[1], carpos[2]);
+    *heading0 = atan2f(g0->dy, g0->dx);
+    printf("race start: grid slot 0 (%.1f, %.1f) -> lined up at (%.1f, %.1f), "
+           "15 m behind the start line\n", w->race.grid[0][0], w->race.grid[0][1],
+           carpos[0], carpos[1]);
+    return 1;
+}
+
 /* Inside any building/wall footprint (same rects collide_walls uses)? */
 static int ss_in_wall(const float obst[][4], int nobst, float x, float y, float r) {
     for (int o = 0; o < nobst; o++)
@@ -2701,6 +2725,24 @@ int main(int argc, char **argv) {
                    strncmp(trackname,"STREAM",6) ? trackname : trackname+6);
     }
     printf("circuits available: %d (menu: Left/Right)\n", ncirc);
+    /* Sprint events (Milestone 117). A region can ship race events but no closed
+       circuit -- L4RB has 9 sprints and 0 loops -- and Enter only knew about the
+       aipath circuit, so those regions fell through to the free-roam showcase.
+       Collect this region's own events (world_load_events already tagged each
+       with its ROUTES<stem> directory) so the same [ / ] selector can cycle them
+       when there is no circuit list. */
+    static int sprintev[WORLD_MAXEVENT]; int nsprint = 0, selsprint = 0;
+    {
+        const char *stem = strncmp(trackname, "STREAM", 6) ? trackname : trackname + 6;
+        for (int i = 0; i < world.nev && nsprint < WORLD_MAXEVENT; i++)
+            if (!strcmp(world.ev[i].reg, stem)) sprintev[nsprint++] = i;
+        if (!ncirc && nsprint)
+            printf("sprint events available: %d (menu: [ / ]) -- selected id %d "
+                   "(%s, %d outline points)\n", nsprint,
+                   world.ev[sprintev[0]].id,
+                   world.ev[sprintev[0]].circuit ? "circuit" : "sprint",
+                   world.ev[sprintev[0]].npoly);
+    }
     if (raudit) { printf("RA circuit list for %s (bbox filter mn %.0f %.0f mx %.0f %.0f):\n",
                          trackname, mn[0], mn[1], mx[0], mx[1]);
                   for (int i = 0; i < ncirc; i++)
@@ -3356,23 +3398,7 @@ int main(int argc, char **argv) {
         heading0 = atan2f(aipath.xy[nx*2+1]-carpos[1], aipath.xy[nx*2]-carpos[0]);
     }
     /* an armed race wins: start on its own grid, facing through the start line */
-    if (!sstatic && world.race.active && world.race.ngrid > 0) {
-        /* Keep the grid slot's ACROSS-track offset (that part is shipped data)
-           but force the along-track position behind the start line — the raw
-           slot can sit a couple of metres past gate 0 once the gate is snapped
-           to the nearest racing-line node, and a car that starts past the line
-           can never cross it. */
-        const WGate *g0 = &world.race.gate[0];
-        float rx = world.race.grid[0][0] - g0->x, ry = world.race.grid[0][1] - g0->y;
-        float lat = -rx*g0->dy + ry*g0->dx;
-        carpos[0] = g0->x + (-g0->dy)*lat - g0->dx*15.0f;
-        carpos[1] = g0->y + ( g0->dx)*lat - g0->dy*15.0f;
-        carpos[2] = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
-        heading0 = atan2f(g0->dy, g0->dx);
-        printf("race start: grid slot 0 (%.1f, %.1f) -> lined up at (%.1f, %.1f), "
-               "15 m behind the start line\n", world.race.grid[0][0],
-               world.race.grid[0][1], carpos[0], carpos[1]);
-    }
+    if (!sstatic) race_place_on_grid(&world, &scene, carpos, &heading0);
     float heading = heading0, speed = 0.0f, vel[2] = {0,0};
     float cam[3] = { spawn[0], spawn[1], spawn[2]+5 };
     if (sstatic) {
@@ -3506,6 +3532,12 @@ int main(int argc, char **argv) {
                     } else if ((k==SDLK_UP || k==SDLK_DOWN) && ntrack > 1) {
                         seltrack = (seltrack + (k==SDLK_DOWN?1:ntrack-1)) % ntrack;
                         relaunch(selfexe, dataroot, carname, tracklist[seltrack]);
+                    } else if ((k==SDLK_LEFTBRACKET || k==SDLK_RIGHTBRACKET) &&
+                               !ncirc && nsprint > 1) {
+                        selsprint = (selsprint + (k==SDLK_RIGHTBRACKET?1:nsprint-1)) % nsprint;
+                        printf("sprint selected: event %d (%d outline points)\n",
+                               world.ev[sprintev[selsprint]].id,
+                               world.ev[sprintev[selsprint]].npoly);
                     } else if ((k==SDLK_LEFTBRACKET || k==SDLK_RIGHTBRACKET) && ncirc > 1) {
                         selcirc = (selcirc + (k==SDLK_RIGHTBRACKET?1:ncirc-1)) % ncirc;
                         nai = load_circuit(dataroot, circlist[selcirc], &scene,
@@ -3521,7 +3553,24 @@ int main(int argc, char **argv) {
                            footprint (M91). Take the first waypoint AHEAD of it
                            whose own road layer passes the footprint, wall and
                            headroom tests, and start the lap there. */
-                        if (aipath.n > 0) {
+                        if (!aipath.n && nsprint > 0) {
+                            /* No closed circuit here: arm the selected shipped
+                               event through the same world_race_start() the
+                               --event path uses, then place the player with the
+                               same grid rule. Gates, corridor, barriers, HUD and
+                               world_race_update all come from that call. */
+                            int ev = sprintev[selsprint];
+                            int ng = world_race_start(&world, troot, ev, want_laps);
+                            if (ng > 0 && race_place_on_grid(&world, &scene, carpos, &heading)) {
+                                printf("sprint armed: event %d, %d gates\n",
+                                       world.ev[ev].id, ng);
+                            } else
+                                printf("sprint event %d could not be armed (%d gates) - "
+                                       "starting from the showcase pose\n",
+                                       world.ev[ev].id, ng);
+                            vel[0]=vel[1]=0; speed=0;
+                        }
+                        else if (aipath.n > 0) {
                             float hl = (carbb[3]-carbb[0])*0.5f, hw = (carbb[4]-carbb[1])*0.5f;
                             if (hl < 0.5f) hl = 2.20f;
                             if (hw < 0.5f) hw = 0.90f;
