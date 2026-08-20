@@ -185,6 +185,15 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                     if (n2_contains(n, L, "SKYDOME") || n2_contains(n, L, "SKY")) return N2_SKY;
                     if (n2_contains(n, L, "ROAD")) return N2_ROAD;
                     if (n2_contains(n, L, "TERRAIN")) return N2_TERRAIN;
+                    /* RDP_ is the shipped road-paint/pavement family: RDP_LANEA,
+                       RDP_ROADSTRIP, RDP_AIRPORT_* are the textures real roads
+                       already wear, and TRN_RDP_RUNWAY_/TRN_RDP_DRAG_ are the
+                       paved runway and drag surfaces. They carry no "ROAD" token
+                       in the name, so the literal test above left them TERRAIN
+                       and M114 gave a paved runway dirt handling (L4RB peak 161
+                       -> 81 km/h). Paved is a road surface; the generic TRN_
+                       ground below is not. */
+                    if (L >= 7 && !memcmp(n, "TRN_RDP", 7)) return N2_ROAD;
                     /* Ground whose asset name does not spell "TERRAIN". L4RB's
                        ground is TRN_RDP_RUNWAY_/TRN_GRASS_/TRN_CONCRETE_/
                        TRN_FOUNDATION_/TRN_TRAINTRACKS_, so the literal test left
