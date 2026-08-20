@@ -1035,23 +1035,66 @@ int world_district_at(const World *w, float x, float y, float maxdist) {
     return best >= 0 ? w->navcomp[best] : -1;
 }
 
-float world_ground_z(const N2Scene *s, float x, float y, float fallback) {
+/* The one layer-selection rule (was inlined in n2_ground_z_ref; lifted here so
+   the same pick can also report the surface category). Identical arithmetic:
+   ROAD/TERRAIN only, barycentric coverage with the -0.01 edge tolerance, and
+   the reference key that biases UP-steps by 3x so a curb lip above the car
+   never beats the road just below it. */
+static int wg_pick(const N2Scene *s, float x, float y, float refz, float *outz) {
+    float best = 0.0f, bestkey = 1e30f; int found = 0, bestcat = WSURF_NONE;
+    int highest = (refz >= N2_GROUND_HIGHEST);
+    for (int m = 0; m < s->count; m++) {
+        int mc = s->meshes[m].cat;
+        if (mc != N2_ROAD && mc != N2_TERRAIN) continue;
+        const N2Mesh *me = &s->meshes[m];
+        for (int t = 0; t + 2 < me->nidx; t += 3) {
+            const float *a = me->verts + me->idx[t]*5;
+            const float *b = me->verts + me->idx[t+1]*5;
+            const float *c = me->verts + me->idx[t+2]*5;
+            float d = (b[1]-c[1])*(a[0]-c[0]) + (c[0]-b[0])*(a[1]-c[1]);
+            if (d > -1e-9f && d < 1e-9f) continue;
+            float u = ((b[1]-c[1])*(x-c[0]) + (c[0]-b[0])*(y-c[1])) / d;
+            float v = ((c[1]-a[1])*(x-c[0]) + (a[0]-c[0])*(y-c[1])) / d;
+            float w = 1.0f - u - v;
+            if (u < -0.01f || v < -0.01f || w < -0.01f) continue;
+            float z = u*a[2] + v*b[2] + w*c[2];
+            float key;
+            if (highest) key = -z;
+            else { float dz = z - refz; key = dz >= 0 ? dz*3.0f : -dz; }
+            if (!found || key < bestkey) {
+                bestkey = key; best = z; found = 1;
+                bestcat = (mc == N2_ROAD) ? WSURF_ROAD : WSURF_TERRAIN;
+            }
+        }
+    }
+    if (found) *outz = best;
+    return found ? bestcat : WSURF_NONE;
+}
+
+int world_ground_at(const N2Scene *s, float x, float y, float fallback, float *outz) {
     /* `fallback` is the caller's current Z at every callsite, so it doubles as
        the layer reference: pick the surface nearest it, not the highest deck
        overhead (Phase 73). A sentinel fallback (|z| huge) means "no reference". */
     float refz = (fallback > -2000.0f && fallback < 4000.0f) ? fallback
                                                              : N2_GROUND_HIGHEST;
+    *outz = fallback;
     if (s->meshes != g_grid.meshes)                        /* not the loaded world */
-        return n2_ground_z_ref((N2Scene *)s, x, y, fallback, refz);
+        return wg_pick(s, x, y, refz, outz);
     int cx = (int)((x - g_grid.x0) / GCELL), cy = (int)((y - g_grid.y0) / GCELL);
-    if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) return fallback;
+    if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) return WSURF_NONE;
     /* borrow the cell's meshes into a scratch scene and reuse the exact scan */
     static N2Mesh scratch[512];
     N2Scene sub = { scratch, 0, 512 };
     int c = cy*g_grid.gw + cx;
     for (int k = g_grid.start[c]; k < g_grid.start[c+1] && sub.count < 512; k++)
         scratch[sub.count++] = s->meshes[g_grid.list[k]];
-    return n2_ground_z_ref(&sub, x, y, fallback, refz);
+    return wg_pick(&sub, x, y, refz, outz);
+}
+
+float world_ground_z(const N2Scene *s, float x, float y, float fallback) {
+    float z = fallback;
+    world_ground_at(s, x, y, fallback, &z);
+    return z;
 }
 
 /* Guardrail/fence collision (Phase 58). Rails are NOT separate meshes with a

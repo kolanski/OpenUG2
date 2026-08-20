@@ -174,6 +174,16 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap);
 
 /* Ground height at (x,y): same contract as n2_ground_z but only tests the
  * road/terrain meshes whose bbox covers the point (grid lookup). */
+/* Which kind of surface the ground query landed on. */
+enum { WSURF_NONE = 0, WSURF_ROAD, WSURF_TERRAIN };
+
+/* THE ground-contact query: the nearest-to-reference supporting layer under
+ * (x,y), plus what it is. `fallback` doubles as the layer reference exactly as
+ * before. Writes the surface Z (or `fallback` when nothing supports the XY) and
+ * returns WSURF_*. world_ground_z is a thin wrapper on this, so there is one
+ * layer-selection rule, not two. */
+int world_ground_at(const N2Scene *s, float x, float y, float fallback, float *outz);
+
 float world_ground_z(const N2Scene *s, float x, float y, float fallback);
 
 /* Unit up-normal of the ground triangle under (x,y); (0,0,1) if off-track. */

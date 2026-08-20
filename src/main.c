@@ -3614,6 +3614,25 @@ int main(int argc, char **argv) {
             else               { throttle =  0.0f; steer = 0.0f; }
             handbrake = 0;
         }
+        /* Surface-aware handling (M114): ask the one ground-contact query what the
+           car is standing on, then EASE the active profile toward that surface's
+           profile over ~0.15 s. Blending the profile (not the velocity) means
+           crossing a road edge cannot snap speed, heading or camera; nothing
+           here moves the car or invents a height. WSURF_NONE keeps the road
+           profile, so an unsupported XY is never penalised. */
+        static PhysSurface surf_now = { 1.00f, 1.00f, 0.99886f, 0.86f, 1.00f };
+        static int surf_id = WSURF_ROAD, surf_prev = WSURF_ROAD;
+        {
+            float sz = carpos[2];
+            int sid = world_ground_at(&scene, carpos[0], carpos[1], carpos[2], &sz);
+            surf_prev = surf_id;
+            if (sid != WSURF_NONE) surf_id = sid;
+            const PhysSurface *tgt = (surf_id == WSURF_TERRAIN) ? &PHYS_SURF_TERRAIN
+                                                                : &PHYS_SURF_ROAD;
+            const float SURF_BLEND = 1.0f / 9.0f;   /* ~0.15 s at 60 Hz */
+            float *d = (float *)&surf_now; const float *t = (const float *)tgt;
+            for (int c = 0; c < 5; c++) d[c] += (t[c] - d[c]) * SURF_BLEND;
+        }
         /* push the ImGui handling sliders into the physics tune (stock when untouched) */
         g_phys_tune.accel = g_dbg.tune_accel; g_phys_tune.brake = g_dbg.tune_brake;
         g_phys_tune.turn = g_dbg.tune_turn;   g_phys_tune.top_kmh = g_dbg.tune_top;
@@ -3698,7 +3717,7 @@ int main(int argc, char **argv) {
         float dmag = sstatic ? 0.0f
                    : race_auto ? speed/60.0f
                    : phys_car_step(carpos, vel, &heading, &speed,
-                                   throttle, steer, handbrake);
+                                   throttle, steer, handbrake, &surf_now);
         float nf[2] = { cosf(heading), sinf(heading) }, nr[2] = { nf[1], -nf[0] };
         /* engine note: 6-speed virtual gearbox drives RPM + load; shifts cut
            the throttle for 150ms and let the revs sag (idles during the
@@ -3807,13 +3826,21 @@ int main(int argc, char **argv) {
               if (ar > ra_maxresid) ra_maxresid = ar;
               float ad = da_dz < 0 ? -da_dz : da_dz;
               if (ad > ra_maxpre) ra_maxpre = ad; }
+            if (surf_id != surf_prev)
+                printf("RA %-6ld t=%6.2fs SURFACE %s -> %s at (%.3f %.3f %.3f) "
+                       "spd %.2f km/h\n", ra_f, ra_f/60.0,
+                       surf_prev == WSURF_TERRAIN ? "TERRAIN" : "ROAD",
+                       surf_id  == WSURF_TERRAIN ? "TERRAIN" : "ROAD",
+                       carpos[0], carpos[1], carpos[2], PHYS_KMH(sk));
             if (ra_f % 30 == 0 || (ra_start >= 0 && ra_f == ra_start))
                 printf("RA %-6ld t=%6.2fs st=%d thr=%+.0f str=%+.0f pos(%9.3f %9.3f %8.3f) "
                        "hdg %+7.4f spd %7.2f km/h gz %8.3f pre_dz %+8.3f resid %+8.4f "
-                       "walls %d rails %d\n",
+                       "walls %d rails %d surf %-7s a%.2f v%.2f g%.2f\n",
                        ra_f, ra_f/60.0, race_state, throttle, steer,
                        carpos[0], carpos[1], carpos[2], heading, PHYS_KMH(sk), gz, da_dz, resid,
-                       ra_walls, ra_rails);
+                       ra_walls, ra_rails,
+                       surf_id == WSURF_TERRAIN ? "TERRAIN" : "ROAD",
+                       surf_now.accel, surf_now.topfrac, surf_now.lat);
             if (ra_start >= 0 && ra_f - ra_start == 2100) {
                 printf("RA SUMMARY track=%s showcase-spawn=(%.3f %.3f %.3f)\n",
                        trackname, spawn[0], spawn[1], spawn[2]);

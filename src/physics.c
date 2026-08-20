@@ -19,15 +19,25 @@
 
 PhysTune g_phys_tune = { 1.0f, 1.0f, 1.0f, 220.0f };   /* stock defaults */
 
+/* Asphalt: the tuned NFSU2 feel, unchanged. */
+const PhysSurface PHYS_SURF_ROAD    = { 1.00f, 1.00f, PHYS_FRICTION, PHYS_GRIP, 1.00f };
+/* Dirt/grass/hillside: it can still be driven onto and across, but it will not
+ * carry the car to road speed and it holds the sideways component far longer,
+ * so a hill has to be climbed slowly and slid across instead of railed up. */
+const PhysSurface PHYS_SURF_TERRAIN = { 0.55f, 0.50f, 0.99800f,     0.94f,     0.75f };
+
 float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
-                    float throttle, float steer, int handbrake) {
-    float top = g_phys_tune.top_kmh / 3.6f / PHYS_TICKRATE;   /* cap in m/tick */
+                    float throttle, float steer, int handbrake,
+                    const PhysSurface *sf) {
+    if (!sf) sf = &PHYS_SURF_ROAD;
+    float top = g_phys_tune.top_kmh / 3.6f / PHYS_TICKRATE * sf->topfrac;
     float hf[2] = { cosf(*heading), sinf(*heading) };
     float fwd = vel[0]*hf[0] + vel[1]*hf[1];   /* signed forward speed */
     if (throttle > 0) {
         /* throttle tapers as speed builds: punchy off the line, eases near top */
         float sp = *speed < 0 ? -*speed : *speed;
-        float a = PHYS_ACCEL * g_phys_tune.accel * (1.15f - 0.55f*sp/PHYS_MAXSPD) * throttle;
+        float a = PHYS_ACCEL * g_phys_tune.accel * (1.15f - 0.55f*sp/PHYS_MAXSPD)
+                  * throttle * sf->accel;
         vel[0] += hf[0]*a; vel[1] += hf[1]*a;
     } else if (throttle < 0) {
         /* moving forward = brakes (strong); at rest / rolling back = reverse */
@@ -36,18 +46,19 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
     } else {
         vel[0] *= COAST_DRAG; vel[1] *= COAST_DRAG;
     }
-    vel[0] *= PHYS_FRICTION; vel[1] *= PHYS_FRICTION;
+    vel[0] *= sf->drag; vel[1] *= sf->drag;
     float spd = sqrtf(vel[0]*vel[0]+vel[1]*vel[1]);
     float dir = (vel[0]*hf[0]+vel[1]*hf[1]) < 0 ? -1.f : 1.f;  /* fwd vs reverse */
     float sfac = spd/(PHYS_MAXSPD*TURN_RAMP_FRAC); if (sfac > 1) sfac = 1;
     float hifrac = spd/PHYS_MAXSPD; if (hifrac > 1) hifrac = 1;
-    *heading += steer * PHYS_TURN * g_phys_tune.turn * sfac * (1.0f - TURN_HISPD_DROP*hifrac) * dir;
+    *heading += steer * PHYS_TURN * g_phys_tune.turn * sfac
+                * (1.0f - TURN_HISPD_DROP*hifrac) * dir * sf->steer;
     /* decompose velocity in the new heading frame, clamp forward, scrub side */
     float nf[2] = { cosf(*heading), sinf(*heading) }, nr[2] = { nf[1], -nf[0] };
     float vf = vel[0]*nf[0]+vel[1]*nf[1], vl = vel[0]*nr[0]+vel[1]*nr[1];
     if (vf >  top) vf =  top;
     if (vf < -top*REVERSE_SPD_FRAC) vf = -top*REVERSE_SPD_FRAC;
-    vl *= handbrake ? HANDBRAKE_GRIP : PHYS_GRIP;
+    vl *= handbrake ? HANDBRAKE_GRIP : sf->lat;
     vel[0] = nf[0]*vf + nr[0]*vl; vel[1] = nf[1]*vf + nr[1]*vl;
     *speed = vf;                      /* forward speed, for HUD/collision */
     pos[0] += vel[0]; pos[1] += vel[1];
@@ -60,7 +71,7 @@ void phys_selftest(void) {
     float pos[3]={0,0,0}, vel[2]={0,0}, h=0, spd=0;
     int t100 = -1;
     for (int t = 1; t <= 60*60; t++) {
-        phys_car_step(pos, vel, &h, &spd, 1.0f, 0, 0);
+        phys_car_step(pos, vel, &h, &spd, 1.0f, 0, 0, NULL);
         if (t100 < 0 && PHYS_KMH(spd) >= 100.0f) t100 = t;
     }
     assert(t100 > 2*60 && t100 < 6*60);
@@ -69,10 +80,35 @@ void phys_selftest(void) {
     vel[0] = cosf(h)*100.0f/3.6f/PHYS_TICKRATE; vel[1] = sinf(h)*100.0f/3.6f/PHYS_TICKRATE;
     int tstop = -1;
     for (int t = 1; t <= 8*60 && tstop < 0; t++) {
-        phys_car_step(pos, vel, &h, &spd, -1.0f, 0, 0);
+        phys_car_step(pos, vel, &h, &spd, -1.0f, 0, 0, NULL);
         if (spd <= 0.0f) tstop = t;
     }
     assert(tstop > 0 && tstop < 5*60);
+
+    /* --- surface profiles (M114) --------------------------------------------
+     * Flat ground, sustained full throttle, identical inputs: terrain must
+     * settle materially below road speed and must slide measurably more. */
+    {
+        float rp[3]={0,0,0}, rv[2]={0,0}, rh=0, rs=0;
+        float tp[3]={0,0,0}, tv[2]={0,0}, th=0, ts=0;
+        for (int t = 0; t < 60*60; t++) {
+            phys_car_step(rp, rv, &rh, &rs, 1.0f, 0, 0, &PHYS_SURF_ROAD);
+            phys_car_step(tp, tv, &th, &ts, 1.0f, 0, 0, &PHYS_SURF_TERRAIN);
+        }
+        assert(PHYS_KMH(ts) < 0.65f * PHYS_KMH(rs));   /* materially slower */
+        assert(PHYS_KMH(ts) > 5.0f);                   /* still drivable */
+        /* same steering input from the same speed: terrain keeps more of the
+         * sideways component, i.e. it slides more (phys_car_step returns the
+         * post-grip lateral magnitude). */
+        float ap[3]={0,0,0}, av[2], ah=0, as2=0, bp[3]={0,0,0}, bv[2], bh=0, bs=0;
+        av[0]=bv[0]=30.0f/3.6f/PHYS_TICKRATE; av[1]=bv[1]=0;
+        float dr = 0, dt2 = 0;
+        for (int t = 0; t < 30; t++) {
+            dr  = phys_car_step(ap, av, &ah, &as2, 1.0f, 1.0f, 0, &PHYS_SURF_ROAD);
+            dt2 = phys_car_step(bp, bv, &bh, &bs,  1.0f, 1.0f, 0, &PHYS_SURF_TERRAIN);
+        }
+        assert(dt2 > dr);                              /* more lateral slide */
+    }
 }
 
 /* Does this mesh present an actual wall to the car here? Near-vertical face,

@@ -30,8 +30,24 @@ extern PhysTune g_phys_tune;
  * in [-1..1] rotates it, tyres scrub the sideways velocity (handbrake keeps
  * it, so the car slides), position integrates. Returns the post-grip lateral
  * speed magnitude — the drift signal for skid marks / smoke / screech. */
+/* What the surface under the car does to the arcade model. Multipliers on the
+ * constants above, except `drag` and `lat` which REPLACE PHYS_FRICTION and
+ * PHYS_GRIP outright. The road profile is exactly the tuned NFSU2 feel, so
+ * passing it (or NULL) reproduces the previous behaviour bit for bit. */
+typedef struct {
+    float accel;    /* thrust multiplier */
+    float topfrac;  /* fraction of the selected top speed the surface allows */
+    float drag;     /* per-tick velocity retention (replaces PHYS_FRICTION) */
+    float lat;      /* lateral retention per tick (replaces PHYS_GRIP) */
+    float steer;    /* steering-authority multiplier */
+} PhysSurface;
+extern const PhysSurface PHYS_SURF_ROAD;
+extern const PhysSurface PHYS_SURF_TERRAIN;
+
+/* sf == NULL is the road profile. */
 float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
-                    float throttle, float steer, int handbrake);
+                    float throttle, float steer, int handbrake,
+                    const PhysSurface *sf);
 
 /* Push (pos.xy) out of any wall AABB (expanded by r) it penetrates, along the
  * least-penetration axis; zero the into-wall velocity so the car slides along
