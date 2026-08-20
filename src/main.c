@@ -256,9 +256,16 @@ static void car_info_walk(const unsigned char *d, long beg, long end,
                 tris += (ib2 - ip) / 2 / 3;
             }
             float M[16]; int hasM = n2_obj_matrix(d, ds, ds + s, M);
-            printf("  %-34s %-10s verts=%-5ld tris=%-5ld  mat=%d t=(%+.3f %+.3f %+.3f)\n",
+            /* M111: the material metadata a soft-top rule would have to key on --
+               every 0x134012 slot in stored order, and the full 0x134011 name run. */
+            uint32_t sl[16]; int nsl = n2_mesh_texslots(d, ds, ds + s, sl, 16);
+            char slb[160]; int sp2 = 0; slb[0] = 0;
+            for (int k = 0; k < nsl && sp2 < 140; k++)
+                sp2 += snprintf(slb + sp2, sizeof slb - sp2, "%08x ", sl[k]);
+            printf("  %-34s %-10s verts=%-5ld tris=%-5ld  mat=%d t=(%+.3f %+.3f %+.3f)"
+                   "  slots=%d [%s]\n",
                    nm[0] ? nm : "(noname)", car_cat_name(c), verts, tris,
-                   hasM, M[12], M[13], M[14]);
+                   hasM, M[12], M[13], M[14], nsl, slb);
             /* Running-gear parts (wheel + brake disc) carry the axle position IF
                they are modelled in place. Print their vertex bbox centre to show
                they are NOT: every one sits at the model origin, so GEOMETRY.BIN
@@ -449,6 +456,100 @@ static int ss_stack(const N2Scene *s, const float (*mbb)[4], float x, float y,
     return n;
 }
 
+/* ---- --race-audit collision attribution (Milestone 94) --------------------
+ * Every persistent collision response in the M93 trace, attributed to the exact
+ * mesh (and triangle, for rails) that produced it. Observation only: the wall
+ * probe reads the same rects collide_walls is about to test, before it resolves;
+ * the rail record is filled inside world_wall_push's own pass. Nothing here
+ * writes carpos or vel. */
+typedef struct {
+    int kind;                 /* 0 = building AABB, 1 = road/terrain rail face */
+    int mesh, tri;
+    float bb[6];              /* AABB x0 y0 x1 y1 z0 z1 (buildings) */
+    float nz, zlo, zhi, edged;/* rails */
+    float cx, cy, cz;         /* car XY/Z at the FIRST hit of this group */
+    int   wp; float segd;     /* nearest route waypoint + distance to the line */
+    long  first; int count;
+} M94Grp;
+#define M94_MAXGRP 4096
+static M94Grp m94g[M94_MAXGRP]; static int m94n = 0;
+typedef struct { int grp; long f; } M94Ev;
+#define M94_MAXEV 256
+static M94Ev m94ev[M94_MAXEV]; static int m94nev = 0;
+static float m94_prex, m94_prey, m94_prez;   /* car pose before this frame's pushes */
+static int   g_m107 = 0;          /* M107: three-heading menu capture, audit only */
+static float g_m107_h[3];
+
+static void m94_nearest_wp(const N2Path *ap, float x, float y, int *wp, float *segd) {
+    *wp = -1; *segd = 0;
+    float bd = 1e30f;
+    for (int i = 0; i < ap->n; i++) {
+        float dx = ap->xy[i*2]-x, dy = ap->xy[i*2+1]-y, d2 = dx*dx+dy*dy;
+        if (d2 < bd) { bd = d2; *wp = i; }
+    }
+    if (*wp >= 0) *segd = sqrtf(bd);
+}
+static void m94_add(M94Grp *k, long f) {
+    for (int i = 0; i < m94n; i++)
+        if (m94g[i].kind == k->kind && m94g[i].mesh == k->mesh && m94g[i].tri == k->tri) {
+            m94g[i].count++;
+            if (m94nev < M94_MAXEV) { m94ev[m94nev].grp = i; m94ev[m94nev].f = f; m94nev++; }
+            return;
+        }
+    if (m94n >= M94_MAXGRP) return;
+    k->count = 1; k->first = f; m94g[m94n] = *k;
+    if (m94nev < M94_MAXEV) { m94ev[m94nev].grp = m94n; m94ev[m94nev].f = f; m94nev++; }
+    m94n++;
+}
+static void m94_wall(int o, int mesh, const N2Scene *s, const float *car,
+                     const N2Path *ap, long f) {
+    (void)o;
+    M94Grp k; memset(&k, 0, sizeof k);
+    k.kind = 0; k.mesh = mesh; k.tri = -1;
+    const N2Mesh *m = &s->meshes[mesh];
+    k.bb[0]=k.bb[1]=k.bb[4]=1e30f; k.bb[2]=k.bb[3]=k.bb[5]=-1e30f;
+    for (int v = 0; v < m->nverts; v++) { float *p = m->verts + v*5;
+        if(p[0]<k.bb[0])k.bb[0]=p[0]; if(p[0]>k.bb[2])k.bb[2]=p[0];
+        if(p[1]<k.bb[1])k.bb[1]=p[1]; if(p[1]>k.bb[3])k.bb[3]=p[1];
+        if(p[2]<k.bb[4])k.bb[4]=p[2]; if(p[2]>k.bb[5])k.bb[5]=p[2]; }
+    k.cx=car[0]; k.cy=car[1]; k.cz=car[2];
+    m94_nearest_wp(ap, car[0], car[1], &k.wp, &k.segd);
+    m94_add(&k, f);
+}
+static void m94_rail(const WRailHit *rh, const N2Scene *s, float px, float py, float pz,
+                     const N2Path *ap, long f) {
+    (void)s;
+    M94Grp k; memset(&k, 0, sizeof k);
+    k.kind = 1; k.mesh = rh->mesh; k.tri = rh->tri;
+    k.nz = rh->nz; k.zlo = rh->zlo; k.zhi = rh->zhi; k.edged = rh->edged;
+    k.cx=px; k.cy=py; k.cz=pz;
+    m94_nearest_wp(ap, px, py, &k.wp, &k.segd);
+    m94_add(&k, f);
+}
+
+/* M100: locate one 0x80134010 object chunk by its 0x134011 name. Read-only. */
+static int m100_nobj = 0;
+static int m100_find(const unsigned char *d, long beg, long end, const char *want,
+                     long *outds, uint32_t *outsz) {
+    long o = beg;
+    while (o + 8 <= end) {
+        uint32_t mg = n2_u32(d + o), sz = n2_u32(d + o + 4);
+        long ds = o + 8;
+        /* advance exactly like n2_walk_meshes: magic 0 is a sized block too */
+        if (mg == 0x80134010u) {
+            char anm[40]; n2_mesh_name(d, ds, ds + sz, anm, sizeof anm);
+            m100_nobj++;
+            if (want[0] == '*') {          /* listing mode: substring filter */
+                if (strstr(anm, want + 1)) printf("  [obj] %s\n", anm);
+            } else if (!strcmp(anm, want)) { *outds = ds; *outsz = sz; return 1; }
+        }
+        else if (mg != 0 && (mg >> 28) == 8 &&
+                 m100_find(d, ds, ds + sz, want, outds, outsz)) return 1;
+        o = ds + sz;
+    }
+    return 0;
+}
+
 /* Inside any building/wall footprint (same rects collide_walls uses)? */
 static int ss_in_wall(const float obst[][4], int nobst, float x, float y, float r) {
     for (int o = 0; o < nobst; o++)
@@ -456,6 +557,39 @@ static int ss_in_wall(const float obst[][4], int nobst, float x, float y, float 
             y > obst[o][1]-r && y < obst[o][3]+r) return 1;
     return 0;
 }
+
+/* First waypoint at or after `from` (wrapping the closed loop) whose road layer
+ * passes the M91 tests: layers come from the exact covering triangles, never
+ * from world_ground_z; the whole car footprint must stand on road (ss_patch);
+ * the point must be outside the collide_walls footprint (ss_in_wall); and there
+ * must be SS_CLEAR_M of headroom (ss_ceiling_above). Heading is the FORWARD path
+ * tangent, the direction the car will actually set off in. Returns the waypoint
+ * index and writes its accepted road Z + heading, or -1 if the route has none. */
+static int sl_first_safe(const N2Scene *s, const float (*mbb)[4],
+                         const float *xy, int n, int from,
+                         const float obst[][4], int nobst,
+                         float hl, float hw, float *outz, float *outhead) {
+    static SSHit hit[8192];
+    for (int k = 0; k < n; k++) {
+        int i = ((from + k) % n + n) % n;
+        float x = xy[i*2], y = xy[i*2+1];
+        int nx = (i + 1) % n;
+        float head = atan2f(xy[nx*2+1] - y, xy[nx*2] - x);   /* forward tangent */
+        if (ss_in_wall(obst, nobst, x, y, 1.3f)) continue;
+        int nh = ss_stack(s, mbb, x, y, hit, 8192);
+        for (int a = 0; a < nh; a++) {
+            if (a && hit[a].z - hit[a-1].z < 0.05f) continue;   /* coincident tris */
+            if (hit[a].cat != N2_ROAD) continue;
+            float rz = hit[a].z, pr[5][4];
+            if (!ss_patch(s, mbb, x, y, rz, head, hl, hw, pr)) continue;
+            if (ss_ceiling_above(s, mbb, x, y, rz) - rz < SS_CLEAR_M) continue;
+            *outz = rz; *outhead = head;
+            return i;
+        }
+    }
+    return -1;
+}
+
 
 /* ---- --bundle-census (Milestone 84) --------------------------------------
  * GL-free. Loads every STREAM*.BUN's geometry with the production parser (no
@@ -509,6 +643,322 @@ static float bc_surface(const BCBundle *b, int cat, float x, float y, float refz
     return best;
 }
 
+/* ---- --ground-conflict (Milestone 85) ------------------------------------
+ * Control census: how far apart do two different bundles put "the ground" at
+ * the same XY, under normal (non-TEMP) road, versus under L4RC's TEMP_ROAD01_
+ * venue strip? Pure measurement -- nothing here is read by the loader, the
+ * batcher, the spawn picker or the renderer, and no threshold is decided or
+ * encoded. Raw per-bundle parse (no dedup), exactly like --bundle-census, so
+ * the byte-identical re-ships between bundles are still present and visible. */
+typedef struct { int sb, sm, ob, om; float sz, oz, dz; } GCSample;
+
+/* First XY-nondegenerate triangle of the mesh, in index order -> its centroid.
+ * Index order makes the pick deterministic; the centroid is by construction
+ * inside the triangle, so the source bundle always covers its own sample. */
+static int gc_centroid(const N2Mesh *m, float *cx, float *cy, float *cz) {
+    for (int t = 0; t + 2 < m->nidx; t += 3) {
+        const float *a = m->verts + m->idx[t]*5;
+        const float *b = m->verts + m->idx[t+1]*5;
+        const float *c = m->verts + m->idx[t+2]*5;
+        float d = (b[1]-c[1])*(a[0]-c[0]) + (c[0]-b[0])*(a[1]-c[1]);
+        if (d > -1e-9f && d < 1e-9f) continue;
+        *cx = (a[0]+b[0]+c[0]) / 3.0f;
+        *cy = (a[1]+b[1]+c[1]) / 3.0f;
+        *cz = (a[2]+b[2]+c[2]) / 3.0f;
+        return 1;
+    }
+    return 0;
+}
+
+/* Nearest ROAD/TERRAIN surface of bundle b to refz at (x,y). ss_stack does the
+ * exact barycentric coverage test; mesh XY bounds are broad-phase only. */
+static int gc_maxstack = 0;   /* deepest covering stack seen; cap-hit guard */
+static int gc_nearest(const BCBundle *b, float x, float y, float refz,
+                      float *oz, int *om) {
+    static SSHit hit[8192];
+    int n = ss_stack(&b->sc, (const float (*)[4])b->bb, x, y, hit, 8192);
+    if (n > gc_maxstack) gc_maxstack = n;
+    float bd = 1e30f; int found = 0;
+    for (int i = 0; i < n; i++) {
+        float d = hit[i].z - refz; if (d < 0) d = -d;
+        if (d < bd) { bd = d; *oz = hit[i].z; *om = hit[i].mesh; found = 1; }
+    }
+    return found;
+}
+
+static int gc_cmp_f(const void *a, const void *b) {
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+static int gc_cmp_dz(const void *a, const void *b) {   /* descending |dZ| */
+    float x = ((const GCSample *)a)->dz, y = ((const GCSample *)b)->dz;
+    return x > y ? -1 : x < y ? 1 : 0;
+}
+static float gc_pct(const float *v, int n, float p) {  /* nearest-rank */
+    if (n <= 0) return 0;
+    int i = (int)ceilf(p * (float)n) - 1;
+    if (i < 0) i = 0; if (i >= n) i = n - 1;
+    return v[i];
+}
+
+/* One cohort. mode 0 = every bundle's non-TEMP_ ROAD meshes; mode 1 = only
+ * STREAML4RC's TEMP_ROAD01_ meshes. Identical measurement either way. */
+/* The sampling pass, shared by M85 (--ground-conflict) and M86 (--pair-overlap)
+ * so both read the identical population: mode 0 = every bundle's non-TEMP_ ROAD
+ * meshes, mode 1 = STREAML4RC's TEMP_ROAD01_ meshes only. Caller frees. */
+static GCSample *gc_collect(BCBundle *bc, int nb, int mode, int *nsrc,
+                            int (*nomiss)[WORLD_MAXREG], int *out_nsm,
+                            int *out_nmesh, int *out_nskip) {
+    GCSample *sm = NULL; int nsm = 0, cap = 0;
+    int nmesh = 0, nskip = 0;
+    memset(nsrc, 0, WORLD_MAXREG * sizeof *nsrc);
+    memset(nomiss, 0, WORLD_MAXREG * sizeof *nomiss);
+
+    for (int b = 0; b < nb; b++) {
+        for (int i = 0; i < bc[b].sc.count; i++) {
+            const N2Mesh *m = &bc[b].sc.meshes[i];
+            if (mode == 0) {
+                if (m->cat != N2_ROAD) continue;
+                if (!strncmp(m->sname, "TEMP_", 5)) continue;
+            } else {
+                if (strcmp(bc[b].name, "STREAML4RC")) continue;
+                if (strncmp(m->sname, "TEMP_ROAD01_", 12)) continue;
+            }
+            nmesh++;
+            float cx, cy, cz;
+            if (!gc_centroid(m, &cx, &cy, &cz)) { nskip++; continue; }
+            nsrc[b]++;
+            for (int q = 0; q < nb; q++) {
+                if (q == b) continue;
+                float oz = 0; int om = -1;
+                if (!gc_nearest(&bc[q], cx, cy, cz, &oz, &om)) { nomiss[b][q]++; continue; }
+                if (nsm == cap) {
+                    cap = cap ? cap * 2 : 4096;
+                    sm = (GCSample *)realloc(sm, (size_t)cap * sizeof *sm);
+                }
+                float d = oz - cz; if (d < 0) d = -d;
+                sm[nsm].sb = b; sm[nsm].sm = i; sm[nsm].ob = q; sm[nsm].om = om;
+                sm[nsm].sz = cz; sm[nsm].oz = oz; sm[nsm].dz = d;
+                nsm++;
+            }
+        }
+    }
+    *out_nsm = nsm; *out_nmesh = nmesh; *out_nskip = nskip;
+    return sm;
+}
+
+static void gc_cohort(BCBundle *bc, int nb, const char *label, int mode) {
+    int nsrc[WORLD_MAXREG], nomiss[WORLD_MAXREG][WORLD_MAXREG];
+    int nsm = 0, nmesh = 0, nskip = 0;
+    GCSample *sm = gc_collect(bc, nb, mode, nsrc, nomiss, &nsm, &nmesh, &nskip);
+
+    printf("%s:\n", label);
+    printf("  source meshes %d (sampled %d, skipped %d with no XY-valid triangle), "
+           "cross-bundle probes %d\n", nmesh, nmesh - nskip, nskip, nsm);
+    if (!nsm) { printf("  (no samples)\n\n"); free(sm); return; }
+    printf("  %-11s %-11s %8s %8s %9s %9s %9s %9s %9s %9s %8s %8s %8s\n",
+           "source", "other", "samples", "no-grnd", "min", "p50", "p90",
+           "p95", "p99", "max", "<=1m", "<=5m", "<=20m");
+
+    float *v = (float *)malloc((size_t)nsm * sizeof *v);
+    for (int b = 0; b < nb; b++) {
+        if (!nsrc[b]) continue;
+        for (int q = 0; q < nb; q++) {
+            if (q == b) continue;
+            int n = 0, c1 = 0, c5 = 0, c20 = 0;
+            for (int k = 0; k < nsm; k++) {
+                if (sm[k].sb != b || sm[k].ob != q) continue;
+                v[n++] = sm[k].dz;
+                if (sm[k].dz <= 1.0f)  c1++;
+                if (sm[k].dz <= 5.0f)  c5++;
+                if (sm[k].dz <= 20.0f) c20++;
+            }
+            if (!n && !nomiss[b][q]) continue;
+            if (!n) {   /* the other bundle never covers this source at all */
+                printf("  %-11s %-11s %8d %8d %9s %9s %9s %9s %9s %9s "
+                       "%8s %8s %8s\n", bc[b].name, bc[q].name, nsrc[b],
+                       nomiss[b][q], "-","-","-","-","-","-","-","-","-");
+                continue;
+            }
+            qsort(v, (size_t)n, sizeof *v, gc_cmp_f);
+            printf("  %-11s %-11s %8d %8d %9.3f %9.3f %9.3f %9.3f %9.3f %9.3f "
+                   "%8d %8d %8d\n",
+                   bc[b].name, bc[q].name, nsrc[b], nomiss[b][q],
+                   v[0], gc_pct(v,n,0.50f), gc_pct(v,n,0.90f),
+                   gc_pct(v,n,0.95f), gc_pct(v,n,0.99f), v[n-1],
+                   c1, c5, c20);
+        }
+    }
+
+    /* cohort-wide pooled distribution */
+    for (int k = 0; k < nsm; k++) v[k] = sm[k].dz;
+    qsort(v, (size_t)nsm, sizeof *v, gc_cmp_f);
+    int p1 = 0, p5 = 0, p20 = 0;
+    for (int k = 0; k < nsm; k++) {
+        if (v[k] <= 1.0f)  p1++;
+        if (v[k] <= 5.0f)  p5++;
+        if (v[k] <= 20.0f) p20++;
+    }
+    printf("  %-11s %-11s %8s %8s %9.3f %9.3f %9.3f %9.3f %9.3f %9.3f "
+           "%8d %8d %8d\n", "POOLED", "*", "-", "-",
+           v[0], gc_pct(v,nsm,0.50f), gc_pct(v,nsm,0.90f), gc_pct(v,nsm,0.95f),
+           gc_pct(v,nsm,0.99f), v[nsm-1], p1, p5, p20);
+    free(v);
+
+    printf("  deepest covering stack in any probe: %d triangles (cap 8192)\n",
+           gc_maxstack);
+    printf("  largest disagreements (up to 10):\n");
+    qsort(sm, (size_t)nsm, sizeof *sm, gc_cmp_dz);
+    for (int k = 0; k < nsm && k < 10; k++) {
+        const N2Mesh *a = &bc[sm[k].sb].sc.meshes[sm[k].sm];
+        const N2Mesh *o = &bc[sm[k].ob].sc.meshes[sm[k].om];
+        printf("    %-11s %-28s %9.3f  ->  %-11s %-28s %9.3f   dZ %9.3f\n",
+               bc[sm[k].sb].name, a->sname[0] ? a->sname : "(unnamed)", sm[k].sz,
+               bc[sm[k].ob].name, o->sname[0] ? o->sname : "(unnamed)", sm[k].oz,
+               sm[k].dz);
+    }
+    printf("\n");
+    free(sm);
+}
+
+/* ---- --pair-overlap (Milestone 86) ---------------------------------------
+ * Same population, same coverage test and same deterministic centroids as M85;
+ * this milestone reorganises them into an ordered bundle-pair matrix. The five
+ * |dZ| bins are disjoint and partition the covered samples exactly:
+ *   [0,1]  (1,5]  (5,20]  (20,50]  (50,inf)
+ * No classification constant, threshold or composition rule is encoded here --
+ * the pair labels are assigned in the written report from these numbers. The
+ * two example rankings below are monotone scores over the measured pairs, not
+ * cutoffs: nothing is included or excluded by them. */
+typedef struct {
+    int samples, covered, nocov;
+    int b1, b5, b20, b50, bhi;
+    float p50, dmin, dmax;
+} GCPairStat;
+
+/* Ascending |dZ| for one ordered pair -> caller's buffer; returns the count. */
+static int gc_pair_dz(const GCSample *sm, int nsm, int b, int q, float *v) {
+    int n = 0;
+    for (int k = 0; k < nsm; k++)
+        if (sm[k].sb == b && sm[k].ob == q) v[n++] = sm[k].dz;
+    qsort(v, (size_t)n, sizeof *v, gc_cmp_f);
+    return n;
+}
+
+/* Five deterministic quantile samples of one ordered pair, named. */
+static void gc_examples(BCBundle *bc, const GCSample *sm, int nsm, int b, int q) {
+    GCSample *e = (GCSample *)malloc((size_t)nsm * sizeof *e);
+    int n = 0;
+    for (int k = 0; k < nsm; k++)
+        if (sm[k].sb == b && sm[k].ob == q) e[n++] = sm[k];
+    if (!n) { free(e); printf("    (no covered samples)\n"); return; }
+    qsort(e, (size_t)n, sizeof *e, gc_cmp_dz);       /* descending */
+    for (int i = 0; i < n / 2; i++) { GCSample t = e[i]; e[i] = e[n-1-i]; e[n-1-i] = t; }
+    const float qs[5] = { 0.0f, 0.25f, 0.50f, 0.75f, 1.0f };
+    const char *qn[5] = { "min", "p25", "p50", "p75", "max" };
+    for (int i = 0; i < 5 && i < n; i++) {
+        int idx = (int)(qs[i] * (float)(n - 1) + 0.5f);
+        const GCSample *x = &e[idx];
+        const N2Mesh *a = &bc[x->sb].sc.meshes[x->sm];
+        const N2Mesh *o = &bc[x->ob].sc.meshes[x->om];
+        printf("    %-3s %-11s %-28s %9.3f  ->  %-11s %-28s %9.3f   dZ %9.3f\n",
+               qn[i], bc[x->sb].name, a->sname[0] ? a->sname : "(unnamed)", x->sz,
+               bc[x->ob].name, o->sname[0] ? o->sname : "(unnamed)", x->oz, x->dz);
+    }
+    free(e);
+}
+
+/* Ordered-pair matrix for one cohort. Fills pst; returns the samples (caller
+ * frees) so the example blocks can quote them. */
+static GCSample *gc_matrix(BCBundle *bc, int nb, const char *label, int mode,
+                           GCPairStat pst[][WORLD_MAXREG], int *out_nsm) {
+    int nsrc[WORLD_MAXREG], nomiss[WORLD_MAXREG][WORLD_MAXREG];
+    int nsm = 0, nmesh = 0, nskip = 0;
+    GCSample *sm = gc_collect(bc, nb, mode, nsrc, nomiss, &nsm, &nmesh, &nskip);
+    memset(pst, 0, WORLD_MAXREG * WORLD_MAXREG * sizeof **pst);
+
+    printf("%s:\n", label);
+    printf("  source meshes %d (sampled %d, skipped %d), cross-bundle probes %d\n",
+           nmesh, nmesh - nskip, nskip, nsm);
+    printf("  counts are RAW sample counts; 'cover%%' is a percentage of source samples.\n");
+    printf("  bins are disjoint and partition the covered samples: "
+           "[0,1] (1,5] (5,20] (20,50] (50,inf)\n");
+    printf("  %-11s %-11s %8s %8s %7s | %7s %7s %7s %7s %7s | %7s %9s\n",
+           "source", "other", "samples", "covers", "cover%",
+           "<=1m", "1-5m", "5-20m", "20-50m", ">50m", "no-cov", "p50|dZ|");
+
+    float *v = (float *)malloc((size_t)(nsm ? nsm : 1) * sizeof *v);
+    for (int b = 0; b < nb; b++) {
+        if (!nsrc[b]) continue;
+        for (int q = 0; q < nb; q++) {
+            if (q == b) continue;
+            GCPairStat *P = &pst[b][q];
+            P->samples = nsrc[b];
+            P->nocov   = nomiss[b][q];
+            int n = gc_pair_dz(sm, nsm, b, q, v);
+            P->covered = n;
+            for (int k = 0; k < n; k++) {
+                float d = v[k];
+                if      (d <= 1.0f)  P->b1++;
+                else if (d <= 5.0f)  P->b5++;
+                else if (d <= 20.0f) P->b20++;
+                else if (d <= 50.0f) P->b50++;
+                else                 P->bhi++;
+            }
+            P->p50  = n ? gc_pct(v, n, 0.50f) : 0;
+            P->dmin = n ? v[0] : 0;
+            P->dmax = n ? v[n-1] : 0;
+            if (!n && !P->nocov) continue;
+            printf("  %-11s %-11s %8d %8d %6.1f%% | %7d %7d %7d %7d %7d | %7d ",
+                   bc[b].name, bc[q].name, P->samples, P->covered,
+                   100.0 * (double)P->covered / (double)P->samples,
+                   P->b1, P->b5, P->b20, P->b50, P->bhi, P->nocov);
+            if (n) printf("%9.3f\n", P->p50); else printf("%9s\n", "-");
+            if (P->b1 + P->b5 + P->b20 + P->b50 + P->bhi != P->covered ||
+                P->covered + P->nocov != P->samples)
+                printf("      !! partition check FAILED for this row\n");
+        }
+    }
+    free(v);
+    printf("\n");
+    *out_nsm = nsm;
+    return sm;
+}
+
+/* ---- --event-refs (Milestone 87) -----------------------------------------
+ * Does the shipped event data itself say which bundles belong together?
+ * Census only: it drives the PRODUCTION parser (world_load_events) over a World
+ * whose region list is filled in from the same res_list_tracks discovery the
+ * engine uses, then re-reads the identical 0x3414c leaves at the identical
+ * 272-byte stride purely to print the header bytes the parser does not consume.
+ * No new chunk schema, no geometry inference, no manifest, no fallback. */
+typedef struct {
+    char stem[8];              /* region stem, e.g. "L4RA" */
+    char cat[256];             /* catalog file the loader would open */
+    char cat2[256];            /* next Paths file in the same dir, for cross-check */
+    int  nrec, nrec2;          /* 0x3414c record counts in each */
+    int  idmatch;              /* 1 = both files' id lists identical */
+    const unsigned char *d; long len;
+    long off;                  /* first 0x3414c leaf offset in cat */
+} ERRegion;
+
+/* The loader's own file search: first existing ROUTES<stem>/Paths<id>.bin. */
+static int er_find_paths(const char *troot, const char *stem, int skip, char *out, int cap) {
+    int seen = 0;
+    for (int fi = 0; fi < 4000; fi++) {
+        char p[1024];
+        snprintf(p, sizeof p, "%s/ROUTES%s/Paths%04d.bin", troot, stem, 4000 + fi);
+        FILE *f = fopen(p, "rb");
+        if (!f) continue;
+        fclose(f);
+        if (seen++ < skip) continue;
+        snprintf(out, (size_t)cap, "%s", p);
+        return 4000 + fi;
+    }
+    out[0] = 0;
+    return -1;
+}
+
 int main(int argc, char **argv) {
     collide_walls_selftest();
     phys_selftest();
@@ -532,6 +982,21 @@ int main(int argc, char **argv) {
     const char *sspawn = NULL;   /* --static-spawn-audit TRACK (M80) */
     const char *sstack = NULL; float stx = 0, sty = 0;   /* --surface-stack TRACK X Y (M81) */
     int bcensus = 0;   /* --bundle-census (M84) */
+    int gconf = 0;     /* --ground-conflict (M85): cross-bundle ground control */
+    int poverlap = 0;  /* --pair-overlap (M86): ordered bundle-pair overlap matrix */
+    int erefs = 0;     /* --event-refs (M87): event -> bundle reference census */
+    const char *daudit = NULL;  /* --drive-audit PREFIX (M88): scripted interactive drive */
+    const char *raudit = NULL;  /* --race-audit PREFIX (M89): menu -> Enter -> countdown -> race */
+    int slaudit = 0;   /* --startline-audit (M91): every route waypoint x every ROAD layer */
+    const char *smaudit = NULL; uint32_t smkey = 0;  /* --smear-audit PREFIX TEXKEYHEX (M98) */
+    const char *tpkrec = NULL; uint32_t tpkkey = 0;  /* --tpk-record PREFIX KEYHEX (M99) */
+    const char *matdump = NULL, *matmesh = NULL;     /* --mesh-material PREFIX NAME (M100) */
+    int fbcensus = 0;   /* --fallback-census (M102): who still takes the old path */
+    int camat = 0; float camx = 0, camy = 0;   /* --cam-at X Y: aim a static capture */
+    const char *b02probe = NULL;   /* --b02-probe NAME (M104): stride/field search */
+    const char *shaudit = NULL;    /* --showcase-audit PREFIX [X Y] (M106) */
+    int cprobe = 0; float cpx = 0, cpy = 0;   /* --cover-probe X Y (M110v) */
+    int shovr = 0; float shx = 0, shy = 0;
     const char *baudit = NULL, *bmesh = NULL;   /* --batch-audit REGION MESHNAME */
     int vcensus = 0;   /* --vista-census: measure every region's backdrop candidates */
     float vthresh = 3000.0f;   /* --vista-census [METRES]: candidate XY-span floor */
@@ -572,6 +1037,35 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "shot-static-pass: unknown pass '%s', using full\n", pm);
         }
         else if (!strcmp(argv[i], "--bundle-census")) bcensus = 1;
+        else if (!strcmp(argv[i], "--ground-conflict")) gconf = 1;
+        else if (!strcmp(argv[i], "--pair-overlap")) poverlap = 1;
+        else if (!strcmp(argv[i], "--event-refs")) erefs = 1;
+        else if (!strcmp(argv[i], "--drive-audit") && i+1 < argc) daudit = argv[++i];
+        else if (!strcmp(argv[i], "--race-audit")  && i+1 < argc) raudit = argv[++i];
+        else if (!strcmp(argv[i], "--startline-audit")) slaudit = 1;
+        else if (!strcmp(argv[i], "--fallback-census")) { fbcensus = 1; n2_m102 = 1; }
+        else if (!strcmp(argv[i], "--cover-probe") && i+2 < argc) {
+            cprobe = 1; cpx = (float)atof(argv[++i]); cpy = (float)atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--showcase-audit") && i+1 < argc) {
+            shaudit = argv[++i];
+            if (i+2 < argc && (argv[i+1][0] == '-' ? isdigit((unsigned char)argv[i+1][1])
+                                                   : isdigit((unsigned char)argv[i+1][0]))) {
+                shovr = 1; shx = (float)atof(argv[++i]); shy = (float)atof(argv[++i]);
+            }
+            raudit = shaudit;   /* reuse the menu-camera frame at rshot == 2 */
+        }
+        else if (!strcmp(argv[i], "--b02-probe") && i+1 < argc) {
+            b02probe = argv[++i]; fbcensus = 1; n2_m102 = 1; }
+        else if (!strcmp(argv[i], "--cam-at") && i+2 < argc) {
+            camat = 1; camx = (float)atof(argv[++i]); camy = (float)atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--mesh-material") && i+2 < argc) {
+            matdump = argv[++i]; matmesh = argv[++i]; }
+        else if (!strcmp(argv[i], "--tpk-record") && i+2 < argc) {
+            tpkrec = argv[++i]; tpkkey = (uint32_t)strtoul(argv[++i], NULL, 16); }
+        else if (!strcmp(argv[i], "--smear-audit") && i+2 < argc) {
+            smaudit = argv[++i]; smkey = (uint32_t)strtoul(argv[++i], NULL, 16);
+            raudit = smaudit;   /* reuse the M89 menu->Enter->countdown path */
+        }
         else if (!strcmp(argv[i], "--vista-census")) { vcensus = 1;
             if (i+1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9') vthresh = (float)atof(argv[++i]); }
         else dataroot = argv[i];
@@ -583,6 +1077,11 @@ int main(int argc, char **argv) {
        position (never from a stale `spawn`) and settles for a fixed count, so
        two runs of the same command produce the same pixels. */
     const int sstatic = sshot != NULL;
+    if (daudit) {   /* M88: 2 s idle + 10 s forward + 20 s forward/steer + 5 s brake/coast */
+        static char dashot[1024];
+        snprintf(dashot, sizeof dashot, "%s_end.png", daudit);
+        shot = dashot; shotframes = 2220;
+    }
     if (sstatic) { shot = sshot; shotframes = 8; }   /* fixed settle: reproducible */
     if (carinfo) return dump_car_info(dataroot, carinfo);   /* inspect one car, GL-free, exit */
     char carp[1024], cartexp[1024], pathp[1024], troot[1024];
@@ -760,6 +1259,288 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    /* --ground-conflict (Milestone 85): the control measurement. How far apart
+       do two bundles place the ground at the same XY under ordinary road, and
+       does L4RC's TEMP_ROAD01_ venue strip sit outside that normal spread?
+       Census only -- GL-free, exits when done, changes nothing. */
+    if (gconf) {
+        static char regs[WORLD_MAXREG][64]; int dummy = 0;
+        int nr = res_list_tracks(troot, regs, WORLD_MAXREG, "", &dummy);
+        static BCBundle bc[WORLD_MAXREG]; int nb = 0;
+        static uint32_t nokeys[1];
+        for (int r = 0; r < nr; r++) {
+            char rp[1024]; snprintf(rp, sizeof rp, "%s/%s.BUN", troot, regs[r]);
+            long rl = 0; unsigned char *rd = n2_read_file(rp, &rl);
+            if (!rd) { fprintf(stderr, "ground-conflict: cannot read %s\n", rp); continue; }
+            snprintf(bc[nb].name, sizeof bc[nb].name, "%s", regs[r]);
+            n2_load_scene(rd, rl, &bc[nb].sc, nokeys, 0);
+            bc_bounds(&bc[nb]);
+            free(rd);
+            nb++;
+        }
+        printf("MILESTONE: 85\n");
+        printf("(raw per-bundle parse: no dedup, no textures. One deterministic\n"
+               " centroid per source mesh = first XY-nondegenerate triangle in index\n"
+               " order. Coverage in the queried bundle is exact barycentric over its\n"
+               " ROAD+TERRAIN triangles; mesh XY bounds are broad-phase only.\n"
+               " |dZ| in metres, percentiles by nearest rank. %d bundles.)\n\n", nb);
+        gc_cohort(bc, nb, "NORMAL-ROAD DISTRIBUTION", 0);
+        gc_cohort(bc, nb, "TEMP-ROAD DISTRIBUTION", 1);
+        return 0;
+    }
+
+    /* --pair-overlap (Milestone 86): the same measurement reorganised per
+       ordered bundle pair, because M85 showed |dZ| alone cannot discriminate.
+       Census only -- GL-free, exits when done, changes nothing. */
+    if (poverlap) {
+        static char regs[WORLD_MAXREG][64]; int dummy = 0;
+        int nr = res_list_tracks(troot, regs, WORLD_MAXREG, "", &dummy);
+        static BCBundle bc[WORLD_MAXREG]; int nb = 0;
+        static uint32_t nokeys[1];
+        for (int r = 0; r < nr; r++) {
+            char rp[1024]; snprintf(rp, sizeof rp, "%s/%s.BUN", troot, regs[r]);
+            long rl = 0; unsigned char *rd = n2_read_file(rp, &rl);
+            if (!rd) { fprintf(stderr, "pair-overlap: cannot read %s\n", rp); continue; }
+            snprintf(bc[nb].name, sizeof bc[nb].name, "%s", regs[r]);
+            n2_load_scene(rd, rl, &bc[nb].sc, nokeys, 0);
+            bc_bounds(&bc[nb]);
+            free(rd);
+            nb++;
+        }
+        printf("MILESTONE: 86\n");
+        printf("(raw per-bundle parse: no dedup, no textures. Deterministic centroid per\n"
+               " source mesh = first XY-nondegenerate triangle in index order. Coverage in\n"
+               " the queried bundle is exact barycentric over its ROAD+TERRAIN triangles;\n"
+               " mesh XY bounds are broad-phase only. %d bundles.)\n\n", nb);
+
+        static GCPairStat pn[WORLD_MAXREG][WORLD_MAXREG];
+        static GCPairStat pt[WORLD_MAXREG][WORLD_MAXREG];
+        int nsmn = 0, nsmt = 0;
+        GCSample *smn = gc_matrix(bc, nb, "NORMAL-ROAD PAIR MATRIX", 0, pn, &nsmn);
+        GCSample *smt = gc_matrix(bc, nb, "TEMP-ROAD PAIR MATRIX", 1, pt, &nsmt);
+
+        printf("SYMMETRIC PAIR EVIDENCE (normal-road cohort):\n");
+        printf("  Interpretation labels are assigned in the written report, not here --\n"
+               "  no classification constant exists in this code. These are the numbers\n"
+               "  the label is read off: coverage each way, median |dZ| each way, and the\n"
+               "  share of covered samples inside 1 m each way.\n");
+        printf("  %-25s %9s %9s %9s %9s %9s %9s\n", "pair",
+               "A->B cov%", "B->A cov%", "A->B p50", "B->A p50",
+               "A->B <=1m%", "B->A <=1m%");
+        for (int a = 0; a < nb; a++)
+            for (int b = a + 1; b < nb; b++) {
+                const GCPairStat *P = &pn[a][b], *Q = &pn[b][a];
+                if (!P->samples && !Q->samples) continue;
+                char nm[32]; snprintf(nm, sizeof nm, "%s/%s",
+                                      bc[a].name + 6, bc[b].name + 6);
+                printf("  %-25s %8.1f%% %8.1f%% %9.3f %9.3f %9.1f%% %9.1f%%\n", nm,
+                       P->samples ? 100.0*(double)P->covered/(double)P->samples : 0.0,
+                       Q->samples ? 100.0*(double)Q->covered/(double)Q->samples : 0.0,
+                       P->covered ? (double)P->p50 : 0.0,
+                       Q->covered ? (double)Q->p50 : 0.0,
+                       P->covered ? 100.0*(double)P->b1/(double)P->covered : 0.0,
+                       Q->covered ? 100.0*(double)Q->b1/(double)Q->covered : 0.0);
+            }
+
+        /* Example blocks. The two rankings are monotone scores over the measured
+           pairs -- they order the pairs, they do not admit or reject any. */
+        int ib = -1, iq = -1, ob = -1, oq = -1, tb = -1, tq = -1;
+        double bestn = -1, bestd = -1, bestt = -1;
+        for (int b = 0; b < nb; b++)
+            for (int q = 0; q < nb; q++) {
+                const GCPairStat *P = &pn[b][q];
+                if (b == q || !P->samples || !P->covered) continue;
+                double cov = (double)P->covered / (double)P->samples;
+                double sn = cov / (1.0 + (double)P->p50);   /* near-identical */
+                double sd = cov * (double)P->p50;           /* overlapping, disagreeing */
+                if (sn > bestn) { bestn = sn; ib = b; iq = q; }
+                if (sd > bestd) { bestd = sd; ob = b; oq = q; }
+                const GCPairStat *T = &pt[b][q];
+                if (T->samples && T->covered) {
+                    double tc = (double)T->covered / (double)T->samples;
+                    if (tc > bestt) { bestt = tc; tb = b; tq = q; }
+                }
+            }
+        printf("\nEXAMPLES (five deterministic quantiles of the pair's |dZ|):\n");
+        if (ib >= 0) {
+            printf("  1. strongest near-identical pair  %s -> %s  "
+                   "(rank score coverage/(1+p50) = %.4f)\n",
+                   bc[ib].name, bc[iq].name, bestn);
+            gc_examples(bc, smn, nsmn, ib, iq);
+        }
+        if (ob >= 0) {
+            printf("  2. strongest overlapping-but-disagreeing pair  %s -> %s  "
+                   "(rank score coverage*p50 = %.3f)\n",
+                   bc[ob].name, bc[oq].name, bestd);
+            gc_examples(bc, smn, nsmn, ob, oq);
+        }
+        if (tb >= 0) {
+            printf("  3. L4RC TEMP_ROAD01_ pair with greatest coverage  %s -> %s  "
+                   "(coverage %.1f%%)\n", bc[tb].name, bc[tq].name, 100.0*bestt);
+            gc_examples(bc, smt, nsmt, tb, tq);
+        }
+        free(smn); free(smt);
+        return 0;
+    }
+
+    /* --event-refs (Milestone 87): trace the shipped event records to whatever
+       they can identify, using the production parser only. GL-free, exits. */
+    if (erefs) {
+        static char regs[WORLD_MAXREG][64]; int dummy = 0;
+        int nr = res_list_tracks(troot, regs, WORLD_MAXREG, "", &dummy);
+        static World ew;
+        static ERRegion er[WORLD_MAXREG];
+        ew.nreg = nr;
+        for (int r = 0; r < nr; r++)
+            snprintf(ew.rgn[r].name, sizeof ew.rgn[r].name, "%s", regs[r]);
+
+        printf("MILESTONE: 87\n\n");
+        printf("PARSER PATH:\n");
+        printf("  res_list_tracks(TRACKS/) -> region names STREAM<stem>\n");
+        printf("  world_load_events(w, TRACKS/)   [src/world.c:422, unmodified]\n");
+        printf("    for each loaded region: stem = name+6\n");
+        printf("    open the FIRST existing TRACKS/ROUTES<stem>/Paths<4000+i>.bin\n");
+        printf("    n2_find_leaves(..., 0x0003414c, ..., cap 4)\n");
+        printf("    each leaf = size/272 records; per record the parser consumes:\n");
+        printf("      +0 u16 id  +2 u8 npoly  +3 u8 circuit  +5 u8 len100m\n");
+        printf("      +8 .. +272  33 * (f32 x, f32 y) outline polygon\n");
+        printf("    reject unless id >= 4000 and 3 <= npoly <= 33\n");
+        printf("    e->reg is written from the DIRECTORY STEM, not from any record field\n");
+        printf("  consumed downstream: world_set_mode/world_race_start use e->poly,\n");
+        printf("    e->bb, e->circuit, e->node0/node1; e->reg is display-only; e->id\n");
+        printf("    is matched by ev_by_id() and by --event <id>.\n");
+        printf("  bytes in the 272-byte record NOT consumed anywhere: +4 (u8), +6..7 (u16).\n\n");
+
+        /* discovery, mirroring the loader, plus the next file for a cross-check */
+        for (int r = 0; r < nr; r++) {
+            const char *rn = regs[r];
+            const char *stem = strncmp(rn, "STREAM", 6) ? rn : rn + 6;
+            snprintf(er[r].stem, sizeof er[r].stem, "%s", stem);
+            er_find_paths(troot, stem, 0, er[r].cat,  sizeof er[r].cat);
+            er_find_paths(troot, stem, 1, er[r].cat2, sizeof er[r].cat2);
+            er[r].nrec = er[r].nrec2 = 0; er[r].idmatch = -1; er[r].off = -1;
+            if (er[r].cat[0]) {
+                long l = 0; unsigned char *d = n2_read_file(er[r].cat, &l);
+                if (d) {
+                    N2Leaf lf[4]; int nl = 0;
+                    n2_find_leaves(d, 0, l, 0x0003414cu, lf, &nl, 4);
+                    for (int L = 0; L < nl; L++) er[r].nrec += (int)lf[L].size / 272;
+                    er[r].d = d; er[r].len = l; er[r].off = nl ? lf[0].off : -1;
+                }
+            }
+            if (er[r].cat2[0]) {
+                long l2 = 0; unsigned char *d2 = n2_read_file(er[r].cat2, &l2);
+                if (d2) {
+                    N2Leaf lf[4]; int nl = 0;
+                    n2_find_leaves(d2, 0, l2, 0x0003414cu, lf, &nl, 4);
+                    for (int L = 0; L < nl; L++) er[r].nrec2 += (int)lf[L].size / 272;
+                    if (er[r].d && er[r].nrec == er[r].nrec2 && er[r].off >= 0 && nl) {
+                        er[r].idmatch = 1;
+                        for (int k = 0; k < er[r].nrec; k++) {
+                            const unsigned char *a = er[r].d + er[r].off + k*272;
+                            const unsigned char *b = d2 + lf[0].off + k*272;
+                            if ((a[0]|(a[1]<<8)) != (b[0]|(b[1]<<8))) { er[r].idmatch = 0; break; }
+                        }
+                    } else er[r].idmatch = 0;
+                    free(d2);
+                }
+            }
+        }
+
+        printf("CATALOG DISCOVERY (per region, exactly what the loader opens):\n");
+        printf("  %-6s %-34s %6s  %-34s %6s  %s\n", "stem", "catalog file the loader opens",
+               "recs", "next Paths file in that dir", "recs", "same id list?");
+        for (int r = 0; r < nr; r++)
+            printf("  %-6s %-34s %6d  %-34s %6d  %s\n", er[r].stem,
+                   er[r].cat[0]  ? er[r].cat  + (int)strlen(troot) + 1 : "(none)", er[r].nrec,
+                   er[r].cat2[0] ? er[r].cat2 + (int)strlen(troot) + 1 : "(none)", er[r].nrec2,
+                   er[r].idmatch < 0 ? "-" : er[r].idmatch ? "yes" : "NO");
+        printf("\n");
+
+        int nev = world_load_events(&ew, troot);
+
+        printf("\nEVENT REFERENCE TABLE:\n");
+        printf("  'resolved bundle' is TRACKS/STREAM<stem>.BUN where <stem> is the\n"
+               "  ROUTES<stem>/ directory the catalog was read from -- an exact 1:1\n"
+               "  filename mapping, verified below. 'id->Paths' checks that the record's\n"
+               "  own id names a file that exists in that same directory.\n");
+        printf("  %4s %6s %-8s %-26s %5s %5s %6s %6s %8s %-20s %s\n",
+               "idx", "id(+0)", "type(+3)", "source Paths file", "np+2", "ln+5",
+               "raw+4", "raw+6", "id->Paths", "resolved bundle", "other id fields");
+        int per_stem[WORLD_MAXREG]; memset(per_stem, 0, sizeof per_stem);
+        int b4hist[256]; memset(b4hist, 0, sizeof b4hist);
+        int b6nonzero = 0, idpaths_ok = 0, idpaths_bad = 0;
+        int xtab[2][2]; memset(xtab, 0, sizeof xtab);   /* +4 flag vs +3 circuit */
+        int idlo[WORLD_MAXREG], idhi[WORLD_MAXREG];
+        for (int k = 0; k < WORLD_MAXREG; k++) { idlo[k] = 1 << 30; idhi[k] = -1; }
+        for (int i = 0; i < nev; i++) {
+            const WEvent *e = &ew.ev[i];
+            int r = -1;
+            for (int k = 0; k < nr; k++) if (!strcmp(er[k].stem, e->reg)) { r = k; break; }
+            unsigned b4 = 0, b6 = 0;
+            if (r >= 0 && er[r].d && er[r].off >= 0) {
+                const unsigned char *b = er[r].d + er[r].off + per_stem[r]*272;
+                b4 = b[4]; b6 = (unsigned)(b[6] | (b[7] << 8));
+            }
+            b4hist[b4 & 255]++; if (b6) b6nonzero++;
+            if (b4 < 2 && e->circuit < 2) xtab[b4][e->circuit]++;
+            if (r >= 0) { if (e->id < idlo[r]) idlo[r] = e->id;
+                          if (e->id > idhi[r]) idhi[r] = e->id; }
+            char pth[1024], bun[128];
+            snprintf(pth, sizeof pth, "%s/ROUTES%s/Paths%04d.bin", troot, e->reg, e->id);
+            FILE *f = fopen(pth, "rb"); int ok = f != NULL; if (f) fclose(f);
+            ok ? idpaths_ok++ : idpaths_bad++;
+            snprintf(bun, sizeof bun, "STREAM%s.BUN", e->reg);
+            printf("  %4d %6d %-8s %-26s %5d %5d %6u %6u %8s %-20s %s\n",
+                   i, e->id, e->circuit ? "circuit" : "sprint",
+                   r >= 0 && er[r].cat[0] ? er[r].cat + (int)strlen(troot) + 1 : "?",
+                   e->npoly, e->len100m, b4, b6, ok ? "exists" : "MISSING", bun,
+                   "dir stem only");
+            if (r >= 0) per_stem[r]++;
+        }
+
+        printf("\nRESOLVED BUNDLE-SET GROUPS:\n");
+        int one = 0, many = 0, none = 0;
+        for (int r = 0; r < nr; r++) {
+            if (!per_stem[r]) continue;
+            char pth[1024]; snprintf(pth, sizeof pth, "%s/STREAM%s.BUN", troot, er[r].stem);
+            FILE *f = fopen(pth, "rb"); int ex = f != NULL; if (f) fclose(f);
+            printf("  {STREAM%s.BUN}  %d event(s)   bundle file %s\n",
+                   er[r].stem, per_stem[r], ex ? "exists" : "MISSING");
+            one += per_stem[r];
+        }
+        for (int r = 0; r < nr; r++)
+            if (!per_stem[r])
+                printf("  (no events)    STREAM%s.BUN   catalog file: %s\n",
+                       er[r].stem, er[r].cat[0] ? er[r].cat : "none shipped");
+        printf("  events resolving to exactly one bundle : %d\n", one);
+        printf("  events resolving to multiple bundles   : %d\n", many);
+        printf("  events with no resolvable bundle ref   : %d\n", none);
+        printf("  id -> ROUTES<stem>/Paths<id>.bin exists: %d, missing: %d\n",
+               idpaths_ok, idpaths_bad);
+
+        printf("\nUNRESOLVED CANDIDATE FIELDS (raw values):\n");
+        printf("  +4 u8   distinct values seen:");
+        for (int k = 0; k < 256; k++) if (b4hist[k]) printf(" %d(x%d)", k, b4hist[k]);
+        printf("\n          why unresolved: no shipped table, hash or filename in the data\n"
+               "          root takes this as a key; nothing in the engine reads it.\n");
+        printf("          cross-tab against the parsed circuit flag (+3):\n");
+        printf("            +4=0 & sprint %3d | +4=0 & circuit %3d\n", xtab[0][0], xtab[0][1]);
+        printf("            +4=1 & sprint %3d | +4=1 & circuit %3d\n", xtab[1][0], xtab[1][1]);
+        printf("          it is binary and correlated with, but not equal to, +3 --\n"
+               "          either way it indexes nothing that names a bundle.\n");
+        printf("  +6 u16  non-zero in %d of %d records\n", b6nonzero, nev);
+        printf("          why unresolved: same -- no lookup exists to resolve it.\n");
+        printf("  outline polygon (+8..+272): world XY only. Resolving it to bundles\n"
+               "          would be geometry inference, which this milestone forbids.\n");
+        printf("\n  id ranges actually observed per region directory:\n");
+        for (int r = 0; r < nr; r++)
+            if (per_stem[r]) printf("    %-6s %d..%d (%d events)\n",
+                                    er[r].stem, idlo[r], idhi[r], per_stem[r]);
+        for (int r = 0; r < nr; r++) if (er[r].d) free((void *)er[r].d);
+        return 0;
+    }
+
     /* --vista-census: measure large-span candidates in every shipped bundle and
        print the evidence the impostor classifier rests on, then exit. GL-free
        (Milestone 76). */
@@ -885,7 +1666,9 @@ int main(int argc, char **argv) {
     /* building collision footprints — the car is kept out of these */
     #define MAXOBST 32768   /* whole city worth of building footprints */
     static float obst[MAXOBST][4];
-    int nobst = phys_collect_walls(&scene, obst, MAXOBST);
+    static int obstsrc[MAXOBST];   /* source mesh per rect, same collection pass */
+    static float obstz[MAXOBST][2];/* its Z span, measured in that same pass */
+    int nobst = phys_collect_walls(&scene, obst, obstsrc, obstz, MAXOBST);
     printf("collision obstacles: %d buildings\n", nobst);
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
@@ -943,9 +1726,466 @@ int main(int argc, char **argv) {
        that decode to noise (wrong format / swizzled surface), map key->GL tex.
        Generalises the old hard-coded TRN_GRASSC/RDP_PARKING lookup across
        regions (L4RR uses ORG_GRASS_001 etc.). */
+    if (smaudit) {
+        printf("\nMILESTONE: 98  target texture %08x\n", smkey);
+        /* re-decode the same key through the same lookup to report its source form */
+        N2Tex tt = {0}; int ok = 0; const char *via = "-";
+        for (int r = 0; r < world.nreg && !ok; r++) {
+            WRegion *g = &world.rgn[r];
+            if (!g->data) continue;
+            ok = n2_tpk_decode(g->data, g->len, g->tpk, smkey, &tt);
+            if (ok) via = "region STREAM TPK (n2_tpk_decode)";
+        }
+        if (!ok && world.loc4) { ok = n2_load_car_tex_by_key(world.loc4, world.loc4len, smkey, &tt);
+                                 if (ok) via = "LOC4DYNTEX (n2_load_car_tex_by_key)"; }
+        if (!ok && world.master) { ok = n2_tpk_decode(world.master, world.masterlen,
+                                                      world.mastertpk, smkey, &tt);
+                                   if (ok) via = "master TPK (n2_tpk_decode)"; }
+        if (!ok) printf("  DECODE FAILED (region buffers already freed after bind)\n");
+        else {
+            printf("  resolved via          %s\n", via);
+            printf("  dimensions            %d x %d\n", tt.w, tt.h);
+            printf("  decoded surface       %s%s\n", tt.rgb ? "RGB" : "none",
+                   tt.alpha ? " + alpha plane" : "");
+            printf("  raw S3TC blob         %s  dxtfmt %d  dxtlen %d\n",
+                   tt.dxt ? "present" : "ABSENT", tt.dxtfmt, tt.dxtlen);
+            if (tt.dxt && tt.dxtfmt) {   /* same walk upload_tpk_texture_to_gpu uses */
+                int bpb = (tt.dxtfmt == 1) ? 8 : 16;
+                int lw = tt.w, lh = tt.h, off = 0, level = 0, complete = 0;
+                for (;;) { int bw = lw<4?1:lw/4, bh = lh<4?1:lh/4, sz = bw*bh*bpb;
+                           if (off + sz > tt.dxtlen) break;
+                           off += sz; level++;
+                           if (lw==1 && lh==1) { complete = 1; break; }
+                           if (lw>1) lw/=2; if (lh>1) lh/=2; }
+                printf("  encoded mip levels    %d  chain complete to 1x1: %s\n",
+                       level, complete ? "YES" : "NO");
+            } else
+                printf("  encoded mip levels    0  (world path decodes to RGB and calls "
+                       "glGenerateMipmap; the TPK chain is never retained)\n");
+            free(tt.rgb); free(tt.alpha); free(tt.dxt);
+        }
+        printf("\n");
+    }
+    if (fbcensus) {
+        /* Re-run the production walk in THIS translation unit so the census
+           statics in nfsu2.h (which each TU owns its own copy of) are the ones
+           that get filled. Same function, same buffer, same key set world.c
+           assembles: region TPK + LOC4 + master. Throwaway scene; the world the
+           engine renders is the one world.c already built and is untouched. */
+        static uint32_t ck[16384]; int nck = 0;
+        for (int r = 0; r < world.nreg; r++) {
+            WRegion *g = &world.rgn[r];
+            if (!g->data) continue;
+            nck = n2_tpk_keys(g->data, g->tpk, ck, 16384);
+            if (world.loc4 && nck < 16384)
+                nck += n2_car_tex_keys(world.loc4, world.loc4len, ck + nck, 16384 - nck);
+            if (world.master && nck < 16384)
+                nck += n2_tpk_keys(world.master, world.mastertpk, ck + nck, 16384 - nck);
+            N2Scene tmp = {0};
+            n2_walk_meshes(g->data, 0, g->len, &tmp, ck, nck);
+            for (int i = 0; i < tmp.count; i++) {
+                free(tmp.meshes[i].verts); free(tmp.meshes[i].idx); free(tmp.meshes[i].vcol);
+            }
+            free(tmp.meshes);
+            break;   /* single-region audit */
+        }
+        if (b02probe) {
+            const unsigned char *rd = NULL;
+            for (int r = 0; r < world.nreg; r++) if (world.rgn[r].data) { rd = world.rgn[r].data; break; }
+            printf("\nMILESTONE: 104  0x134B02 stride/field probe  track=%s\n", trackname);
+            printf("Method: for each B02 body, try every 4-aligned stride that divides it\n"
+                   "exactly; at each stride try every 4-aligned (start,count) u32 field pair\n"
+                   "and require a COMPLETE contiguous partition of the paired B03 usable\n"
+                   "index span, every count a positive multiple of 3. Nothing is inferred\n"
+                   "from names or textures.\n\n");
+            for (int a = 0; a < n2_m102_ns[N2_FB_MALFORMED]; a++) {
+                N2FbRec *r = &n2_m102_s[N2_FB_MALFORMED][a];
+                if (r->b02off < 0) { printf("%-30s no B02 leaf\n", r->name); continue; }
+                const unsigned char *p = rd + r->b02off;
+                int detail = !strcmp(r->name, b02probe) || !strcmp(b02probe, "*");
+                int pad = n2_skip_filler(p, (int)r->b02size);
+                long body = (long)r->b02size - pad;
+                const unsigned char *q = p + pad;
+                /* n2_skip_filler eats EVERY leading 0x11 byte, including one that
+                   is merely the low byte of the first bbox float. Test the leaf
+                   at the skipped offset AND at offset 0. */
+                /* pair-filler: the index-leaf convention is whole 0x1111 u16
+                   words, so a lone trailing 0x11 byte is data, not filler. */
+                int ppad = 0;
+                while (ppad + 2 <= (int)r->b02size && p[ppad] == 0x11 && p[ppad+1] == 0x11) ppad += 2;
+                long bases[3] = { pad, 0, ppad };
+                for (int bi = 0; bi < 3; bi++) {
+                    long base = bases[bi];
+                    if (bi == 1 && base == pad) continue;
+                    if (bi == 2 && (base == pad || base == 0)) continue;
+                    long b2 = (long)r->b02size - base;
+                    if (detail)
+                        printf("   base +%-3ld (%s) body %4ld  body%%60 = %ld  -> %ld records\n",
+                               base, bi == 0 ? "byte-filler skip" : bi == 1 ? "no skip"
+                                                                            : "pair-filler skip",
+                               b2, b2 % 60, b2 / 60);
+                    if (b2 % 60) continue;
+                    const unsigned char *qq = p + base;
+                    long n = b2 / 60, chain = 0; int ok = 1;
+                    for (long i = 0; i < n && ok; i++) {
+                        uint32_t cv = n2_u32(qq + i*60 + 12);
+                        uint32_t sv = n2_u32(qq + i*60 + 52);
+                        uint32_t mv = n2_u32(qq + i*60 + 28);
+                        if ((long)sv != chain || cv == 0 || cv % 3 ||
+                            mv >= (uint32_t)r->nslot) ok = 0;
+                        else chain += (long)cv;
+                    }
+                    if (detail || ok)
+                        printf("   %-30s base +%-3ld 60B: %-7s chain %ld / avail %ld "
+                               "(whole tris %ld, pad %ld) %s\n",
+                               r->name, base, ok ? "VALID" : "invalid", chain, r->avail,
+                               r->avail - r->avail%3, r->avail%3,
+                               (ok && chain == r->avail - r->avail%3)
+                                 ? " COVERS EVERY WHOLE TRIANGLE" : "");
+                    if (ok && detail)
+                        for (long i = 0; i < n; i++)
+                            printf("       rec %ld  start %u count %u mat_id %u\n", i,
+                                   n2_u32(qq + i*60 + 52), n2_u32(qq + i*60 + 12),
+                                   n2_u32(qq + i*60 + 28));
+                }
+                if (detail)
+                    printf("== %s  cat %s  slots %d  B02 size %u filler %d body %ld  "
+                           "B03 usable %ld indices (%ld tris, remainder %ld)\n",
+                           r->name, bc_cat(r->cat), r->nslot, r->b02size, pad, body,
+                           r->avail, r->avail/3, r->avail%3);
+                int nhit = 0; long hs = 0, hos = 0, hoc = 0, hn = 0;
+                for (long st = 12; st <= 256 && st <= body; st += 4) {
+                    if (body % st) continue;
+                    long n = body / st;
+                    if (n < 1 || n > 256) continue;
+                    for (long os = 0; os + 4 <= st; os += 4)
+                    for (long oc = 0; oc + 4 <= st; oc += 4) {
+                        if (os == oc) continue;
+                        long chain = 0; int ok = 1;
+                        for (long i = 0; i < n && ok; i++) {
+                            uint32_t sv = n2_u32(q + i*st + os);
+                            uint32_t cv = n2_u32(q + i*st + oc);
+                            if ((long)sv != chain) ok = 0;
+                            else if (cv == 0 || cv % 3 || cv > 65535u) ok = 0;
+                            else chain += (long)cv;
+                        }
+                        if (ok && chain == r->avail) {
+                            nhit++;
+                            if (nhit == 1) { hs = st; hos = os; hoc = oc; hn = n; }
+                            if (detail && nhit <= 6)
+                                printf("   HIT stride %3ld  n %3ld  start@+%-3ld count@+%-3ld  "
+                                       "partition 0..%ld exact\n", st, n, os, oc, chain);
+                        }
+                    }
+                }
+                if (!detail) {
+                    printf("%-30s body %5ld  avail %5ld  hits %2d", r->name, body, r->avail, nhit);
+                    if (nhit) printf("  first: stride %ld n %ld start@+%ld count@+%ld", hs, hn, hos, hoc);
+                    printf("\n");
+                } else {
+                    printf("   total field-layout hits: %d\n", nhit);
+                    if (nhit) {
+                        /* material-field candidates under the winning stride */
+                        printf("   mat_id candidates at stride %ld (all values < %d):",
+                               hs, r->nslot);
+                        for (long om = 0; om + 4 <= hs; om += 4) {
+                            if (om == hos || om == hoc) continue;
+                            int ok = 1;
+                            for (long i = 0; i < hn && ok; i++)
+                                if (n2_u32(q + i*hs + om) >= (uint32_t)r->nslot) ok = 0;
+                            if (ok) printf(" +%ld", om);
+                        }
+                        printf("\n");
+                    }
+                    printf("\n");
+                }
+            }
+            /* one working 60-byte sibling of the same family, for comparison */
+            printf("\nworking 60-byte sibling for comparison:\n");
+        }
+        static const char *fbn[N2_FB_NCAT] = {
+            "1 validated per-submesh", "2 fallback: no 0x134B02",
+            "3 fallback: multi-leaf",  "4 fallback: malformed/non-contiguous",
+            "5 fallback: bad mat_id / empty or unresolved slot" };
+        printf("\nMILESTONE: 102  ROAD/TERRAIN emission census  track=%s\n", trackname);
+        long to = 0, tt = 0, ti = 0;
+        for (int c = 0; c < N2_FB_NCAT; c++)
+            { to += n2_m102_obj[c]; tt += n2_m102_tri[c]; ti += n2_m102_idx[c]; }
+        printf("%-50s %8s %8s %10s %8s %8s\n", "category", "objects", "obj%",
+               "indices", "tris", "tri%");
+        for (int c = 0; c < N2_FB_NCAT; c++)
+            printf("%-50s %8ld %7.2f%% %10ld %8ld %7.2f%%\n", fbn[c],
+                   n2_m102_obj[c], to ? 100.0*n2_m102_obj[c]/to : 0.0,
+                   n2_m102_idx[c], n2_m102_tri[c], tt ? 100.0*n2_m102_tri[c]/tt : 0.0);
+        printf("%-50s %8ld %7.2f%% %10ld %8ld %7.2f%%\n", "TOTAL", to, 100.0, ti, tt, 100.0);
+        printf("\ncategory 5 split: mat_id out of range %ld, empty slot %ld, "
+               "slot key unresolved in this region's TPK set %ld\n",
+               n2_m102_bad[0], n2_m102_bad[1], n2_m102_bad[2]);
+        printf("emitted submesh ranges: %ld with their own resolved slot key, "
+               "%ld falling back to the object's `last` key (%.3f%% of ranges)\n",
+               n2_m102_rng_res, n2_m102_rng_unres,
+               (n2_m102_rng_res + n2_m102_rng_unres)
+                 ? 100.0*n2_m102_rng_unres/(n2_m102_rng_res + n2_m102_rng_unres) : 0.0);
+        printf("\nmulti-slot fallback objects where `last` != slot 0 "
+               "(the only immediate wrong-material candidates):\n");
+        for (int c = 1; c < N2_FB_NCAT; c++)
+            if (n2_m102_obj[c])
+                printf("  %-48s %4ld of %4ld objects, %6ld tris (%.3f%% of all ROAD/TERRAIN tris)\n",
+                       fbn[c], n2_m102_risk[c], n2_m102_obj[c], n2_m102_risktri[c],
+                       tt ? 100.0*n2_m102_risktri[c]/tt : 0.0);
+        for (int c = 1; c < N2_FB_NCAT; c++) {
+            if (!n2_m102_ns[c]) continue;
+            printf("\n%s -- first %d objects in load order:\n", fbn[c], n2_m102_ns[c]);
+            printf("  %-30s %-8s %5s %5s %6s %9s %9s %-34s %s\n", "asset name", "cat",
+                   "slots", "recs", "leaves", "fallback", "slot 0", "world XY / Z bounds", "tris");
+            for (int a = 0; a < n2_m102_ns[c]; a++) {
+                N2FbRec *r = &n2_m102_s[c][a];
+                char bb[64];
+                snprintf(bb, sizeof bb, "[%.0f %.0f][%.0f %.0f][%.1f %.1f]",
+                         r->bb[0],r->bb[1], r->bb[2],r->bb[3], r->bb[4],r->bb[5]);
+                printf("  %-30s %-8s %5d %5d %6d %9.8x %9.8x %-34s %6d%s\n",
+                       r->name, bc_cat(r->cat), r->nslot, r->nsub, r->nleaf,
+                       r->key, r->slot0, bb, r->ntri,
+                       (r->nslot > 1 && r->key != r->slot0) ? "  <-- multi-slot, last != slot0"
+                                                            : "");
+            }
+        }
+        printf("\n");
+    }
+    /* --mesh-material (Milestone 100): re-walk ONE object's original records and
+       dump its material linkage verbatim. Read-only; no parser, sampler, UV or
+       asset change, and nothing is inferred from a texture name. */
+    if (matdump) {
+        const unsigned char *rd = NULL; long rl = 0; N2Tpk rtpk; const char *rn = "";
+        for (int q = 0; q < world.nreg; q++) if (world.rgn[q].data) {
+            rd = world.rgn[q].data; rl = world.rgn[q].len; rtpk = world.rgn[q].tpk;
+            rn = world.rgn[q].name; break; }
+        if (rd) {
+            printf("MILESTONE: 100  object material dump  %s in %s\n\n", matmesh, rn);
+            long ds = 0; uint32_t sz = 0;
+            if (!m100_find(rd, 0, rl, matmesh, &ds, &sz))
+                printf("object \"%s\" not found in %s (%d objects scanned)\n",
+                       matmesh, rn, m100_nobj);
+            else {
+                            int cat = n2_mesh_category(rd, ds, ds + sz);
+
+                            printf("object chunk 0x80134010 payload@%ld size %u  name \"%s\"  cat %s\n",
+                                   ds, sz, matmesh, bc_cat(cat));
+                            /* --- 0x134012 slot list, stored order --- */
+                            N2Leaf t12[4]; int n12 = 0;
+                            n2_find_leaves(rd, ds, ds + sz, 0x00134012u, t12, &n12, 4);
+                            printf("\n0x134012 leaves: %d\n", n12);
+                            uint32_t cand[64]; int ncand = 0;
+                            for (int a = 0; a < n12; a++) {
+                                printf("  leaf %d @%ld size %u  (stride-8 entries: %ld)\n",
+                                       a, t12[a].off, t12[a].size, (long)t12[a].size/8);
+                                for (long b = 0; b + 8 <= (long)t12[a].size; b += 8) {
+                                    uint32_t k = n2_u32(rd + t12[a].off + b);
+                                    uint32_t pad2 = n2_u32(rd + t12[a].off + b + 4);
+                                    N2Tex tt = {0};
+                                    int ok = k && n2_tpk_decode(rd, rl, rtpk, k, &tt);
+                                    char nm[25] = "(unresolved)";
+                                    if (ok) {   /* recover the 24-byte record name */
+                                        for (int bl = 0; bl < rtpk.nblk && nm[0]=='('; bl++) {
+                                            long hb = rtpk.blk[bl].hbeg, he = hb + rtpk.blk[bl].hsize;
+                                            for (long z = hb; z + 0x40 < he; z++) {
+                                                if (!(rd[z] >= 'A' && rd[z] <= 'Z')) continue;
+                                                if (n2_u32(rd + z + 0x18) != k) continue;
+                                                memcpy(nm, rd + z, 24); nm[24] = 0; break; }
+                                        }
+                                    }
+                                    printf("    slot %-2ld payload@+%-6ld key %08x pad %08x  "
+                                           "%-24s %s",
+                                           b/8, b, k, pad2, ok ? nm : "-",
+                                           ok ? "" : "UNRESOLVED");
+                                    if (ok) printf("%d x %d", tt.w, tt.h);
+                                    printf("\n");
+                                    if (k && ncand < 64) cand[ncand++] = k;
+                                    if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
+                                }
+                            }
+                            /* --- what the production rule selects --- */
+                            static uint32_t rkeys[16384];
+                            int nrk = n2_tpk_keys(rd, rtpk, rkeys, 16384);
+                            uint32_t sel = n2_mesh_texkey_cat(rd, ds, ds + sz, cat,
+                                                              rkeys, nrk);
+                            printf("\nn2_mesh_texkey_cat selects: %08x\n", sel);
+                            printf("  rule: cat is %s -> returns `last`, the LAST non-zero u32\n"
+                                   "        scanned at stride 4 over every 0x134012 leaf\n"
+                                   "        (resolvability is NOT consulted for ROAD/TERRAIN)\n",
+                                   bc_cat(cat));
+                            /* --- geometry leaves --- */
+                            N2Leaf vb[8], ib[8], sm[8]; int nvb=0, nib=0, nsm=0;
+                            n2_find_leaves(rd, ds, ds + sz, 0x00134B01u, vb, &nvb, 8);
+                            n2_find_leaves(rd, ds, ds + sz, 0x00134B03u, ib, &nib, 8);
+                            n2_find_leaves(rd, ds, ds + sz, 0x00134B02u, sm, &nsm, 8);
+                            printf("\n0x134B01 vertex leaves: %d, 0x134B03 index leaves: %d, "
+                                   "0x134B02 submesh leaves: %d\n", nvb, nib, nsm);
+                            for (int a = 0; a < nvb; a++) {
+                                int pad3 = n2_skip_filler(rd + vb[a].off, (int)vb[a].size);
+                                printf("  0x134B01[%d] @%ld size %u  filler %d  -> %d verts @24B\n",
+                                       a, vb[a].off, vb[a].size, pad3,
+                                       (int)((vb[a].size - pad3)/24));
+                            }
+                            for (int a = 0; a < nib; a++) {
+                                int pad3 = n2_skip_filler(rd + ib[a].off, (int)ib[a].size);
+                                printf("  0x134B03[%d] @%ld size %u  filler %d  -> %d u16 indices\n",
+                                       a, ib[a].off, ib[a].size, pad3,
+                                       (int)((ib[a].size - pad3)/2));
+                            }
+                            for (int a = 0; a < nsm; a++) {
+                                int pad3 = n2_skip_filler(rd + sm[a].off, (int)sm[a].size);
+                                long body = (long)sm[a].size - pad3;
+                                printf("  0x134B02[%d] @%ld size %u  filler %d  body %ld  "
+                                       "body%%60 = %ld\n", a, sm[a].off, sm[a].size, pad3,
+                                       body, body % 60);
+                            }
+                            N2Sub sub[64];
+                            int nsub = n2_mesh_submeshes(rd, ds, ds + sz, sub, 64);
+                            printf("n2_mesh_submeshes decoded: %d record(s)%s\n", nsub,
+                                   nsub ? "" : "  (returns 0: needs exactly 1 leaf and body%%60==0)");
+                            for (int a = 0; a < nsub; a++)
+                                printf("  sub %d  start %u count %u mat_id %u\n",
+                                       a, sub[a].start, sub[a].count, sub[a].mat);
+                            /* --- nearest-filter preview per candidate key --- */
+                            printf("\ncandidate previews (1x nearest, no rescale):\n");
+                            for (int a = 0; a < ncand; a++) {
+                                N2Tex tt = {0};
+                                if (!n2_tpk_decode(rd, rl, rtpk, cand[a], &tt)) {
+                                    printf("  %08x  no decode\n", cand[a]); continue; }
+                                char pp[1024];
+                                snprintf(pp, sizeof pp, "%s_%s_slot%d_%08x_%dx%d.png",
+                                         matdump, matmesh, a, cand[a], tt.w, tt.h);
+                                write_png(pp, tt.w, tt.h, tt.rgb);
+                                printf("  %08x %dx%d -> %s\n", cand[a], tt.w, tt.h, pp);
+                                free(tt.rgb); free(tt.alpha); free(tt.dxt);
+                            }
+            }
+            printf("\n");
+        }
+    }
+
+    /* --tpk-record (Milestone 99): every RAW TPK record carrying one key, in the
+       exact sources and the exact scan order world_bind_textures uses. Read-only
+       -- it re-walks the same 0x7c-byte record layout n2_tpk_decode walks and
+       prints the fields verbatim; no decode, sampler, UV or asset change. */
+    if (tpkrec) {
+        printf("MILESTONE: 99  raw TPK records for key %08x\n", tpkkey);
+        printf("record layout (Nikki minus the 0x0C name pad): name@+0x00(24B) "
+               "key@+0x18 Offset@+0x24 PaletteOffset@+0x28 Size@+0x2c "
+               "PaletteSize@+0x30 W@+0x38(u16) H@+0x3a(u16)\n\n");
+        int nfound = 0, firstw = 0, firsth = 0, firstdone = 0;
+        char firstsrc[128] = "-"; uint32_t f_off=0, f_pal=0, f_psz=0;
+        long f_dbase = 0; const unsigned char *f_d = NULL; long f_len = 0;
+        for (int pass = 0; pass < 3; pass++) {
+            const unsigned char *d = NULL; long dl = 0; N2Tpk tp; char label[128];
+            if (pass == 0) {
+                int r = -1;
+                for (int q = 0; q < world.nreg; q++) if (world.rgn[q].data) { r = q; break; }
+                if (r < 0) continue;
+                d = world.rgn[r].data; dl = world.rgn[r].len; tp = world.rgn[r].tpk;
+                snprintf(label, sizeof label, "STREAM%s.BUN local TPK", world.rgn[r].name + 6);
+            } else if (pass == 1) {
+                if (!world.loc4) { printf("[LOC4 fallback: not present]\n"); continue; }
+                d = world.loc4; dl = world.loc4len; tp = n2_tpk_open(d, dl);
+                snprintf(label, sizeof label, "TRACKS/LOC4DYNTEX.BIN");
+            } else {
+                if (!world.master) { printf("[master fallback: not present]\n"); continue; }
+                d = world.master; dl = world.masterlen; tp = world.mastertpk;
+                snprintf(label, sizeof label, "master TPK");
+            }
+            for (int b = 0; b < tp.nblk; b++) {
+                long hbeg = tp.blk[b].hbeg, hend = hbeg + tp.blk[b].hsize;
+                long dbase = tp.blk[b].dbase;
+                for (long i = hbeg; i + 0x40 < hend; i++) {
+                    if (!(d[i] >= 'A' && d[i] <= 'Z')) continue;
+                    if (n2_u32(d + i + 0x18) != tpkkey) continue;
+                    char nm[25]; memcpy(nm, d + i, 24); nm[24] = 0;
+                    for (int c = 0; c < 24; c++) if (nm[c] && (nm[c] < 32 || nm[c] > 126)) nm[c] = '.';
+                    uint32_t off = n2_u32(d+i+0x24), paloff = n2_u32(d+i+0x28);
+                    uint32_t sz = n2_u32(d+i+0x2c), palsz = n2_u32(d+i+0x30);
+                    int w = d[i+0x38] | d[i+0x39]<<8, hh = d[i+0x3a] | d[i+0x3b]<<8;
+                    int isp8 = palsz >= 1024;
+                    long pixend = dbase + off + (long)w*hh;
+                    long palend = dbase + paloff + 1024;
+                    printf("record %d\n", nfound);
+                    printf("  source file/block     %s, block %d (hdr@%ld size %ld, dbase %ld)\n",
+                           label, b, hbeg, (long)tp.blk[b].hsize, dbase);
+                    printf("  24-byte name          \"%s\"\n", nm);
+                    printf("  key                   %08x\n", n2_u32(d+i+0x18));
+                    printf("  Offset / PaletteOffset %u / %u\n", off, paloff);
+                    printf("  Size / PaletteSize     %u / %u\n", sz, palsz);
+                    printf("  W / H raw u16          %d x %d\n", w, hh);
+                    printf("  classification         %s\n",
+                           isp8 ? "P8 (PaletteSize >= 1024)"
+                                : ((long)sz > (long)w*hh*9/10 ? "DXT3 (Size > W*H*0.9)"
+                                                              : "DXT1"));
+                    printf("  W*H                    %ld  (Size %u -> %s)\n",
+                           (long)w*hh, sz,
+                           (long)sz == (long)w*hh ? "EXACTLY W*H (1 byte/texel index plane)"
+                           : (long)sz > (long)w*hh ? "larger than W*H" : "smaller than W*H");
+                    printf("  pixel range valid      %s (dbase+Offset+W*H = %ld vs len %ld)\n",
+                           pixend <= dl ? "yes" : "NO", pixend, dl);
+                    printf("  palette range valid    %s (dbase+PaletteOffset+1024 = %ld)\n",
+                           isp8 ? (palend <= dl ? "yes" : "NO") : "n/a", palend);
+                    if (!firstdone) {
+                        firstdone = 1; firstw = w; firsth = hh;
+                        snprintf(firstsrc, sizeof firstsrc, "%s block %d", label, b);
+                        f_off=off; f_pal=paloff; f_psz=palsz;
+                        f_dbase=dbase; f_d=d; f_len=dl;
+                    }
+                    nfound++;
+                    i += 0x7b;
+                }
+            }
+        }
+        printf("\ntotal raw records with this key: %d\n", nfound);
+        if (firstdone) {
+            printf("world_bind_textures resolves FIRST: %s  ->  raw W/H %d x %d\n",
+                   firstsrc, firstw, firsth);
+            N2Tex chk = {0};
+            int r0 = -1;
+            for (int q = 0; q < world.nreg; q++) if (world.rgn[q].data) { r0 = q; break; }
+            int ok = r0 >= 0 && n2_tpk_decode(world.rgn[r0].data, world.rgn[r0].len,
+                                              world.rgn[r0].tpk, tpkkey, &chk);
+            printf("n2_tpk_decode returns:            %s  %d x %d   -> raw==decoded: %s\n",
+                   ok ? "ok" : "FAILED", chk.w, chk.h,
+                   (ok && chk.w == firstw && chk.h == firsth) ? "YES" : "NO");
+            /* 1x nearest PNG of the SELECTED record, straight from its own bytes */
+            if (ok && f_d && f_psz >= 1024 &&
+                f_dbase + f_pal + 1024 <= f_len &&
+                f_dbase + f_off + (long)firstw*firsth <= f_len) {
+                unsigned char *px = (unsigned char *)malloc((size_t)firstw*firsth*3);
+                const unsigned char *pal = f_d + f_dbase + f_pal;
+                const unsigned char *ix  = f_d + f_dbase + f_off;
+                for (long q = 0; q < (long)firstw*firsth; q++) {
+                    const unsigned char *c = pal + (long)ix[q]*4;
+                    px[q*3]=c[0]; px[q*3+1]=c[1]; px[q*3+2]=c[2];
+                }
+                char pp[1024]; snprintf(pp, sizeof pp, "%s_%08x_%dx%d.png",
+                                        tpkrec, tpkkey, firstw, firsth);
+                write_png(pp, firstw, firsth, px);
+                printf("wrote 1x nearest PNG (no rescale, no filter): %s\n", pp);
+                free(px);
+                /* index-plane sanity: how much of the 256-entry palette is used */
+                int used[256]; memset(used, 0, sizeof used); int nu = 0;
+                for (long q = 0; q < (long)firstw*firsth; q++)
+                    if (!used[ix[q]]) { used[ix[q]] = 1; nu++; }
+                printf("index plane: %ld bytes read, %d distinct palette entries used\n",
+                       (long)firstw*firsth, nu);
+            }
+            free(chk.rgb); free(chk.alpha); free(chk.dxt);
+        }
+        printf("\n");
+    }
     static uint32_t tmapkey[2048]; static GLuint tmaptex[2048];
     int ntmap = world_bind_textures(&world, tmapkey, tmaptex, 2048);
     printf("track textures bound: %d distinct\n", ntmap);
+    if (smaudit) { int slot = -1;
+        for (int j = 0; j < ntmap; j++) if (tmapkey[j] == smkey) { slot = j; break; }
+        printf("M98 target %08x -> bound slot %d, GL id %u\n\n", smkey, slot,
+               slot < 0 ? 0u : tmaptex[slot]); }
+
 
     /* GPS self-check: route across the city so a broken graph is loud at load. */
     if (world.nnav > 0 && world.ndist >= 2) {
@@ -1279,6 +2519,12 @@ int main(int argc, char **argv) {
             spawn[0] = cand[chosen][0]; spawn[1] = cand[chosen][1]; spawn[2] = czl;
             heading0 = atan2f(densy - spawn[1], densx - spawn[0]);
         }
+        if (camat) {   /* diagnostic: put the same static capture at a given XY */
+            spawn[0] = camx; spawn[1] = camy;
+            spawn[2] = world_ground_z(&scene, camx, camy, 0.0f);
+            printf("cam-at: static capture moved to (%.3f, %.3f, %.3f)\n",
+                   spawn[0], spawn[1], spawn[2]);
+        }
         if (sspawn) {
             float orz = 0, oclear;
             int oroad = ss_road_z(&scene, mbb, oldsp[0], oldsp[1], oldsp[2], &orz);
@@ -1421,10 +2667,23 @@ int main(int argc, char **argv) {
     char carlist[MAXCARS][64]; int selcar = 0;
     int ncars = res_list_cars(dataroot, carlist, MAXCARS, carname, &selcar);
     char circlist[MAXCIRC][256]; int selcirc = 0;
-    int ncirc = res_list_circuits(troot, circlist, MAXCIRC, mn, mx);
-    if (explicit_circuit)  /* honor an explicit --circuit if it's valid on this track */
-        for (int i=0;i<ncirc;i++) if(!strcmp(circlist[i], circuit)) selcirc=i;
+    int ncirc = res_list_circuits(troot, trackname, circlist, MAXCIRC);
+    /* honour an explicit --circuit only when it belongs to THIS region's own
+       catalog; a foreign one is ignored rather than flinging the car into
+       another bundle (M89). */
+    if (explicit_circuit) {
+        int found = 0;
+        for (int i=0;i<ncirc;i++) if(!strcmp(circlist[i], circuit)) { selcirc=i; found=1; }
+        if (!found)
+            printf("--circuit %s is not in %s's route catalog (ROUTES%s) - ignored\n",
+                   circuit, trackname,
+                   strncmp(trackname,"STREAM",6) ? trackname : trackname+6);
+    }
     printf("circuits available: %d (menu: Left/Right)\n", ncirc);
+    if (raudit) { printf("RA circuit list for %s (bbox filter mn %.0f %.0f mx %.0f %.0f):\n",
+                         trackname, mn[0], mn[1], mx[0], mx[1]);
+                  for (int i = 0; i < ncirc; i++)
+                      printf("RA   [%d]%s %s\n", i, i == selcirc ? "*" : " ", circlist[i]); }
 
     N2Path aipath = {0};
     AiCar ais[N_AI]; int start_idx = 0;
@@ -1434,6 +2693,421 @@ int main(int argc, char **argv) {
                                    ais, spawn, &heading0, &start_idx, densx, densy) : 0;
     if (nai) printf("circuit: %d-waypoint loop; %d AI racers, lap system on\n",
                     aipath.n, nai);
+
+    /* --cover-probe (M110 visual recovery): every mesh with a triangle covering
+       one XY, regardless of category -- so ground that exists but is not
+       classified as ground is visible in the evidence. Read-only. */
+    if (cprobe) {
+        printf("\nM110 cover-probe at (%.3f, %.3f)  track=%s\n", cpx, cpy, trackname);
+        printf("  %-30s %-8s %-8s %10s %9s %-34s\n",
+               "asset name", "cat", "class", "texkey", "z", "world XY / Z bounds");
+        int nfound = 0;
+        for (int i = 0; i < nm; i++) {
+            const N2Mesh *m = &scene.meshes[i];
+            if (cpx < world.mbb[i][0] || cpx > world.mbb[i][2] ||
+                cpy < world.mbb[i][1] || cpy > world.mbb[i][3]) continue;
+            for (int t = 0; t + 2 < m->nidx; t += 3) {
+                const float *A = m->verts + m->idx[t]*5;
+                const float *B = m->verts + m->idx[t+1]*5;
+                const float *C = m->verts + m->idx[t+2]*5;
+                float d = (B[1]-C[1])*(A[0]-C[0]) + (C[0]-B[0])*(A[1]-C[1]);
+                if (d > -1e-9f && d < 1e-9f) continue;
+                float u = ((B[1]-C[1])*(cpx-C[0]) + (C[0]-B[0])*(cpy-C[1])) / d;
+                float v = ((C[1]-A[1])*(cpx-C[0]) + (A[0]-C[0])*(cpy-C[1])) / d;
+                float w = 1.0f - u - v;
+                if (u < 0 || v < 0 || w < 0) continue;
+                float z = u*A[2] + v*B[2] + w*C[2];
+                float bb[6] = {1e30f,-1e30f,1e30f,-1e30f,1e30f,-1e30f};
+                for (int q = 0; q < m->nverts; q++) { const float *pv = m->verts + q*5;
+                    if(pv[0]<bb[0])bb[0]=pv[0]; if(pv[0]>bb[1])bb[1]=pv[0];
+                    if(pv[1]<bb[2])bb[2]=pv[1]; if(pv[1]>bb[3])bb[3]=pv[1];
+                    if(pv[2]<bb[4])bb[4]=pv[2]; if(pv[2]>bb[5])bb[5]=pv[2]; }
+                char bs[64]; snprintf(bs, sizeof bs, "[%.0f %.0f][%.0f %.0f][%.1f %.1f]",
+                                      bb[0],bb[1], bb[2],bb[3], bb[4],bb[5]);
+                printf("  %-30s %-8s %-8s %10.8x %9.3f %-34s\n",
+                       m->sname[0] ? m->sname : "(unnamed)", bc_cat(m->cat),
+                       n2_scen_name(m->scen), m->texkey, z, bs);
+                nfound++;
+                break;
+            }
+        }
+        printf("  total covering meshes: %d   world_ground_z(ref -12.087) = %.3f\n",
+               nfound, world_ground_z(&scene, cpx, cpy, -12.087f));
+        printf("\n");
+    }
+
+    /* Showcase/menu pose (Milestone 108). L4RA's shipped showcase spot is the
+       dense build-up centre, and that XY has NO covering ROAD/TERRAIN triangle
+       at all (M106): world_ground_z returns its own reference there, so the car
+       hangs at whatever Z the previous spawn happened to have. Re-pick it with
+       the same triangle tests --shot-static uses, take Z from the chosen
+       candidate's OWN supporting road layer, and face the car along the local
+       road (reversed tangent, M107) instead of at a point hundreds of metres
+       away. Menu/showcase only: the Enter branch, sl_first_safe, the race route
+       start and the --shot-static selector are all downstream and untouched, and
+       if nothing passes, the shipped pose is left exactly as it was. */
+    if (!sstatic && !sspawn && !sstack && !strcmp(trackname, "STREAML4RA")) {
+        const float (*wmbb)[4] = (const float (*)[4])world.mbb;
+        float hl = (carbb[3]-carbb[0]) * 0.5f, hw = (carbb[4]-carbb[1]) * 0.5f;
+        if (hl < 0.5f) hl = 2.20f;
+        if (hw < 0.5f) hw = 0.90f;
+        float oldsp[3] = { spawn[0], spawn[1], spawn[2] };
+        #define SC_MAXC 65536
+        static float sc[SC_MAXC][4]; long trv = 0;
+        for (int i = 0; i < nm; i++)
+            if (scene.meshes[i].cat == N2_ROAD) trv += scene.meshes[i].nverts;
+        int stp = (int)(trv / SC_MAXC) + 1, nc = 0;
+        for (int i = 0; i < nm && nc < SC_MAXC; i++) {
+            if (scene.meshes[i].cat != N2_ROAD) continue;
+            for (int v = 0; v < scene.meshes[i].nverts && nc < SC_MAXC; v += stp) {
+                float *p = scene.meshes[i].verts + v*5;
+                sc[nc][0]=p[0]; sc[nc][1]=p[1]; sc[nc][2]=p[2];
+                sc[nc][3]=(p[0]-oldsp[0])*(p[0]-oldsp[0]) + (p[1]-oldsp[1])*(p[1]-oldsp[1]);
+                nc++;
+            }
+        }
+        static unsigned char scu[SC_MAXC]; memset(scu, 0, (size_t)nc);
+        int rj_road=0, rj_wall=0, rj_low=0, rj_patch=0, tried=0, found=0;
+        float px=0, py=0, pz=0, phd=0;
+        for (int pass = 0; pass < nc && !found; pass++) {
+            int a = -1; float bd = 1e30f;
+            for (int q = 0; q < nc; q++) if (!scu[q] && sc[q][3] < bd) { bd = sc[q][3]; a = q; }
+            if (a < 0) break;
+            scu[a] = 1; tried++;
+            float x = sc[a][0], y = sc[a][1], vz = sc[a][2], rz;
+            /* Z comes from this candidate's own vertex as the layer reference */
+            if (!ss_road_z(&scene, wmbb, x, y, vz, &rz))    { rj_road++; continue; }
+            if (ss_in_wall(obst, nobst, x, y, 1.3f))        { rj_wall++; continue; }
+            float ceil = ss_ceiling_above(&scene, wmbb, x, y, rz);
+            if (ceil - rz < SS_CLEAR_M)                     { rj_low++;  continue; }
+            /* local road tangent from the supporting triangle's longest XY edge,
+               reversed so the car presents its front three-quarter (M107) */
+            static SSHit sh[8192];
+            int nh = ss_stack(&scene, wmbb, x, y, sh, 8192);
+            float tx = 1, ty = 0; int gotT = 0;
+            for (int k = 0; k < nh && !gotT; k++) {
+                if (sh[k].cat != N2_ROAD) continue;
+                float dz = sh[k].z - rz; if (dz < 0) dz = -dz;
+                if (dz > 0.05f) continue;
+                const N2Mesh *me = &scene.meshes[sh[k].mesh];
+                int t = sh[k].tri * 3;
+                const float *A = me->verts + me->idx[t]*5;
+                const float *B = me->verts + me->idx[t+1]*5;
+                const float *C = me->verts + me->idx[t+2]*5;
+                const float *e[3][2] = { {A,B}, {B,C}, {C,A} };
+                float best = -1;
+                for (int j = 0; j < 3; j++) {
+                    float ex = e[j][1][0]-e[j][0][0], ey = e[j][1][1]-e[j][0][1];
+                    float L = ex*ex + ey*ey;
+                    if (L > best) { best = L; tx = ex; ty = ey; }
+                }
+                gotT = 1;
+            }
+            if (!gotT) { rj_patch++; continue; }
+            float ht = atan2f(ty, tx);
+            ht = ht > 0 ? ht - 3.14159265f : ht + 3.14159265f;   /* reversed tangent */
+            float pr[5][4];
+            if (!ss_patch(&scene, wmbb, x, y, rz, ht, hl, hw, pr)) { rj_patch++; continue; }
+            px = x; py = y; pz = rz; phd = ht; found = 1;
+        }
+        if (found) {
+            spawn[0] = px; spawn[1] = py; spawn[2] = pz; heading0 = phd;
+            printf("showcase pose: (%.3f, %.3f, %.3f) heading %+.4f  "
+                   "[nearest road candidate passing road/patch/wall/headroom; "
+                   "was (%.3f, %.3f, %.3f), %.1f m away]\n",
+                   px, py, pz, phd, oldsp[0], oldsp[1], oldsp[2],
+                   sqrtf((px-oldsp[0])*(px-oldsp[0]) + (py-oldsp[1])*(py-oldsp[1])));
+            printf("  probed %d: rejected road %d, wall %d, headroom %d, patch/tangent %d\n",
+                   tried, rj_road, rj_wall, rj_low, rj_patch);
+        } else
+            printf("showcase pose: no valid road candidate; keeping the shipped pose "
+                   "(%.3f, %.3f, %.3f)\n", oldsp[0], oldsp[1], oldsp[2]);
+    }
+
+    /* --showcase-audit (Milestone 106): is the shipped menu/showcase pose a safe,
+       coherent place to park the car, and what is the nearest road that is?
+       Read-only measurement using the SAME triangle tests --shot-static uses; it
+       does not run the M80 selector, does not touch the Enter branch or the route
+       start, and does not alter --shot-static's own spawn. */
+    if (shaudit) {
+        const float (*smbb)[4] = (const float (*)[4])world.mbb;
+        float hl = (carbb[3]-carbb[0]) * 0.5f, hw = (carbb[4]-carbb[1]) * 0.5f;
+        if (hl < 0.5f) hl = 2.20f;
+        if (hw < 0.5f) hw = 0.90f;
+        printf("\nMILESTONE: 106  showcase spawn audit  track=%s\n", trackname);
+        printf("car footprint half_l %.3f half_w %.3f  SS_PATCH_DZ %.2f  SS_CLEAR_M %.2f\n",
+               hl, hw, SS_PATCH_DZ, SS_CLEAR_M);
+        printf("shipped showcase pose (%.3f, %.3f, %.3f)  heading %+.4f\n",
+               spawn[0], spawn[1], spawn[2], heading0);
+        printf("dense build-up centre  (%.3f, %.3f)\n", densx, densy);
+
+        static SSHit hit[8192];
+        int nh = ss_stack(&scene, smbb, spawn[0], spawn[1], hit, 8192);
+        printf("\ncovering ROAD/TERRAIN triangles at the showcase XY: %d\n", nh);
+        for (int a = 0; a < nh; a++)
+            printf("   %-8s z %9.3f  %-28s n(%.2f %.2f %.2f)\n",
+                   bc_cat(hit[a].cat), hit[a].z,
+                   scene.meshes[hit[a].mesh].sname[0] ?
+                   scene.meshes[hit[a].mesh].sname : "(unnamed)",
+                   hit[a].n[0], hit[a].n[1], hit[a].n[2]);
+        float srz = 0;
+        int hasroad = ss_road_z(&scene, smbb, spawn[0], spawn[1], spawn[2], &srz);
+        int inwall = ss_in_wall(obst, nobst, spawn[0], spawn[1], 1.3f);
+        float sceil = ss_ceiling_above(&scene, smbb, spawn[0], spawn[1],
+                                       hasroad ? srz : spawn[2]);
+        float pr[5][4];
+        int spatch = hasroad && ss_patch(&scene, smbb, spawn[0], spawn[1], srz,
+                                         heading0, hl, hw, pr);
+        printf("   road support          %s%s\n", hasroad ? "yes, z " : "NO", "");
+        if (hasroad) printf("     nearest road z      %.3f (%+.3f vs pose z)\n", srz, srz - spawn[2]);
+        printf("   car-footprint patch   %s\n", spatch ? "ok" : "FAIL");
+        printf("   collide_walls foot    %s\n", inwall ? "INSIDE a building rect" : "clear");
+        printf("   overhead clearance    %.3f m %s\n",
+               sceil > 1e29f ? 99999.0 : sceil - (hasroad ? srz : spawn[2]),
+               (sceil - (hasroad ? srz : spawn[2])) >= SS_CLEAR_M ? "" : "(BELOW SS_CLEAR_M)");
+        { int nb = 0; float bd = 1e30f; const char *bn = "-";
+          for (int o = 0; o < nobst; o++) {
+              float cxr = 0.5f*(obst[o][0]+obst[o][2]), cyr = 0.5f*(obst[o][1]+obst[o][3]);
+              float dx = cxr-spawn[0], dy = cyr-spawn[1], d2 = dx*dx+dy*dy;
+              if (spawn[0] > obst[o][0] && spawn[0] < obst[o][2] &&
+                  spawn[1] > obst[o][1] && spawn[1] < obst[o][3]) nb++;
+              if (d2 < bd) { bd = d2; bn = "(rect)"; }
+          }
+          printf("   building rects containing this XY: %d   nearest rect centre %.2f m away %s\n",
+                 nb, sqrtf(bd), bn); }
+
+        /* nearest valid road candidates, same tests, ranked by displacement */
+        #define SH_MAXC 65536
+        static float shc[SH_MAXC][4]; long trv = 0;
+        for (int i = 0; i < nm; i++)
+            if (scene.meshes[i].cat == N2_ROAD) trv += scene.meshes[i].nverts;
+        int stp = (int)(trv / SH_MAXC) + 1, nc = 0;
+        for (int i = 0; i < nm && nc < SH_MAXC; i++) {
+            if (scene.meshes[i].cat != N2_ROAD) continue;
+            for (int v = 0; v < scene.meshes[i].nverts && nc < SH_MAXC; v += stp) {
+                float *p = scene.meshes[i].verts + v*5;
+                shc[nc][0]=p[0]; shc[nc][1]=p[1]; shc[nc][2]=p[2];
+                shc[nc][3]=(p[0]-spawn[0])*(p[0]-spawn[0]) + (p[1]-spawn[1])*(p[1]-spawn[1]);
+                nc++;
+            }
+        }
+        static unsigned char shu[SH_MAXC]; memset(shu, 0, (size_t)nc);
+        int rj_road=0, rj_wall=0, rj_low=0, rj_patch=0, tried=0, got=0;
+        printf("\nnearest valid road candidates (%d road vertices sampled, stride %d):\n", nc, stp);
+        printf("  %-4s %10s %10s %9s %9s %9s %s\n", "rank", "X", "Y", "Z", "heading",
+               "dist m", "clearance");
+        for (int pass = 0; pass < nc && got < 3; pass++) {
+            int a = -1; float bd2 = 1e30f;
+            for (int q = 0; q < nc; q++) if (!shu[q] && shc[q][3] < bd2) { bd2 = shc[q][3]; a = q; }
+            if (a < 0) break;
+            shu[a] = 1; tried++;
+            float x = shc[a][0], y = shc[a][1], vz = shc[a][2], rz;
+            if (!ss_road_z(&scene, smbb, x, y, vz, &rz)) { rj_road++; continue; }
+            if (ss_in_wall(obst, nobst, x, y, 1.3f))     { rj_wall++; continue; }
+            float ceil = ss_ceiling_above(&scene, smbb, x, y, rz);
+            if (ceil - rz < SS_CLEAR_M)                  { rj_low++;  continue; }
+            float hd = atan2f(densy - y, densx - x);
+            float p2[5][4];
+            if (!ss_patch(&scene, smbb, x, y, rz, hd, hl, hw, p2)) { rj_patch++; continue; }
+            /* report DISTINCT places: road meshes share vertices, so the same
+               XY can be sampled many times over. Purely a reporting rule. */
+            static float shown[3][2]; int dup = 0;
+            for (int q = 0; q < got; q++) {
+                float dx2 = shown[q][0]-x, dy2 = shown[q][1]-y;
+                if (dx2*dx2 + dy2*dy2 < 25.0f) dup = 1;
+            }
+            if (dup) continue;
+            shown[got][0] = x; shown[got][1] = y;
+            got++;
+            printf("  %-4d %10.3f %10.3f %9.3f %9.4f %9.2f %9.3f\n", got, x, y, rz, hd,
+                   sqrtf(shc[a][3]), ceil > 1e29f ? 99999.0 : ceil - rz);
+        }
+        printf("  probed %d candidates: rejected road %d, wall %d, headroom %d, patch %d\n",
+               tried, rj_road, rj_wall, rj_low, rj_patch);
+        if (shovr) {
+            /* M107: resolve Z from the candidate's OWN supporting road layer --
+               nearest road vertex sets the reference, never world_ground_z(...,0)
+               which resolves to whatever deck sits closest to zero. */
+            float vz = 0; float bd3 = 1e30f;
+            for (int i = 0; i < nm; i++) {
+                if (scene.meshes[i].cat != N2_ROAD) continue;
+                for (int v = 0; v < scene.meshes[i].nverts; v++) {
+                    float *p = scene.meshes[i].verts + v*5;
+                    float dx2 = p[0]-shx, dy2 = p[1]-shy, d2 = dx2*dx2+dy2*dy2;
+                    if (d2 < bd3) { bd3 = d2; vz = p[2]; }
+                }
+            }
+            float oz = 0;
+            int okz = ss_road_z(&scene, smbb, shx, shy, vz, &oz);
+            printf("\nM107 candidate Z: nearest road vertex z %.3f (%.2f m away) -> "
+                   "ss_road_z = %.3f  [%s]\n", vz, sqrtf(bd3), oz,
+                   okz ? "supported" : "NO ROAD");
+            printf("   for comparison, world_ground_z(x,y,0) = %.3f  (the M106 mistake)\n",
+                   world_ground_z(&scene, shx, shy, 0.0f));
+            /* local road tangent from the supporting triangle's longest XY edge */
+            int nh2 = ss_stack(&scene, smbb, shx, shy, hit, 8192);
+            float tx = 1, ty = 0; int gotT = 0;
+            for (int a = 0; a < nh2 && !gotT; a++) {
+                if (hit[a].cat != N2_ROAD) continue;
+                float d3 = hit[a].z - oz; if (d3 < 0) d3 = -d3;
+                if (d3 > 0.05f) continue;              /* the layer we stand on */
+                const N2Mesh *me = &scene.meshes[hit[a].mesh];
+                int t = hit[a].tri * 3;
+                const float *A = me->verts + me->idx[t]*5;
+                const float *B = me->verts + me->idx[t+1]*5;
+                const float *C = me->verts + me->idx[t+2]*5;
+                const float *e[3][2] = { {A,B}, {B,C}, {C,A} };
+                float best = -1;
+                for (int k = 0; k < 3; k++) {
+                    float dx2 = e[k][1][0]-e[k][0][0], dy2 = e[k][1][1]-e[k][0][1];
+                    float L = dx2*dx2 + dy2*dy2;
+                    if (L > best) { best = L; tx = dx2; ty = dy2; }
+                }
+                float L = sqrtf(tx*tx + ty*ty); if (L > 1e-6f) { tx /= L; ty /= L; }
+                gotT = 1;
+                printf("   supporting triangle: mesh %d %s tri %d  longest XY edge "
+                       "(%.4f, %.4f)  length %.2f m\n", hit[a].mesh,
+                       me->sname[0] ? me->sname : "(unnamed)", hit[a].tri, tx, ty, sqrtf(best));
+            }
+            float hdens = atan2f(densy - shy, densx - shx);
+            float htan  = atan2f(ty, tx);
+            printf("   heading A dense-centre  %+.4f rad (%+.1f deg)\n", hdens, hdens*57.29578f);
+            printf("   heading B road tangent  %+.4f rad (%+.1f deg)\n", htan,  htan*57.29578f);
+            printf("   heading C tangent + pi  %+.4f rad (%+.1f deg)\n",
+                   htan > 0 ? htan-3.14159265f : htan+3.14159265f,
+                   (htan > 0 ? htan-3.14159265f : htan+3.14159265f)*57.29578f);
+            printf("\nTEMPORARY capture override: showcase pose -> (%.3f, %.3f, %.3f)\n",
+                   shx, shy, oz);
+            spawn[0] = shx; spawn[1] = shy; spawn[2] = oz;
+            heading0 = hdens;
+            g_m107_h[0] = hdens; g_m107_h[1] = htan;
+            g_m107_h[2] = htan > 0 ? htan-3.14159265f : htan+3.14159265f;
+            g_m107 = 1;
+        }
+        printf("\n");
+    }
+
+
+
+    /* --startline-audit (Milestone 91): why does the route line start below its
+       own ground layer, and is there a safe start on this route at all?
+       Every waypoint, oriented by its LOCAL PATH TANGENT, is opened up into all
+       of its exact covering ROAD/TERRAIN triangles -- no current-spawn Z is used
+       to pick a layer. Each distinct ROAD level is then put through the three
+       existing production-side tests, unchanged and unrelaxed: ss_patch (car
+       footprint within SS_PATCH_DZ), ss_in_wall (collide_walls footprint) and
+       ss_ceiling_above (SS_CLEAR_M headroom). Diagnostic only. */
+    if (slaudit && aipath.n > 0) {
+        float half_l = (carbb[3]-carbb[0]) * 0.5f, half_w = (carbb[4]-carbb[1]) * 0.5f;
+        if (half_l < 0.5f) half_l = 2.20f;
+        if (half_w < 0.5f) half_w = 0.90f;
+        printf("MILESTONE: 91\n");
+        printf("track=%s circuit=%s waypoints=%d start_idx=%d\n",
+               trackname, circlist[selcirc], aipath.n, start_idx);
+        printf("car footprint half_l=%.3f half_w=%.3f  SS_PATCH_DZ=%.2f "
+               "SS_CLEAR_M=%.2f  wall radius 1.3 (same as collide_walls)\n",
+               half_l, half_w, SS_PATCH_DZ, SS_CLEAR_M);
+        printf("layers are distinct covering triangles grouped only where their Z "
+               "coincide within 0.05 m (coincident-triangle de-dup, not a policy)\n\n");
+
+        /* cumulative path length, for path-distance (not straight-line) reporting */
+        double *cum = (double *)malloc((size_t)aipath.n * sizeof *cum);
+        double total = 0; cum[0] = 0;
+        for (int i = 1; i < aipath.n; i++) {
+            float dx = aipath.xy[i*2]-aipath.xy[(i-1)*2];
+            float dy = aipath.xy[i*2+1]-aipath.xy[(i-1)*2+1];
+            total += sqrt((double)(dx*dx+dy*dy)); cum[i] = total;
+        }
+        { float dx = aipath.xy[0]-aipath.xy[(aipath.n-1)*2];
+          float dy = aipath.xy[1]-aipath.xy[(aipath.n-1)*2+1];
+          total += sqrt((double)(dx*dx+dy*dy)); }
+
+        int nroadlayer = 0, neligible = 0;
+        int *safe = (int *)malloc((size_t)aipath.n * sizeof *safe);
+        float *safez = (float *)malloc((size_t)aipath.n * sizeof *safez);
+        int nsafe = 0;
+        static SSHit hit[8192];
+
+        for (int i = 0; i < aipath.n; i++) {
+            float x = aipath.xy[i*2], y = aipath.xy[i*2+1];
+            int ip = (i - 1 + aipath.n) % aipath.n, in = (i + 1) % aipath.n;
+            float head = atan2f(aipath.xy[in*2+1]-aipath.xy[ip*2+1],
+                                aipath.xy[in*2]  -aipath.xy[ip*2]);
+            int n = ss_stack(&scene, (const float (*)[4])world.mbb, x, y, hit, 8192);
+            int wall = ss_in_wall(obst, nobst, x, y, 1.3f);
+            int printed = 0, isafe = 0; float bestz = 0;
+            for (int a = 0; a < n; a++) {
+                if (a && hit[a].z - hit[a-1].z < 0.05f) continue;   /* coincident */
+                if (hit[a].cat != N2_ROAD) continue;
+                nroadlayer++;
+                float rz = hit[a].z;
+                float pr[5][4];
+                int patch = ss_patch(&scene, (const float (*)[4])world.mbb, x, y, rz,
+                                     head, half_l, half_w, pr);
+                float ceil = ss_ceiling_above(&scene, (const float (*)[4])world.mbb, x, y, rz);
+                float clear = ceil - rz;
+                int ok = patch && !wall && clear >= SS_CLEAR_M;
+                if (ok) { neligible++; if (!isafe) { isafe = 1; bestz = rz; } }
+                if (i == start_idx || ok || !printed) {
+                    printf("wp %-4d (%9.3f %9.3f) tan %+7.4f  ROAD z %9.3f  "
+                           "patch %s wall %s clear %8.3f  => %s\n",
+                           i, x, y, head, rz, patch ? "ok " : "FAIL",
+                           wall ? "IN " : "out", clear > 1e29f ? 99999.0 : clear,
+                           ok ? "ELIGIBLE" : "rejected");
+                    printed = 1;
+                }
+            }
+            if (!printed)
+                printf("wp %-4d (%9.3f %9.3f) tan %+7.4f  no covering ROAD "
+                       "(%d ROAD/TERRAIN tris total, wall %s)\n",
+                       i, x, y, head, n, wall ? "IN" : "out");
+            if (isafe) { safe[nsafe] = i; safez[nsafe] = bestz; nsafe++; }
+            if (i == start_idx) {
+                printf("  --- start_idx %d full layer stack (%d covering tris) ---\n", i, n);
+                for (int a = 0; a < n; a++)
+                    printf("      %-8s z %9.3f  mesh %-28s n(%.2f %.2f %.2f)\n",
+                           hit[a].cat == N2_ROAD ? "ROAD" : "TERRAIN", hit[a].z,
+                           scene.meshes[hit[a].mesh].sname[0] ?
+                           scene.meshes[hit[a].mesh].sname : "(unnamed)",
+                           hit[a].n[0], hit[a].n[1], hit[a].n[2]);
+                printf("      in collide_walls footprint (r=1.3): %s\n", wall ? "YES" : "no");
+                for (int a = 0; a < n; a++) {
+                    if (hit[a].cat != N2_ROAD) continue;
+                    printf("      world_ground_z(ref=%9.3f) = %9.3f\n",
+                           hit[a].z, world_ground_z(&scene, x, y, hit[a].z));
+                }
+                printf("      world_ground_z(ref=%9.3f showcase spawn Z) = %9.3f\n",
+                       spawn[2], world_ground_z(&scene, x, y, spawn[2]));
+            }
+        }
+
+        printf("\neligible route-road layers: %d / %d  (waypoints with >=1 safe "
+               "layer: %d / %d)\n", neligible, nroadlayer, nsafe, aipath.n);
+        printf("route closed length %.2f m over %d waypoints\n", total, aipath.n);
+        if (!nsafe) printf("nearest safe candidate: NONE on this route\n");
+        else {
+            printf("nearest safe candidates from start_idx %d, by PATH distance:\n", start_idx);
+            for (int k = 0; k < 5 && k < nsafe; k++) {
+                int bi = -1; double bd = 1e30;
+                for (int q = 0; q < nsafe; q++) {
+                    if (safe[q] < 0) continue;
+                    double f = cum[safe[q]] - cum[start_idx];
+                    if (f < 0) f += total;
+                    double b = total - f;
+                    double dmin = f < b ? f : b;
+                    if (dmin < bd) { bd = dmin; bi = q; }
+                }
+                if (bi < 0) break;
+                int wp = safe[bi]; safe[bi] = -1;
+                double f = cum[wp] - cum[start_idx]; if (f < 0) f += total;
+                printf("  wp %-4d (%9.3f %9.3f) z %9.3f  path-distance %8.2f m (%s)\n",
+                       wp, aipath.xy[wp*2], aipath.xy[wp*2+1], safez[bi], bd,
+                       f <= total - f ? "forward" : "backward");
+            }
+        }
+        free(cum); free(safe); free(safez);
+        return 0;
+    }
 
     GLuint texTerr = world.have_grass ? upload_tex(&world.grass) : 0;
     GLuint texWheel = make_wheel_tex();   /* radial alloy-rim look for the tyres */
@@ -1541,7 +3215,7 @@ int main(int argc, char **argv) {
     if (!strcmp(carname, "MIATA")) { paint[0]=0.55f; paint[1]=0.10f; paint[2]=0.09f; }  /* reference showroom red */
     float carpos[3] = { spawn[0], spawn[1], spawn[2] };
     float car_up[3] = { 0, 0, 1 };   /* chassis up, lerped toward the ground normal */
-    if (shot && !sstatic && aipath.n > 0) {
+    if (shot && !sstatic && !daudit && aipath.n > 0) {
         /* --shot skips the menu (and its Enter-key start-line snap), so the
            showcase density-spawn would leave the car parked off-circuit in
            the void on proxy regions. Snap to the start line like a race. */
@@ -1599,6 +3273,25 @@ int main(int argc, char **argv) {
     #define MAXSMOKE 512
     static struct { float p[3], v[3], life, size; } smoke[MAXSMOKE]; int smoken = 0;
     while (running) {
+        /* M89 race audit: one synthetic RETURN at 1 s, delivered through SDL so
+           the production race_state==3 Enter branch runs exactly as written. */
+        static long ra_f = 0; static int ra_sent = 0, ra_start = -1;
+        static double ra_dist = 0; static float ra_peak = 0, ra_px = 0, ra_py = 0;
+        static int ra_walls = 0, ra_rails = 0, ra_clamp = 0, ra_stall = -1, ra_bad = 0;
+        static double ra_clampsum = 0; static int ra_cd = -1; static int ra_done = 0;
+        static float ra_maxresid = 0, ra_maxpre = 0;
+        if (raudit) {
+            if (ra_f == 0)
+                printf("RA menu showcase pos(%.3f %.3f %.3f) hdg %+.4f  race_state %d\n",
+                       carpos[0], carpos[1], carpos[2], heading, race_state);
+            if (ra_f == 60 && !ra_sent) {
+                SDL_Event ke; memset(&ke, 0, sizeof ke);
+                ke.type = SDL_KEYDOWN; ke.key.state = SDL_PRESSED;
+                ke.key.keysym.sym = SDLK_RETURN; ke.key.keysym.scancode = SDL_SCANCODE_RETURN;
+                SDL_PushEvent(&ke); ra_sent = 1;
+                printf("RA Enter pushed at frame 60\n");
+            }
+        }
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
 #ifdef DEBUG_UI
@@ -1689,13 +3382,38 @@ int main(int argc, char **argv) {
                         carpos[0]=spawn[0]; carpos[1]=spawn[1]; carpos[2]=spawn[2];
                         heading=heading0; vel[0]=vel[1]=0; speed=0; p_lap=p_prev=0;
                     } else if (k==SDLK_RETURN || k==SDLK_SPACE) {
-                        /* snap the player from the showcase spot to the circuit
-                           start line so the race itself is fair. */
+                        /* Snap the player from the showcase spot to the circuit
+                           start line so the race itself is fair. start_idx is
+                           only the waypoint nearest the showcase spot, and it is
+                           not necessarily standable: on L4RA/Paths4175 it has no
+                           covering ground at all and sits inside a building
+                           footprint (M91). Take the first waypoint AHEAD of it
+                           whose own road layer passes the footprint, wall and
+                           headroom tests, and start the lap there. */
                         if (aipath.n > 0) {
-                            carpos[0]=aipath.xy[start_idx*2]; carpos[1]=aipath.xy[start_idx*2+1];
-                            carpos[2]=world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
-                            int nx=(start_idx+1)%aipath.n;
-                            heading=atan2f(aipath.xy[nx*2+1]-carpos[1], aipath.xy[nx*2]-carpos[0]);
+                            float hl = (carbb[3]-carbb[0])*0.5f, hw = (carbb[4]-carbb[1])*0.5f;
+                            if (hl < 0.5f) hl = 2.20f;
+                            if (hw < 0.5f) hw = 0.90f;
+                            float sz = 0, sh = 0;
+                            int si = sl_first_safe(&scene, (const float (*)[4])world.mbb,
+                                                   aipath.xy, aipath.n, start_idx + 1,
+                                                   obst, nobst, hl, hw, &sz, &sh);
+                            if (si >= 0) {
+                                start_idx = si;              /* lap logic uses the real start */
+                                carpos[0]=aipath.xy[si*2]; carpos[1]=aipath.xy[si*2+1];
+                                carpos[2]=sz; heading=sh;
+                                printf("start line: waypoint %d (%.3f, %.3f, %.3f) "
+                                       "heading %+.4f [first safe forward candidate]\n",
+                                       si, carpos[0], carpos[1], carpos[2], heading);
+                            } else {
+                                printf("start line: no waypoint on this route passes the "
+                                       "footprint/wall/headroom tests - using start_idx %d "
+                                       "unchanged\n", start_idx);
+                                carpos[0]=aipath.xy[start_idx*2]; carpos[1]=aipath.xy[start_idx*2+1];
+                                carpos[2]=world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
+                                int nx=(start_idx+1)%aipath.n;
+                                heading=atan2f(aipath.xy[nx*2+1]-carpos[1], aipath.xy[nx*2]-carpos[0]);
+                            }
                             vel[0]=vel[1]=0; speed=0;
                         }
                         race_state = 0; racetimer = 0;   /* -> 3-2-1 countdown */
@@ -1741,6 +3459,29 @@ int main(int argc, char **argv) {
             throttle = 1.0f;
             steer = sinf(adt) * 0.35f;                  /* gentle S -- hard lock scrubs
                                                            off all the speed and it creeps */
+        }
+        /* M88 drive audit: keyboard-equivalent scripted input. Observes only --
+           it replaces the key state, nothing downstream is altered or tuned. */
+        static long da_f = 0;
+        static double da_dist = 0; static float da_peak = 0, da_prevx = 0, da_prevy = 0;
+        static int da_walls = 0, da_rails = 0, da_clamp = 0, da_stall = -1, da_bad = 0;
+        static double da_clampsum = 0;
+        if (daudit) {
+            if      (da_f < 120)  { throttle =  0.0f; steer = 0.0f; }
+            else if (da_f < 720)  { throttle =  1.0f; steer = 0.0f; }
+            else if (da_f < 1920) { throttle =  1.0f;
+                                    steer = ((da_f - 720) / 120) % 2 ? -1.0f : 1.0f; }
+            else if (da_f < 2070) { throttle = -1.0f; steer = 0.0f; }   /* brake */
+            else                  { throttle =  0.0f; steer = 0.0f; }   /* coast */
+            handbrake = 0;
+        }
+        if (raudit && race_state == 1) {   /* keyboard-equivalent, race only */
+            long r = ra_start < 0 ? 0 : ra_f - ra_start;
+            if      (r < 600)  { throttle = 1.0f; steer = 0.0f; }
+            else if (r < 1800) { throttle = 1.0f; steer = ((r-600)/120) % 2 ? -1.0f : 1.0f; }
+            else if (r < 1950) { throttle = -1.0f; steer = 0.0f; }
+            else               { throttle =  0.0f; steer = 0.0f; }
+            handbrake = 0;
         }
         /* push the ImGui handling sliders into the physics tune (stock when untouched) */
         g_phys_tune.accel = g_dbg.tune_accel; g_phys_tune.brake = g_dbg.tune_brake;
@@ -1806,7 +3547,7 @@ int main(int argc, char **argv) {
               carpos[2] += dz; }
             world_race_update(&world, carpos[0], carpos[1]);
         }
-        else if (shot && !sstatic && aipath.n > 0) {   /* screenshot autopilot: follow the racing
+        else if (shot && !sstatic && !daudit && aipath.n > 0) {   /* screenshot autopilot: follow the racing
                line (chasing an AI used to drift off small proxy regions into
                the empty void — black screenshots) */
             int nearest = 0; float bd = 1e30f;
@@ -1837,10 +3578,44 @@ int main(int argc, char **argv) {
           g_road_vol = sp*sp*0.35f; }   /* tyre/wind roar rises with speed */
         float fwd[3] = { nf[0], nf[1], 0 };
         /* building collision: push the car out of any wall footprint it entered.*/
-        if (race_state == 1 && !race_auto && !sstatic && collide_walls(carpos, vel, obst, nobst, 1.3f)) g_hit = 0.5f;
+        /* The car's world-space vertical envelope, matching the RENDER
+           transform exactly: mat_car() puts the model origin at pos + up*ride,
+           so with the body AABB's local Z range the drawn car spans
+           [carpos.z + ride + carbb.z0, carpos.z + ride + carbb.z1].
+           car_ride is the single shared expression -- the renderer below uses
+           this same variable, so the two can never drift apart. */
+        float car_ride = carprof.ride
+                       * (g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f);
+        float car_z0 = carpos[2] + car_ride + carbb[2];
+        float car_z1 = carpos[2] + car_ride + carbb[5];
+        if (car_z1 - car_z0 < 0.5f) car_z1 = car_z0 + 1.5f;   /* no car body loaded */
+        m94_prex = carpos[0]; m94_prey = carpos[1]; m94_prez = carpos[2];
+        if (raudit && race_state == 1 && !race_auto && !sstatic) {
+            /* read-only: the same rects collide_walls is about to test, before it
+               moves anything. Nothing here writes carpos or vel. */
+            for (int o = 0; o < nobst; o++) {
+                const float R = 1.3f;
+                if (carpos[0] <= obst[o][0]-R || carpos[0] >= obst[o][2]+R ||
+                    carpos[1] <= obst[o][1]-R || carpos[1] >= obst[o][3]+R) continue;
+                float z0 = car_z0, z1 = car_z1;
+                if (obstz[o][1] < z0 || obstz[o][0] > z1) continue;   /* same gate */
+                m94_wall(o, obstsrc[o], &scene, carpos, &aipath, ra_f);
+            }
+        }
+
+        if (race_state == 1 && !race_auto && !sstatic &&
+            collide_walls(carpos, vel, obst, obstz, nobst, 1.3f, car_z0, car_z1)) {
+            g_hit = 0.5f; da_walls++; ra_walls++; }
         /* guardrail/fence collision: push out of near-vertical road/terrain faces */
-        if (race_state == 1 && !race_auto && !sstatic && world_wall_push(&scene, carpos, 1.3f)) {
+        { WRailHit rh; rh.mesh = -1;
+          int rpushed = (race_state == 1 && !race_auto && !sstatic) &&
+                        world_wall_push(&scene, carpos, 1.3f, raudit ? &rh : NULL);
+          if (raudit && rpushed && rh.mesh >= 0)
+              m94_rail(&rh, &scene, m94_prex, m94_prey, m94_prez, &aipath, ra_f);
+          if (rpushed) {
             vel[0]*=0.3f; vel[1]*=0.3f; g_hit = 0.5f;   /* rebound: bleed speed */
+            da_rails++; ra_rails++;
+          }
         }
         /* race blockades: only solid while a race event is active (Phase 71) */
         if (race_state == 1 && !race_auto && !sstatic && world_barrier_push(&world, carpos, 1.3f)) {
@@ -1848,9 +3623,181 @@ int main(int argc, char **argv) {
         }
         /* checkpoint / lap tracking, after the pushes so it sees the final XY */
         if (race_state == 1 && !race_auto && !sstatic) world_race_update(&world, carpos[0], carpos[1]);
-        /* sit on the road/terrain surface (smoothed to avoid jitter) */
+        /* Sit ON the road/terrain surface: exact contact projection, not a
+           smoothed chase. The old 0.35 lerp fell up to a metre behind on the
+           SH-hill descent at 120 km/h (M92), which reads as the car sinking
+           into the road. world_ground_z is unchanged -- its nearest-to-
+           reference layer pick is what keeps stacked decks correct, and when
+           nothing covers the XY it returns the reference, so this adds no
+           invented height. */
         float gz = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
-        if (!sstatic) carpos[2] += (gz - carpos[2]) * 0.35f;
+        float da_dz = gz - carpos[2];          /* pre-projection delta */
+        if (!sstatic) carpos[2] = gz;
+        if (raudit) {   /* observe the production state, after every push */
+            if (race_state == 1 && ra_start < 0) {
+                ra_start = (int)ra_f; ra_cd = (int)ra_f - 60;
+                printf("RA countdown complete at frame %ld (%.2f s after Enter); "
+                       "race_state=1  start-line pos(%.3f %.3f %.3f) hdg %+.4f gz %.3f\n",
+                       ra_f, ra_cd/60.0, carpos[0], carpos[1], carpos[2], heading, gz);
+            }
+            float d = da_dz < 0 ? -da_dz : da_dz;   /* pre-projection, not post */
+            if (d > 0.01f) { ra_clamp++; ra_clampsum += d; }
+            float sk = speed < 0 ? -speed : speed;
+            if (race_state == 1) {
+                if (sk > ra_peak) ra_peak = sk;
+                if (ra_start >= 0 && ra_f > ra_start) {
+                    float ddx = carpos[0]-ra_px, ddy = carpos[1]-ra_py;
+                    ra_dist += sqrtf(ddx*ddx + ddy*ddy);
+                }
+                if (throttle != 0.0f && PHYS_KMH(sk) < 1.0f && ra_stall < 0) ra_stall = (int)ra_f;
+            }
+            ra_px = carpos[0]; ra_py = carpos[1];
+            if (isnan(carpos[0])||isnan(carpos[1])||isnan(carpos[2])||isnan(speed)||
+                isnan(heading)||isnan(vel[0])||isnan(vel[1])) ra_bad |= 1;
+            if (carpos[2] < -500.0f || carpos[2] > 500.0f) ra_bad |= 2;
+            if (carpos[0]<-8000||carpos[0]>8000||carpos[1]<-8000||carpos[1]>8000) ra_bad |= 4;
+            if (ra_start >= 0 && ra_f == ra_start)
+                printf("RA ENVELOPE contact_z %.4f  effective_ride %.4f "
+                       "(carprof.ride %.4f x wheel_scale %.4f)  body local Z [%.4f %.4f]"
+                       "  ->  world collision Z [%.4f %.4f]  (= contact + ride + local)\n",
+                       carpos[2], car_ride, carprof.ride,
+                       g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f,
+                       carbb[2], carbb[5], car_z0, car_z1);
+            /* residual: re-query the surface with the car's NEW Z as the
+               reference, so this measures whether the projection actually
+               landed on a layer that is stable under itself. */
+            float resid = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]) - carpos[2];
+            { float ar = resid < 0 ? -resid : resid;
+              if (ar > ra_maxresid) ra_maxresid = ar;
+              float ad = da_dz < 0 ? -da_dz : da_dz;
+              if (ad > ra_maxpre) ra_maxpre = ad; }
+            if (ra_f % 30 == 0 || (ra_start >= 0 && ra_f == ra_start))
+                printf("RA %-6ld t=%6.2fs st=%d thr=%+.0f str=%+.0f pos(%9.3f %9.3f %8.3f) "
+                       "hdg %+7.4f spd %7.2f km/h gz %8.3f pre_dz %+8.3f resid %+8.4f "
+                       "walls %d rails %d\n",
+                       ra_f, ra_f/60.0, race_state, throttle, steer,
+                       carpos[0], carpos[1], carpos[2], heading, PHYS_KMH(sk), gz, da_dz, resid,
+                       ra_walls, ra_rails);
+            if (ra_start >= 0 && ra_f - ra_start == 2100) {
+                printf("RA SUMMARY track=%s showcase-spawn=(%.3f %.3f %.3f)\n",
+                       trackname, spawn[0], spawn[1], spawn[2]);
+                printf("RA SUMMARY peak=%.2f km/h final=%.2f km/h travelled=%.2f m\n",
+                       PHYS_KMH(ra_peak), PHYS_KMH(sk), ra_dist);
+                printf("RA SUMMARY ground-clamp frames=%d (sum |pre_dz| %.2f m) wall=%d rail=%d\n",
+                       ra_clamp, ra_clampsum, ra_walls, ra_rails);
+                printf("RA SUMMARY max |pre-projection delta|=%.4f m  "
+                       "max |post-projection residual|=%.4f m\n", ra_maxpre, ra_maxresid);
+                printf("RA SUMMARY first throttle-active <1km/h frame=%d (%.2f s after start) "
+                       "status: nan=%d oob_z=%d oob_xy=%d\n", ra_stall,
+                       ra_stall < 0 ? -1.0 : (ra_stall - ra_start)/60.0,
+                       !!(ra_bad&1), !!(ra_bad&2), !!(ra_bad&4));
+                /* ---- M94 attribution report ---- */
+                printf("\nM94 COLLISION ATTRIBUTION  (%d distinct sources, %d recorded events)\n",
+                       m94n, m94nev);
+                printf("dominant groups (up to 12, by response count):\n");
+                for (int k = 0; k < 12; k++) {
+                    int b = -1, bc = 0;
+                    for (int i = 0; i < m94n; i++)
+                        if (m94g[i].count > bc) { bc = m94g[i].count; b = i; }
+                    if (b < 0) break;
+                    M94Grp *g = &m94g[b];
+                    const N2Mesh *m = &scene.meshes[g->mesh];
+                    if (g->kind == 0)
+                        printf("  BUILDING x%-5d mesh %-6d %-30s %-8s "
+                               "AABB XY[%.1f %.1f][%.1f %.1f] Z[%.1f %.1f] "
+                               "car(%.2f %.2f %.2f) wp %d d %.2f m first f%ld\n",
+                               g->count, g->mesh, m->sname[0]?m->sname:"(unnamed)",
+                               n2_scen_name(m->scen), g->bb[0],g->bb[2], g->bb[1],g->bb[3],
+                               g->bb[4],g->bb[5], g->cx,g->cy,g->cz, g->wp, g->segd, g->first);
+                    else
+                        printf("  RAIL     x%-5d mesh %-6d %-30s %-8s tri %-6d "
+                               "nz %+.3f triZ[%.2f %.2f] edge %.3f m "
+                               "car(%.2f %.2f %.2f) wp %d d %.2f m first f%ld\n",
+                               g->count, g->mesh, m->sname[0]?m->sname:"(unnamed)",
+                               bc_cat(m->cat), g->tri, g->nz, g->zlo, g->zhi, g->edged,
+                               g->cx,g->cy,g->cz, g->wp, g->segd, g->first);
+                    g->count = -g->count;   /* mark printed */
+                }
+                for (int i = 0; i < m94n; i++) if (m94g[i].count < 0) m94g[i].count = -m94g[i].count;
+                printf("first 20 chronological responses:\n");
+                for (int k = 0; k < 20 && k < m94nev; k++) {
+                    M94Grp *g = &m94g[m94ev[k].grp];
+                    const N2Mesh *m = &scene.meshes[g->mesh];
+                    printf("  f%-6ld %-8s mesh %-6d %-30s tri %-6d wp %d\n",
+                           m94ev[k].f, g->kind ? "RAIL" : "BUILDING", g->mesh,
+                           m->sname[0]?m->sname:"(unnamed)", g->tri, g->wp);
+                }
+                /* M91 wall-rejected waypoints: what actually sits there? */
+                printf("\nM91 wall-rejected waypoints, classified:\n");
+                { float hl = (carbb[3]-carbb[0])*0.5f, hw = (carbb[4]-carbb[1])*0.5f;
+                  if (hl < 0.5f) hl = 2.20f; if (hw < 0.5f) hw = 0.90f; (void)hl; (void)hw;
+                  int nb=0, nr=0, nboth=0, nnone=0;
+                  for (int i = 0; i < aipath.n; i++) {
+                    float x = aipath.xy[i*2], y = aipath.xy[i*2+1];
+                    if (!ss_in_wall(obst, nobst, x, y, 1.3f)) continue;
+                    float rz = 0;
+                    int hasroad = ss_road_z(&scene, (const float (*)[4])world.mbb, x, y,
+                                            carpos[2], &rz);
+                    /* probe the production rail test on a COPY: no side effects */
+                    WRailHit rh; rh.mesh = -1;
+                    float tmp[3] = { x, y, hasroad ? rz : carpos[2] };
+                    int rail = world_wall_push(&scene, tmp, 1.3f, &rh);
+                    int hitduring = 0;
+                    for (int g = 0; g < m94n; g++) if (m94g[g].wp == i) hitduring = 1;
+                    const char *cls = rail ? "BOTH (AABB proxy + exact rail face)"
+                                           : "building AABB proxy only";
+                    if (rail) nboth++; else nb++;
+                    if (!hitduring) nnone++;
+                    printf("  wp %-4d (%9.3f %9.3f) road %s  %-38s  hit during trace: %s",
+                           i, x, y, hasroad ? "yes" : "NO ", cls, hitduring ? "yes" : "no");
+                    if (rail) printf("  [rail mesh %d tri %d nz %+.3f]", rh.mesh, rh.tri, rh.nz);
+                    printf("\n");
+                    if (rail) nr++;
+                  }
+                  printf("  totals: AABB-proxy-only %d, both %d, rail-bearing %d, "
+                         "never hit during the trace %d\n", nb, nboth, nr, nnone);
+                }
+                ra_done = 1;
+            }
+            ra_f++;
+        }
+        if (daudit) {   /* observe the production state, after every push */
+            float d = da_dz < 0 ? -da_dz : da_dz;
+            if (d > 0.01f) { da_clamp++; da_clampsum += d; }
+            float sk = speed < 0 ? -speed : speed;
+            if (sk > da_peak) da_peak = sk;
+            if (da_f) { float ddx = carpos[0]-da_prevx, ddy = carpos[1]-da_prevy;
+                        da_dist += sqrtf(ddx*ddx + ddy*ddy); }
+            da_prevx = carpos[0]; da_prevy = carpos[1];
+            if (isnan(carpos[0])||isnan(carpos[1])||isnan(carpos[2])||
+                isnan(speed)||isnan(heading)||isnan(vel[0])||isnan(vel[1])) da_bad |= 1;
+            if (carpos[2] < -500.0f || carpos[2] > 500.0f) da_bad |= 2;
+            if (carpos[0] < -8000 || carpos[0] > 8000 ||
+                carpos[1] < -8000 || carpos[1] > 8000) da_bad |= 4;
+            if (throttle != 0.0f && PHYS_KMH(sk) < 1.0f && da_stall < 0) da_stall = (int)da_f;
+            if (da_f % 30 == 0 || da_f == 119 || da_f == 120 || da_f == 719 ||
+                da_f == 720 || da_f == 1919 || da_f == 1920 || da_f == 2219)
+                printf("DA %-6ld t=%6.2fs thr=%+.0f str=%+.0f  pos(%9.3f %9.3f %8.3f) "
+                       "hdg %+7.4f  spd %7.2f km/h  vel(%8.3f %8.3f)  gz %8.3f dz %+7.3f  "
+                       "walls %d rails %d\n", da_f, da_f/60.0, throttle, steer,
+                       carpos[0], carpos[1], carpos[2], heading, PHYS_KMH(sk),
+                       vel[0], vel[1], gz, da_dz, da_walls, da_rails);
+            if (da_f == shotframes - 1) {
+                float sk2 = speed < 0 ? -speed : speed;
+                printf("DA SUMMARY track=%s spawn=(%.3f %.3f %.3f) hdg0=%.4f\n",
+                       trackname, spawn[0], spawn[1], spawn[2], heading0);
+                printf("DA SUMMARY peak=%.2f km/h final=%.2f km/h travelled=%.2f m\n",
+                       PHYS_KMH(da_peak), PHYS_KMH(sk2), da_dist);
+                printf("DA SUMMARY ground-clamp frames=%d (sum |dz| %.2f m) "
+                       "wall-response=%d rail-response=%d\n",
+                       da_clamp, da_clampsum, da_walls, da_rails);
+                printf("DA SUMMARY first throttle-active <1km/h frame=%d (%.2f s)  "
+                       "status: nan=%d oob_z=%d oob_xy=%d\n", da_stall,
+                       da_stall < 0 ? -1.0 : da_stall/60.0,
+                       !!(da_bad&1), !!(da_bad&2), !!(da_bad&4));
+            }
+            da_f++;
+        }
         /* chassis pitch/roll: ease the body up-vector toward the ground normal
            (slow lerp so sharp mesh seams don't snap the car). */
         { float gn[3]; world_ground_normal(&scene, carpos[0], carpos[1], gn);
@@ -2168,8 +4115,7 @@ int main(int argc, char **argv) {
                The wheel mesh is additionally scaled by wheel_scale in its own
                matrix, so the effective radius is carWheelR*wheel_scale -- ride
                tracks that product, keeping the car flush at any slider value. */
-            float ride = carprof.ride
-                       * (g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f);
+            float ride = car_ride;   /* the exact value the collision envelope used */
             mat_car(carpos, heading, car_up, ride, Model);
             mat_mul(MVP, Model, MVPc);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
@@ -2269,18 +4215,15 @@ int main(int argc, char **argv) {
                 float specv = (c==N2_CAR_BODY||c==N2_CAR_MISC)?g_dbg.body_spec
                             : is_light?0.45f : c==N2_CAR_MECH?0.05f : 0.0f;
                 if (cgm[i].trim) specv *= 0.4f;
-                if (cgm[i].roof) specv = 0.05f;   /* canvas soft-top: near-matte */
                 glUniform1f(uSpec, specv);
-                glUniform1f(uGloss, cgm[i].trim || cgm[i].roof ? 6.0f : 20.0f);
+                glUniform1f(uGloss, cgm[i].trim ? 6.0f : 20.0f);
                 /* no diffuse texture exists for any light part (verified
                    exhaustively against the data, see n2_car_category) — chrome
                    housing + coloured lens read entirely through reflection.
                    Mechanical compartment parts (engine/exhaust) are unpainted
                    metal/plastic when they have no texture of their own — no
-                   body-paint gloss or reflection either. Soft-top canvas
-                   doesn't reflect the environment like painted metal either. */
-                glUniform1f(rp.uEnv, cgm[i].roof ? 0.02f
-                                   : (c==N2_CAR_BODY||c==N2_CAR_MISC)?0.50f*g_dbg.body_env
+                   body-paint gloss or reflection either. */
+                glUniform1f(rp.uEnv, (c==N2_CAR_BODY||c==N2_CAR_MISC)?0.50f*g_dbg.body_env
                                    : is_light?0.55f : c==N2_CAR_MECH?0.0f : 0.15f);
                 glUniform1f(rp.uDecal, 0.0f);   /* body branch may re-enable */
                 GLuint tex = 0; int hasalpha = 0;
@@ -2308,12 +4251,10 @@ int main(int argc, char **argv) {
                        submesh-level materials would let genuinely-textured
                        sub-regions (if any exist) resolve correctly instead
                        of an all-or-nothing per-object key. Not implemented. */
-                    /* soft-top canvas ignores the player's paint choice —
-                       real convertible tops don't get body-coloured, and
-                       this mesh has no texture of its own to show fabric
-                       weave instead. */
-                    if (cgm[i].roof) glUniform3f(uColor, 0.035f, 0.032f, 0.03f);
-                    else             glUniform3f(uColor, pnt[0], pnt[1], pnt[2]);
+                    /* Roof panels are ordinary painted body: the data carries
+                       no soft-top marker (M111), so they take the same paint and
+                       their own texture like every other body mesh. */
+                    glUniform3f(uColor, pnt[0], pnt[1], pnt[2]);
                     if (tex && !hasalpha) {
                         glUniform1f(uUseTex, 1.0f);
                         glBindTexture(GL_TEXTURE_2D, tex);
@@ -2956,6 +4897,119 @@ int main(int argc, char **argv) {
         if (g_dbg.want_track >= 0 && g_dbg.want_track < ntrack)
             relaunch(selfexe, dataroot, carname, tracklist[g_dbg.want_track]);
 #endif
+        if (smaudit) {
+            /* Four sampler variants on the TARGET TEXTURE ONLY, all captured
+               during the countdown while the car is motionless, so the camera
+               pose is byte-identical across variants. Sampler state is restored
+               to variant 0 before the run ends; nothing else is touched. */
+            static const char *vn[4] = { "0_genmips_trilinear", "1_base_linear",
+                                         "2_genmips_aniso", "3_tpk_chain" };
+            static int done_v = 0;
+            long f = ra_f - 1;
+            int v = (f == 100) ? 0 : (f == 110) ? 1 : (f == 120) ? 2 : (f == 130) ? 3 : -1;
+            if (v >= 0 && v < 4 && !(done_v & (1 << v))) {
+                done_v |= 1 << v;
+                GLuint tid = 0;
+                for (int j = 0; j < ntmap; j++) if (tmapkey[j] == smkey) tid = tmaptex[j];
+                if (tid) {
+                    glBindTexture(GL_TEXTURE_2D, tid);
+                    float amax = 1.0f;
+                    glGetFloatv(0x84FF /*GL_MAX_TEXTURE_MAX_ANISOTROPY*/, &amax);
+                    if (v == 0) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                                                  GL_LINEAR_MIPMAP_LINEAR);
+                                  glTexParameterf(GL_TEXTURE_2D, 0x84FE, 1.0f); }
+                    else if (v == 1) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                                                       GL_LINEAR);
+                                       glTexParameterf(GL_TEXTURE_2D, 0x84FE, 1.0f); }
+                    else if (v == 2) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                                                       GL_LINEAR_MIPMAP_LINEAR);
+                                       glTexParameterf(GL_TEXTURE_2D, 0x84FE, amax);
+                                       printf("SM max anisotropy reported: %.1f\n", amax); }
+                    else { printf("SM variant 3 (original TPK mip chain): NOT CAPTURED -- "
+                                  "the world path never retains an encoded chain for this "
+                                  "key (see inventory above); repeating variant 0\n");
+                           glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                                           GL_LINEAR_MIPMAP_LINEAR);
+                           glTexParameterf(GL_TEXTURE_2D, 0x84FE, 1.0f); }
+                }
+            }
+            /* capture one frame AFTER the state took effect */
+            int cap = (f == 101) ? 0 : (f == 111) ? 1 : (f == 121) ? 2 : (f == 131) ? 3 : -1;
+            if (cap >= 0) {
+                char sp[1024]; snprintf(sp, sizeof sp, "%s_%s.png", smaudit, vn[cap]);
+                unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
+                glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
+                write_png(sp, W, H, fl); free(px); free(fl);
+                printf("SM captured %s (frame %ld, car stationary during countdown)\n", sp, f);
+            }
+            if (f == 132) {   /* restore normal sampler state, then stop */
+                GLuint tid = 0;
+                for (int j = 0; j < ntmap; j++) if (tmapkey[j] == smkey) tid = tmaptex[j];
+                if (tid) { glBindTexture(GL_TEXTURE_2D, tid);
+                           glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                                           GL_LINEAR_MIPMAP_LINEAR);
+                           glTexParameterf(GL_TEXTURE_2D, 0x84FE, 1.0f); }
+                printf("SM sampler state restored to the production default\n");
+                running = 0;
+            }
+        }
+        if (raudit) {   /* deterministic evidence frames, then stop */
+            static int rshot = 0; rshot++;
+            const char *tag = NULL;
+            if (rshot == 2)   tag = "_menu";
+            else if (ra_start >= 0 && ra_f - 1 == ra_start) tag = "_startline";
+            else if (ra_done) tag = "_end";
+            if (g_m107) {
+                /* Freeze the orbit so all three captures share one camera pose;
+                   the camera FORMULA is untouched -- eye = car + (cos,sin)*16, +8,
+                   target = car + 1.5z -- and it never reads heading. */
+                menuspin = 0.0f;
+                int v = (rshot >= 20 && rshot < 30) ? 0 : (rshot >= 30 && rshot < 40) ? 1
+                      : (rshot >= 40) ? 2 : -1;
+                if (v >= 0) heading = g_m107_h[v];
+                static int shot107 = 0;
+                if ((rshot == 29 || rshot == 39 || rshot == 49) && shot107 < 3) {
+                    static const char *hn[3] = { "A_dense_centre", "B_road_tangent",
+                                                 "C_tangent_reversed" };
+                    char sp[1024]; snprintf(sp, sizeof sp, "%s_%s.png", shaudit, hn[shot107]);
+                    unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
+                    glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                    for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
+                    write_png(sp, W, H, fl); free(px); free(fl);
+                    printf("M107 capture %s  heading %+.4f  car(%.3f %.3f %.3f) "
+                           "cam(%.3f %.3f %.3f) menuspin %.4f\n", sp, heading,
+                           carpos[0], carpos[1], carpos[2], cam[0], cam[1], cam[2], menuspin);
+                    shot107++;
+                }
+                if (shot107 >= 3) { printf("M107: three headings captured at one camera pose\n");
+                                    running = 0; }
+                tag = NULL;   /* suppress the ordinary menu frame */
+            }
+            if (tag && shaudit && rshot > 2) tag = NULL;   /* menu frame only */
+            if (tag) {
+                char sp[1024]; snprintf(sp, sizeof sp, "%s%s.png", raudit, tag);
+                unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
+                glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
+                write_png(sp, W, H, fl); free(px); free(fl);
+                printf("RA frame written: %s\n", sp);
+            }
+            if (ra_done) running = 0;
+            if (shaudit && !g_m107 && rshot >= 3) {
+                printf("showcase audit: menu frame captured; Enter branch, route start "
+                       "and --shot-static spawn were never invoked\n");
+                running = 0;
+            }
+        }
+        if (daudit && shotframe == 2) {   /* one normal rendered frame at spawn */
+            char sp[1024]; snprintf(sp, sizeof sp, "%s_spawn.png", daudit);
+            unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
+            glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+            for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
+            write_png(sp, W, H, fl); free(px); free(fl);
+            printf("DA spawn frame written: %s\n", sp);
+        }
         if (shot && ++shotframe >= shotframes) {
             unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);

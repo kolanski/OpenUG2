@@ -63,38 +63,31 @@ int res_list_cars(const char *dataroot, char (*list)[64], int max,
     return n;
 }
 
-int res_list_circuits(const char *troot, char (*list)[256], int max,
-                      const float mn[3], const float mx[3]) {
+int res_list_circuits(const char *troot, const char *trackname,
+                      char (*list)[256], int max) {
+    /* ALL is a blind union of incompatible bundles, not a race world. */
+    if (!trackname || !strcmp(trackname, "ALL")) return 0;
+    /* the shipped 1:1 mapping: STREAM<stem>.BUN <-> ROUTES<stem>/ */
+    const char *stem = strncmp(trackname, "STREAM", 6) ? trackname : trackname + 6;
+    char dname[256]; snprintf(dname, sizeof dname, "ROUTES%s", stem);
+    char rdir[1200]; snprintf(rdir, sizeof rdir, "%s/%s", troot, dname);
+
     int n = 0;
-    DIR *td = opendir(troot); struct dirent *de;
-    while (td && n < max && (de = readdir(td))) {
-        if (strncmp(de->d_name, "ROUTES", 6)) continue;
-        char rdir[1200]; snprintf(rdir, sizeof rdir, "%s/%s", troot, de->d_name);
-        DIR *rd = opendir(rdir); struct dirent *re;
-        while (rd && n < max && (re = readdir(rd))) {
-            if (strncmp(re->d_name, "Paths", 5)) continue;
-            char rel[256]; snprintf(rel, sizeof rel, "%s/%s", de->d_name, re->d_name);
-            int dup=0; for (int i=0;i<n;i++) if(!strcmp(list[i],rel)) dup=1;
-            if (dup) continue;
-            char pp[1500]; snprintf(pp, sizeof pp, "%s/%s", troot, rel);
-            long pl; unsigned char *pd = n2_read_file(pp, &pl); N2Path tp = {0};
-            if (pd && n2_load_path(pd, pl, &tp) > 4) {
-                /* closed loop (start ~= end) whose centroid sits in this
-                   track's footprint (+30% margin, since a circuit may
-                   overhang the mesh bbox). Regions are far apart, so the
-                   centroid test keeps other regions' loops off the list. */
-                float dx=tp.xy[0]-tp.xy[(tp.n-1)*2], dy=tp.xy[1]-tp.xy[(tp.n-1)*2+1];
-                float px=0,py=0; for(int i=0;i<tp.n;i++){ px+=tp.xy[i*2]; py+=tp.xy[i*2+1]; }
-                px/=tp.n; py/=tp.n;
-                float ex=(mx[0]-mn[0])*0.3f, ey=(mx[1]-mn[1])*0.3f;
-                if (dx*dx+dy*dy < 900.0f &&
-                    px>=mn[0]-ex && px<=mx[0]+ex && py>=mn[1]-ey && py<=mx[1]+ey)
-                    strncpy(list[n++], rel, 255);
-            }
-            free(tp.xy); free(pd);
+    DIR *rd = opendir(rdir); struct dirent *re;
+    while (rd && n < max && (re = readdir(rd))) {
+        if (strncmp(re->d_name, "Paths", 5)) continue;
+        char rel[256]; snprintf(rel, sizeof rel, "%s/%s", dname, re->d_name);
+        int dup=0; for (int i=0;i<n;i++) if(!strcmp(list[i],rel)) dup=1;
+        if (dup) continue;
+        char pp[1500]; snprintf(pp, sizeof pp, "%s/%s", troot, rel);
+        long pl; unsigned char *pd = n2_read_file(pp, &pl); N2Path tp = {0};
+        if (pd && n2_load_path(pd, pl, &tp) > 4) {
+            /* closed loop: first waypoint ~= last (sprints are open routes) */
+            float dx=tp.xy[0]-tp.xy[(tp.n-1)*2], dy=tp.xy[1]-tp.xy[(tp.n-1)*2+1];
+            if (dx*dx+dy*dy < 900.0f) strncpy(list[n++], rel, 255);
         }
-        if (rd) closedir(rd);
+        free(tp.xy); free(pd);
     }
-    if (td) closedir(td);
+    if (rd) closedir(rd);
     return n;
 }

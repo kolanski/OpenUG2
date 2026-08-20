@@ -1070,7 +1070,7 @@ static float seg_d2(float px,float py,float ax,float ay,float bx,float by,float 
     *ox=ax+t*dx; *oy=ay+t*dy;
     float ex=px-*ox, ey=py-*oy; return ex*ex+ey*ey;
 }
-int world_wall_push(const N2Scene *s, float *pos, float r) {
+int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit) {
     if (s->meshes != g_grid.meshes) return 0;
     int cx = (int)((pos[0]-g_grid.x0)/GCELL), cy = (int)((pos[1]-g_grid.y0)/GCELL);
     if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) return 0;
@@ -1092,6 +1092,9 @@ int world_wall_push(const N2Scene *s, float *pos, float r) {
             float d1=seg_d2(pos[0],pos[1],b[0],b[1],cc[0],cc[1],&ox,&oy); if(d1<best){best=d1;bx=ox;by=oy;}
             float d2=seg_d2(pos[0],pos[1],cc[0],cc[1],a[0],a[1],&ox,&oy); if(d2<best){best=d2;bx=ox;by=oy;}
             if (best >= r*r) continue;
+            if (hit && !pushed) { hit->mesh = g_grid.list[k]; hit->tri = t/3;
+                                  hit->nz = nz/L; hit->zlo = zlo; hit->zhi = zhi;
+                                  hit->edged = sqrtf(best); }
             float hx=pos[0]-bx, hy=pos[1]-by;
             float hl = sqrtf(hx*hx+hy*hy); if (hl<1e-6f){ hx=nx; hy=ny; hl=sqrtf(hx*hx+hy*hy); if(hl<1e-6f)continue; }
             pos[0] = bx + hx/hl*r; pos[1] = by + hy/hl*r;        /* shove back to r */

@@ -29,10 +29,6 @@ typedef struct {
     int      trim;    /* car BODY meshes only: 1 = plastic bumper/skirt (verified
                           real per-part name tokens, e.g. GOLF_KIT00_FRONT_BUMPER_A),
                           duller/broader specular than the metallic paint panels */
-    int      roof;    /* car BODY meshes only: 1 = convertible soft-top fabric
-                          (verified real token, e.g. MIATA_KIT00_ROOF_A) — canvas,
-                          not painted metal: fixed dark colour, ignores player
-                          paint, near-zero specular/reflection */
     uint32_t namekey; /* car meshes: hash of the part name with any trailing
                           _A.._D LOD suffix stripped, so every tier of one part
                           shares a key. 0 = unnamed. Drives n2_car_dedupe_lod. */
@@ -159,6 +155,12 @@ static int n2_icontains(const unsigned char *hay, long n, const char *needle) {
 
 /* Classify a 0x80134010 mesh by the material name in its first 0x134011 leaf.
  * Names look like TRN_ROADA_CHOP_*, TRN_TERRAINA_*, XO_TRAFFICCONE_* ... */
+/* The semantic asset-name classifier, declared early so the category test can
+ * defer to it; defined with the rest of the scenery classification below. */
+enum { N2_SC_NONE = 0, N2_SC_TERRAIN, N2_SC_BUILDING, N2_SC_PROP,
+       N2_SC_TREE, N2_SC_WALL, N2_SC_STRUCT, N2_SC_OTHER };
+static int n2_scen_class(const char *nm);
+
 static int n2_mesh_category(const unsigned char *d, long beg, long end) {
     N2Leaf mat[4]; int nm = 0;
     n2_find_leaves(d, beg, end, 0x00134011u, mat, &nm, 4);
@@ -183,6 +185,21 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                     if (n2_contains(n, L, "SKYDOME") || n2_contains(n, L, "SKY")) return N2_SKY;
                     if (n2_contains(n, L, "ROAD")) return N2_ROAD;
                     if (n2_contains(n, L, "TERRAIN")) return N2_TERRAIN;
+                    /* Ground whose asset name does not spell "TERRAIN". L4RB's
+                       ground is TRN_RDP_RUNWAY_/TRN_GRASS_/TRN_CONCRETE_/
+                       TRN_FOUNDATION_/TRN_TRAINTRACKS_, so the literal test left
+                       it N2_OTHER -- invisible to world_ground_z, which then
+                       returns the caller's own Z. Measured: the car drove at
+                       z -12.087 while TRN_RDP_RUNWAY_KT_CHOP_A2_3 lay at z 0.009
+                       directly beneath it, i.e. 12.1 m UNDER the airport, which
+                       is why the terminal read as a detached prop overhead and
+                       the world read as an empty plane. Defer to the SAME
+                       semantic classifier the loader already tags meshes with
+                       instead of adding another name rule; ROAD and SKY keep
+                       their precedence above. */
+                    { char sn[40]; int cl = (int)(L < 39 ? L : 39);
+                      memcpy(sn, n, (size_t)cl); sn[cl] = 0;
+                      if (n2_scen_class(sn) == N2_SC_TERRAIN) return N2_TERRAIN; }
                     return N2_OTHER;
                 }
                 i = j;
@@ -330,9 +347,6 @@ static int n2_obj_matrix(const unsigned char *d, long beg, long end, float *m) {
  * meshes were claimed by >1 solid -- avg 5.2 -- which would mislabel collisions.)
  * Prefix census for L4RA: TRN 4248, XB 2405, XO 1458, XS 759, XW 739, XT 454,
  * ZPM 166, PAN 51, UC 43, XV 32. */
-enum { N2_SC_NONE = 0, N2_SC_TERRAIN, N2_SC_BUILDING, N2_SC_PROP,
-       N2_SC_TREE, N2_SC_WALL, N2_SC_STRUCT, N2_SC_OTHER };
-
 static int n2_scen_class(const char *nm) {
     if (!nm || !nm[0]) return N2_SC_NONE;
     if (!strncmp(nm, "TRN", 3) || !strncmp(nm, "PAN", 3)) return N2_SC_TERRAIN;
@@ -486,6 +500,79 @@ static int n2_is_vista_impostor(const char *nm, const N2Geom *g) {
            g->zspan >= N2_VISTA_Z && g->planarity >= N2_VISTA_PLANAR;
 }
 
+/* ---- M102 fallback census -------------------------------------------------
+ * Records WHY each ROAD/TERRAIN object took the per-submesh path or the old
+ * single-last-slot fallback. Pure bookkeeping: it reads the same values the
+ * validation already computed and never influences emission. Off unless
+ * n2_m102 is set before the load. */
+enum { N2_FB_OK = 0, N2_FB_NOREC, N2_FB_MULTILEAF, N2_FB_MALFORMED,
+       N2_FB_BADSLOT, N2_FB_NCAT };
+typedef struct {
+    char     name[32];
+    int      cat, nslot, nsub, nleaf, ntri;
+    uint32_t key, slot0;
+    float    bb[6];               /* x0 x1 y0 y1 z0 z1, world space */
+    long     b02off; uint32_t b02size;   /* M104: the raw leaves, for stride probing */
+    long     b03off; uint32_t b03size;
+    long     avail;               /* usable u16 indices in B03, post-filler */
+    uint32_t slots[16];
+} N2FbRec;
+static int  n2_m102 = 0;
+static long n2_m102_obj[N2_FB_NCAT], n2_m102_tri[N2_FB_NCAT], n2_m102_idx[N2_FB_NCAT];
+#define N2_FB_MAXS 16
+static N2FbRec n2_m102_s[N2_FB_NCAT][N2_FB_MAXS];
+static int  n2_m102_ns[N2_FB_NCAT];
+static long n2_m102_risk[N2_FB_NCAT], n2_m102_risktri[N2_FB_NCAT];
+static long n2_m102_bad[3];   /* cat5 split: 0 mat_id range, 1 empty slot, 2 unresolved key */
+static long n2_m102_rng_res, n2_m102_rng_unres;   /* emitted ranges, by key source */
+static void n2_m102_note2(N2FbRec *r, const unsigned char *d, long beg, long end,
+                          const uint32_t *slot, int nslot, N2Leaf i0) {
+    N2Leaf sm[8]; int nsm = 0;
+    n2_find_leaves(d, beg, end, 0x00134B02u, sm, &nsm, 8);
+    r->b02off = nsm ? sm[0].off : -1; r->b02size = nsm ? sm[0].size : 0;
+    r->b03off = i0.off; r->b03size = i0.size;
+    const unsigned char *ib0 = d + i0.off; int ib = (int)i0.size, ip = 0;
+    while (ip + 2 <= ib && ib0[ip] == 0x11 && ib0[ip+1] == 0x11) ip += 2;
+    r->avail = (ib - ip) / 2;
+    for (int k = 0; k < 16; k++) r->slots[k] = k < nslot ? slot[k] : 0;
+}
+static void n2_m102_note(int why, const char *anm, int cat, int nslot, int nsub,
+                         int nleaf, long nidx, uint32_t key, uint32_t slot0,
+                         const unsigned char *d, N2Leaf v0, const float *mtx) {
+    n2_m102_obj[why]++; n2_m102_idx[why] += nidx; n2_m102_tri[why] += nidx / 3;
+    if (nslot > 1 && key != slot0) { n2_m102_risk[why]++; n2_m102_risktri[why] += nidx/3; }
+    if (n2_m102_ns[why] >= N2_FB_MAXS) return;
+    N2FbRec *r = &n2_m102_s[why][n2_m102_ns[why]++];
+    snprintf(r->name, sizeof r->name, "%.31s", anm);
+    r->cat = cat; r->nslot = nslot; r->nsub = nsub; r->nleaf = nleaf;
+    r->ntri = (int)(nidx / 3); r->key = key; r->slot0 = slot0;
+    r->bb[0]=r->bb[2]=r->bb[4]= 1e30f;
+    r->bb[1]=r->bb[3]=r->bb[5]=-1e30f;
+    const unsigned char *vb = d + v0.off; int vlen = (int)v0.size;
+    int pad = n2_skip_filler(vb, vlen);
+    const unsigned char *rec = vb + pad; int n = (vlen - pad) / 24;
+    for (int i = 0; i < n; i++) {
+        float px, py, pz;
+        memcpy(&px, rec + i*24 + 0, 4); memcpy(&py, rec + i*24 + 4, 4);
+        memcpy(&pz, rec + i*24 + 8, 4);
+        float wx = px*mtx[0]+py*mtx[4]+pz*mtx[8] +mtx[12];
+        float wy = px*mtx[1]+py*mtx[5]+pz*mtx[9] +mtx[13];
+        float wz = px*mtx[2]+py*mtx[6]+pz*mtx[10]+mtx[14];
+        if (wx<r->bb[0])r->bb[0]=wx; if (wx>r->bb[1])r->bb[1]=wx;
+        if (wy<r->bb[2])r->bb[2]=wy; if (wy>r->bb[3])r->bb[3]=wy;
+        if (wz<r->bb[4])r->bb[4]=wz; if (wz>r->bb[5])r->bb[5]=wz;
+    }
+}
+
+/* Declared here because n2_walk_meshes' per-submesh road path (M101) needs
+ * them; the definitions stay with the car material code further down. */
+typedef struct { uint32_t start, count, mat; } N2Sub;
+static int n2_mesh_submeshes(const unsigned char *d, long beg, long end,
+                             N2Sub *out, int cap);
+static int n2_mesh_texslots(const unsigned char *d, long beg, long end,
+                            uint32_t *out, int cap);
+static uint32_t n2_resolve_key(uint32_t v, const uint32_t *keys, int nkeys);
+
 static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *scene,
                            const uint32_t *keys, int nkeys) {
     long o = beg;
@@ -526,6 +613,104 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                depth-write off) so its absurd span must skip the size-safety
                cull that still guards every other category. */
             int cull = (cat != N2_SKY);
+            /* Per-submesh materials for road/terrain (Milestone 101). A road
+             * object lists SEVERAL 0x134012 slots and its single 0x134B02 leaf
+             * partitions the index buffer into ranges, each naming its slot by
+             * mat_id -- the same linkage the car path already uses. Binding one
+             * key per object (the last slot) put a 64x64 intersection tile over
+             * a whole carriageway whose geometry is 91% lane/shoulder strips
+             * (M100, TRN_SH_ROADA_CHOP_A13_R7: mat_id 2 owns 9 of 105 indices).
+             * Emit one mesh per range instead. Anything that does not verify --
+             * no records, several index leaves, a mat_id out of range, an empty
+             * or unresolved slot, or ranges that do not chain from 0 -- falls
+             * straight through to the unchanged single-mesh path below. */
+            int sub_ok = 0;
+            N2Sub sub[64]; int nsub = 0;
+            uint32_t slot[64]; int nslot = 0;
+            int fb_why = -1; long fb_idx = 0, fb_chain = 0;   /* M102 census only */
+            if ((cat == N2_ROAD || cat == N2_TERRAIN) && pairs == 1) {
+                nsub  = n2_mesh_submeshes(d, ds, ds + size, sub, 64);
+                nslot = n2_mesh_texslots(d, ds, ds + size, slot, 64);
+                if (nsub > 0 && nslot > 0) {
+                    const unsigned char *ib0 = d + idx[0].off;
+                    int ibytes = (int)idx[0].size, ip = 0;
+                    while (ip + 2 <= ibytes && ib0[ip] == 0x11 && ib0[ip+1] == 0x11) ip += 2;
+                    long avail = (ibytes - ip) / 2;
+                    sub_ok = 1;
+                    long chain = 0;
+                    for (int a = 0; a < nsub && sub_ok; a++) {
+                        if (sub[a].mat >= (uint32_t)nslot)
+                            { sub_ok = 0; fb_why = N2_FB_BADSLOT; if (n2_m102) n2_m102_bad[0]++; }
+                        else if (!slot[sub[a].mat])
+                            { sub_ok = 0; fb_why = N2_FB_BADSLOT; if (n2_m102) n2_m102_bad[1]++; }
+                        else if ((long)sub[a].start != chain)
+                            { sub_ok = 0; fb_why = N2_FB_MALFORMED; }   /* contiguous */
+                        else if (sub[a].count < 3) { sub_ok = 0; fb_why = N2_FB_MALFORMED; }
+                        else if (chain + (long)sub[a].count > avail)
+                            { sub_ok = 0; fb_why = N2_FB_MALFORMED; }
+                        else chain += (long)sub[a].count;
+                    }
+                    /* The records partition every WHOLE triangle; the leaf may
+                       carry one spare u16 of alignment padding (measured: avail%3
+                       is 0 or 1, never 2). Require the partition to end exactly
+                       at the last whole triangle so a short chain can never
+                       silently drop geometry. */
+                    if (sub_ok && chain != avail - avail % 3)
+                        { sub_ok = 0; fb_why = N2_FB_MALFORMED; }
+                    fb_chain = chain;
+                }
+            }
+            if (n2_m102 && (cat == N2_ROAD || cat == N2_TERRAIN)) {
+                /* usable indices across every pair, post-filler */
+                for (int k = 0; k < pairs; k++) {
+                    const unsigned char *ib0 = d + idx[k].off;
+                    int ibytes = (int)idx[k].size, ip = 0;
+                    while (ip + 2 <= ibytes && ib0[ip] == 0x11 && ib0[ip+1] == 0x11) ip += 2;
+                    fb_idx += (ibytes - ip) / 2;
+                }
+                int why = N2_FB_OK;
+                if (sub_ok) why = N2_FB_OK;
+                else if (fb_why >= 0) why = fb_why;
+                else if (pairs != 1) why = N2_FB_MULTILEAF;
+                else {
+                    N2Leaf sm[8]; int nsm = 0;
+                    n2_find_leaves(d, ds, ds + size, 0x00134B02u, sm, &nsm, 8);
+                    why = (nsm == 0) ? N2_FB_NOREC
+                        : (nsm  > 1) ? N2_FB_MULTILEAF : N2_FB_MALFORMED;
+                }
+                if (pairs > 0) {
+                    int ns0 = n2_m102_ns[why];
+                    n2_m102_note(why, anm, cat, nslot, nsub, pairs,
+                                 sub_ok ? fb_chain : fb_idx, tk,
+                                 nslot ? slot[0] : 0, d, vtx[0], objm);
+                    if (n2_m102_ns[why] > ns0)
+                        n2_m102_note2(&n2_m102_s[why][ns0], d, ds, ds + size,
+                                      slot, nslot, idx[0]);
+                }
+            }
+            if (sub_ok) {
+                for (int a = 0; a < nsub; a++) {
+                    int before = scene->count;
+                    /* Resolvability is a PER-SUBMESH question (M103). A record's
+                       own slot key wins whenever this region's TPK set can supply
+                       it; a slot that lives in a pack we do not ship falls back to
+                       the object's `last` key for THAT RANGE ONLY, which is
+                       exactly what the whole object used to get. Geometry and the
+                       index partition are identical either way -- only the key
+                       differs -- so nothing is dropped or duplicated. */
+                    uint32_t sk = n2_resolve_key(slot[sub[a].mat], keys, nkeys);
+                    if (!sk) { sk = tk; if (n2_m102) n2_m102_rng_unres++; }
+                    else if (n2_m102) n2_m102_rng_res++;
+                    n2_add_pair(d, vtx[0], idx[0], cat, scene, 24, 16, cull,
+                                sk, objm,
+                                (long)sub[a].start, (long)sub[a].count);
+                    for (int m2 = before; m2 < scene->count; m2++) {
+                        scene->meshes[m2].scen = (unsigned char)sc;
+                        snprintf(scene->meshes[m2].sname, sizeof scene->meshes[m2].sname,
+                                 "%.31s", anm);
+                    }
+                }
+            } else
             for (int k = 0; k < pairs; k++) {
                 int before = scene->count;
                 n2_add_pair(d, vtx[k], idx[k], cat, scene, 24, 16, cull, tk, objm, 0, -1);
@@ -1009,18 +1194,15 @@ static int n2_car_is_trim(const unsigned char *d, long beg, long end) {
     return 0;
 }
 
-/* Convertible soft-top fabric within N2_CAR_BODY: real token, e.g.
- * MIATA_KIT00_ROOF_A/B/C. Canvas, not painted sheet metal — rendered as a
- * fixed dark colour regardless of the player's paint choice. */
-static int n2_car_is_roof(const unsigned char *d, long beg, long end) {
-    N2Leaf mat[4]; int nm = 0;
-    n2_find_leaves(d, beg, end, 0x00134011u, mat, &nm, 4);
-    for (int k = 0; k < nm; k++) {
-        const unsigned char *p = d + mat[k].off; long s = mat[k].size;
-        if (n2_contains(p, s, "ROOF")) return 1;
-    }
-    return 0;
-}
+/* Soft-top vs painted roof: the shipped data draws no distinction (M111).
+ * Every car has a *_KIT00_ROOF_* part -- hardtops included -- and on all five
+ * cars measured (HUMMER, MIATA, MUSTANGGT, 350Z, ECLIPSE) the roof's 0x134012
+ * slot list is a subset of its own *_KIT00_BODY_* slots, i.e. the same body
+ * texture keys. There is no material, texture or naming discriminator to key a
+ * canvas rule on, so ROOF is treated as ordinary body panel and rendered from
+ * its own material like every other body mesh. The previous name-substring rule
+ * forced (0.035, 0.032, 0.030) on all of them, which is where the black Hummer
+ * roof came from. */
 
 /* Find this mesh's bound diffuse: scan its 0x134012 texture-slot list (8-byte
  * entries: key + 0) for a key present in the car's TPK (keys[]). 0 if none. */
@@ -1070,14 +1252,21 @@ static uint32_t n2_resolve_key(uint32_t v, const uint32_t *keys, int nkeys) {
  * 1143 = the whole index list), which is what confirms the field roles.
  * mat_id is NOT the same field as the flag at +32: BODY_A's last record has
  * mat_id 1 but flag 2, and BODY_A only HAS two slots. */
-typedef struct { uint32_t start, count, mat; } N2Sub;
 static int n2_mesh_submeshes(const unsigned char *d, long beg, long end,
                              N2Sub *out, int cap) {
     N2Leaf sm[4]; int nsm = 0;
     n2_find_leaves(d, beg, end, 0x00134B02u, sm, &nsm, 4);
     if (nsm != 1) return 0;                     /* only the simple case */
     const unsigned char *p = d + sm[0].off; long ls = sm[0].size;
-    int pad = n2_skip_filler(p, (int)ls);
+    /* This leaf's filler is whole 0x1111 u16 words, exactly like the index leaf.
+     * n2_skip_filler eats single 0x11 bytes, so a record whose first bbox float
+     * merely ENDS in 0x11 lost one data byte and the leaf then failed body%60
+     * (measured: 12 L4RA objects, every one 60k-1 after the byte skip; skipping
+     * in pairs gives 60k for all of them -- M104). Local to this leaf; the
+     * global n2_skip_filler is unchanged because the vertex and index leaves
+     * depend on its current behaviour. */
+    int pad = 0;
+    while (pad + 2 <= (int)ls && p[pad] == 0x11 && p[pad+1] == 0x11) pad += 2;
     long body = ls - pad;
     if (body <= 0 || body % 60 || body / 60 > cap) return 0;
     int n = (int)(body / 60);
@@ -1131,8 +1320,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
             if (n2_car_is_variant(d, ds, ds + s, cfg, &vkind, &vnum, &vfam)) { o = ds + s; continue; }
             int cat = n2_car_category(d, ds, ds + s);
             int trim = cat == N2_CAR_BODY && n2_car_is_trim(d, ds, ds + s);
-            int roof = cat == N2_CAR_BODY && !trim && n2_car_is_roof(d, ds, ds + s);
-            uint32_t nk2 = n2_car_name_key(d, ds, ds + s);   /* LOD family, resolved after the walk */
+                        uint32_t nk2 = n2_car_name_key(d, ds, ds + s);   /* LOD family, resolved after the walk */
             uint32_t tk = n2_mesh_texkey(d, ds, ds + s, keys, nkeys);
             N2Leaf vtx[64], idx[64]; int nv = 0, ni = 0;
             n2_find_leaves(d, ds, ds + s, 0x00134B01u, vtx, &nv, 64);
@@ -1163,8 +1351,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                                 subtex[k], NULL, sub[k].start, sub[k].count);
                     if (scene->count > before) {
                         scene->meshes[before].trim = trim;
-                        scene->meshes[before].roof = roof;
-                        /* The dominant slice keeps the plain family key so it
+                                                /* The dominant slice keeps the plain family key so it
                            still dedupes against LOD tiers that never split
                            (a lower tier can lack the badge slot entirely, so
                            it stays whole); the small extra slices get their
@@ -1183,8 +1370,7 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                     n2_add_pair(d, vtx[k], idx[k], cat, scene, 36, 28, 0, tk, NULL, 0, -1);
                     if (scene->count > before) {
                         scene->meshes[before].trim = trim;
-                        scene->meshes[before].roof = roof;
-                        scene->meshes[before].namekey = nk2;
+                                                scene->meshes[before].namekey = nk2;
                         scene->meshes[before].vkind = vkind;
                         scene->meshes[before].vnum = vnum;
                         scene->meshes[before].famkey = vfam;

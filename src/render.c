@@ -282,7 +282,7 @@ GpuMesh *upload_scene(N2Scene *s) {
         glGenBuffers(1,&gm[i].ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,gm[i].ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, m->nidx*sizeof(uint16_t), m->idx, GL_STATIC_DRAW);
         gm[i].nidx = m->nidx; gm[i].cat = m->cat; gm[i].texkey = m->texkey;
-        gm[i].trim = m->trim; gm[i].roof = m->roof;
+        gm[i].trim = m->trim;
         free(nor);
     }
     return gm;
@@ -394,6 +394,36 @@ static void batch_audit_report(const N2Scene *s, const BSortEnt *ent, int i0, in
                (int)offsetof(BatchedVertex, pos), (int)offsetof(BatchedVertex, uv),
                (int)offsetof(BatchedVertex, normal), (int)offsetof(BatchedVertex, col),
                (int)sizeof(BatchedVertex));
+        /* M98: UVs travel in the same vertex, so verify them the same way and
+           report the ranges the sampler will actually see. Diagnostic only. */
+        { int bad_uv = 0;
+          float su0=1e30f, sv0=1e30f, su1=-1e30f, sv1=-1e30f;
+          float bu0=1e30f, bv0=1e30f, bu1=-1e30f, bv1=-1e30f;
+          float x0=1e30f, y0=1e30f, z0=1e30f, x1=-1e30f, y1=-1e30f, z1=-1e30f;
+          for (int v = 0; v < m->nverts; v++) {
+              const float *p = m->verts + v*5;
+              const BatchedVertex *o = &bv[vo + v];
+              if (memcmp(o->uv, p + 3, 2*sizeof(float))) bad_uv++;
+              if (p[3]<su0)su0=p[3]; if (p[3]>su1)su1=p[3];
+              if (p[4]<sv0)sv0=p[4]; if (p[4]>sv1)sv1=p[4];
+              if (o->uv[0]<bu0)bu0=o->uv[0]; if (o->uv[0]>bu1)bu1=o->uv[0];
+              if (o->uv[1]<bv0)bv0=o->uv[1]; if (o->uv[1]>bv1)bv1=o->uv[1];
+              if (p[0]<x0)x0=p[0]; if (p[0]>x1)x1=p[0];
+              if (p[1]<y0)y0=p[1]; if (p[1]>y1)y1=p[1];
+              if (p[2]<z0)z0=p[2]; if (p[2]>z1)z1=p[2];
+          }
+          printf("texkey                           %08x\n", m->texkey);
+          printf("source UV  min/max               u[%.4f %.4f] v[%.4f %.4f]  span %.3f x %.3f\n",
+                 su0, su1, sv0, sv1, su1-su0, sv1-sv0);
+          printf("batched UV min/max               u[%.4f %.4f] v[%.4f %.4f]\n",
+                 bu0, bu1, bv0, bv1);
+          printf("world span                       X %.3f Y %.3f Z %.3f  (m)\n",
+                 x1-x0, y1-y0, z1-z0);
+          printf("texels per metre (u,v vs X,Y)    %.4f / %.4f  [UV span / world span]\n",
+                 (x1-x0) > 1e-6f ? (su1-su0)/(x1-x0) : 0.0f,
+                 (y1-y0) > 1e-6f ? (sv1-sv0)/(y1-y0) : 0.0f);
+          printf("UVs mismatched                   %d/%d\n", bad_uv, m->nverts);
+        }
         printf("positions mismatched %d/%d   indices mismatched %d/%d",
                bad_pos, m->nverts, bad_idx, m->nidx);
         if (first_bad >= 0) printf("   (first bad vertex %d)", first_bad);

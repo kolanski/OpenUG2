@@ -181,7 +181,11 @@ void world_ground_normal(const N2Scene *s, float x, float y, float n[3]);
 
 /* Push the car circle (centre pos[3], radius r) out of any near-vertical
    guardrail/fence face baked into the road/terrain. Returns 1 if it pushed. */
-int world_wall_push(const N2Scene *s, float *pos, float r);
+/* Report-only record of the first triangle that satisfied the push test, filled
+ * during the SAME pass before the shove (NULL to ignore). Purely diagnostic:
+ * the push itself is unchanged. */
+typedef struct { int mesh, tri; float nz, zlo, zhi, edged; } WRailHit;
+int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit);
 
 /* Decode the scripted-object entity DEFINITIONS (name + FNV-32 hash + local
  * OBB extents) from each loaded district's companion L4R*.BUN, deduped by

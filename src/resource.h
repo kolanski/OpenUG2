@@ -22,11 +22,14 @@ int res_list_tracks(const char *troot, char (*list)[64], int max,
 int res_list_cars(const char *dataroot, char (*list)[64], int max,
                   const char *cur, int *sel);
 
-/* Enumerate selectable circuits: closed-loop ROUTES* Paths*.bin (first
- * waypoint ~= last) whose centroid lies within the track footprint given by
- * mn/mx (+30% margin), so switching route never flings the cars off the
- * rendered map. Paths are written relative to troot ("ROUTESX/PathsN.bin"). */
-int res_list_circuits(const char *troot, char (*list)[256], int max,
-                      const float mn[3], const float mx[3]);
+/* Enumerate the selected region's own selectable circuits: closed-loop
+ * Paths*.bin (first waypoint ~= last) from the ONE route directory that
+ * belongs to trackname -- STREAML4RA -> ROUTESL4RA, a 1:1 shipped mapping
+ * (M87: every race catalog lives in exactly one region directory, and no
+ * event references a second bundle). trackname "ALL" returns 0: a blind union
+ * of bundles is not a valid race world (M86), so it offers no circuits.
+ * Paths are written relative to troot ("ROUTESX/PathsN.bin"). */
+int res_list_circuits(const char *troot, const char *trackname,
+                      char (*list)[256], int max);
 
 #endif

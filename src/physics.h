@@ -35,15 +35,28 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
 
 /* Push (pos.xy) out of any wall AABB (expanded by r) it penetrates, along the
  * least-penetration axis; zero the into-wall velocity so the car slides along
- * the face. Returns the number of walls resolved. */
-int collide_walls(float *pos, float *vel, const float obst[][4], int nobst, float r);
+ * the face. Returns the number of walls resolved.
+ *
+ * obz is the per-obstacle {z0,z1} span from the same phys_collect_walls pass,
+ * and [cz0,cz1] is the car's own world-space vertical extent: an obstacle whose
+ * Z span does not overlap the car's is skipped, so a deck or overhang the car
+ * is under (or over) no longer blocks it in XY (M94: a 6.1 m slab 5.3 m ABOVE
+ * the car produced 68 responses). Pass obz = NULL to disable the Z test and get
+ * the original XY-only behaviour. */
+int collide_walls(float *pos, float *vel, const float obst[][4],
+                  const float obz[][2], int nobst, float r, float cz0, float cz1);
 void collide_walls_selftest(void);
 void phys_selftest(void);   /* asserts the NFSU2 velocity tuning targets */
 
 /* Collect building collision footprints: the 2D (XY) bounding box of every
  * tall N2_OTHER mesh. Flat props/signs/road paint are skipped so they don't
  * block the road. Returns the number of AABBs written. */
-int phys_collect_walls(const N2Scene *s, float (*obst)[4], int max);
+/* Same selection pass, plus an optional parallel array of the SOURCE mesh index
+ * each rect came from (pass NULL to ignore). Selection semantics are unchanged;
+ * src exists so a diagnostic can name the mesh behind a collision response
+ * without re-implementing the predicate. */
+int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
+                       float (*obz)[2], int max);
 
 /* Circle-separate the player from each AI and the AIs from each other.
  * Player is pushed at half weight each way; a bump scrubs a little player
