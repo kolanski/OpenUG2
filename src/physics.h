@@ -44,10 +44,33 @@ typedef struct {
 extern const PhysSurface PHYS_SURF_ROAD;
 extern const PhysSurface PHYS_SURF_TERRAIN;
 
-/* sf == NULL is the road profile. */
+/* What the CAR's own measured geometry does to the arcade model, as bounded
+ * multipliers on the constants above. Built by phys_vehicle_from_geometry();
+ * NULL is a neutral car (all 1.0), which is what the self-tests use. */
+typedef struct {
+    float accel;   /* thrust multiplier      (mass proxy: body volume)      */
+    float brake;   /* braking multiplier     (same proxy)                   */
+    float steer;   /* steering authority     (axle wheelbase)               */
+    float lat;     /* lateral-retention mult (tyre width, track width)      */
+} PhysVehicle;
+
+/* Fleet medians measured over all 44 drivable cars (--fleet-census, M121).
+ * They are the normalisation basis, not per-car values. */
+#define PHYS_FLEET_VOLUME   11.8908f   /* m^3, body AABB L*W*H */
+#define PHYS_FLEET_WHEELBASE 2.7896f   /* m, front axle - rear axle */
+#define PHYS_FLEET_TRACK     1.5004f   /* m, front track */
+#define PHYS_FLEET_TYREW     0.2243f   /* m, tyre width */
+
+/* Derive one car's profile from measurements only: body volume as the mass and
+ * inertia proxy, axle wheelbase for steering authority, tyre and track width for
+ * lateral grip. Every factor is clamped, so a bus cannot invert the model. */
+PhysVehicle phys_vehicle_from_geometry(float body_len, float body_wid, float body_hgt,
+                                       float wheelbase, float track, float tyre_w);
+
+/* sf == NULL is the road profile; vh == NULL is a neutral car. */
 float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
                     float throttle, float steer, int handbrake,
-                    const PhysSurface *sf);
+                    const PhysSurface *sf, const PhysVehicle *vh);
 
 /* Push (pos.xy) out of any wall AABB (expanded by r) it penetrates, along the
  * least-penetration axis; zero the into-wall velocity so the car slides along

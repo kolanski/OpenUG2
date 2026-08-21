@@ -478,6 +478,7 @@ typedef struct { int grp; long f; } M94Ev;
 #define M94_MAXEV 256
 static M94Ev m94ev[M94_MAXEV]; static int m94nev = 0;
 static float m94_prex, m94_prey, m94_prez;   /* car pose before this frame's pushes */
+static PhysVehicle g_vehicle = { 1.0f, 1.0f, 1.0f, 1.0f };   /* M121: this car */
 static int   g_m107 = 0;          /* M107: three-heading menu capture, audit only */
 static float g_m107_h[3];
 
@@ -1062,6 +1063,8 @@ int main(int argc, char **argv) {
     int gaudit = 0;   /* --grid-audit EVENTID (M118) */
     int rband = 0;    /* --rail-band (M119): whole-region rail-predicate survey */
     int rtrace = 0;   /* --race-trace (M120): gate targeting + route forensics */
+    int fleetc = 0;   /* --fleet-census (M121): measured geometry of every car */
+    const char *vcmpA = NULL, *vcmpB = NULL;   /* --vehicle-compare A B (M121) */
     int shovr = 0; float shx = 0, shy = 0;
     const char *baudit = NULL, *bmesh = NULL;   /* --batch-audit REGION MESHNAME */
     int vcensus = 0;   /* --vista-census: measure every region's backdrop candidates */
@@ -1114,6 +1117,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--grid-audit") && i+1 < argc) gaudit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rail-band")) rband = 1;
         else if (!strcmp(argv[i], "--race-trace")) rtrace = 1;
+        else if (!strcmp(argv[i], "--fleet-census")) fleetc = 1;
+        else if (!strcmp(argv[i], "--vehicle-compare") && i+2 < argc) {
+            vcmpA = argv[++i]; vcmpB = argv[++i]; }
         else if (!strcmp(argv[i], "--wall-probe") && i+3 < argc) {
             wprobe = argv[++i]; wpx = (float)atof(argv[++i]); wpy = (float)atof(argv[++i]);
             if (i+1 < argc && (isdigit((unsigned char)argv[i+1][0]) ||
@@ -1161,6 +1167,107 @@ int main(int argc, char **argv) {
     }
     if (sstatic) { shot = sshot; shotframes = 8; }   /* fixed settle: reproducible */
     if (carinfo) return dump_car_info(dataroot, carinfo);   /* inspect one car, GL-free, exit */
+    if (vcmpA) {   /* M121: same fixed input trace, two cars, flat ROAD. GL-free. */
+        const char *nmv[2] = { vcmpA, vcmpB };
+        PhysVehicle pv[2];
+        printf("MILESTONE: 121  vehicle comparison on flat ROAD (identical inputs)\n");
+        for (int c = 0; c < 2; c++) {
+            char gp2[1024]; snprintf(gp2, sizeof gp2, "%s/CARS/%s/GEOMETRY.BIN", dataroot, nmv[c]);
+            long gl2 = 0; unsigned char *gd2 = n2_read_file(gp2, &gl2);
+            pv[c] = phys_vehicle_from_geometry(0,0,0,0,0,0);
+            if (!gd2) { printf("  %s: cannot read %s\n", nmv[c], gp2); continue; }
+            N2Scene cs = {0}; N2CarConfig cc0 = {0,0,0,0}; uint32_t nk2[1]; int dmy = 0;
+            if (n2_load_car(gd2, gl2, &cs, nk2, 0, &cc0) > 0) {
+                N2CarProfile cp; memset(&cp, 0, sizeof cp);
+                n2_car_profile(&cs, nmv[c], WHEEL_SEED_FRONTF, WHEEL_SEED_REARF,
+                               WHEEL_SEED_TRACKF, n2_car_brake_radius(gd2, 0, gl2), &cp);
+                VehicleWheelConfig wc = wheel_config_for(nmv[c], &cp, NULL, 0, &dmy);
+                float bl = cp.body[1]-cp.body[0], bw = cp.body[3]-cp.body[2],
+                      bh = cp.body[5]-cp.body[4];
+                pv[c] = phys_vehicle_from_geometry(bl, bw, bh,
+                          wc.front_axle - wc.rear_axle, wc.front_track, cp.wheel_w);
+                printf("  %-10s body %.3f x %.3f x %.3f  wb %.3f track %.3f tyre %.3f\n",
+                       nmv[c], bl, bw, bh, wc.front_axle - wc.rear_axle,
+                       wc.front_track, cp.wheel_w);
+                printf("             factors accel %.4f brake %.4f steer %.4f lat %.4f\n",
+                       pv[c].accel, pv[c].brake, pv[c].steer, pv[c].lat);
+            }
+            for (int k = 0; k < cs.count; k++) { free(cs.meshes[k].verts);
+                free(cs.meshes[k].idx); free(cs.meshes[k].vcol); }
+            free(cs.meshes); free(gd2);
+        }
+        printf("  %-10s %10s %10s %12s %12s %10s\n", "car", "0-100 s", "top km/h",
+               "turn rad m", "yaw 2s deg", "slide");
+        for (int c = 0; c < 2; c++) {
+            /* 0-100 and settled top speed, straight line */
+            float p[3]={0,0,0}, v[2]={0,0}, h=0, sp=0; int t100=-1;
+            for (int t = 1; t <= 60*60; t++) {
+                phys_car_step(p, v, &h, &sp, 1.0f, 0, 0, &PHYS_SURF_ROAD, &pv[c]);
+                if (t100 < 0 && PHYS_KMH(sp) >= 100.0f) t100 = t;
+            }
+            float top = PHYS_KMH(sp);
+            /* steady 50 km/h, full lock for 2 s: yaw swept and the radius it implies */
+            float p2[3]={0,0,0}, v2[2], h2=0, s2=0, slide=0;
+            v2[0]=50.0f/3.6f/PHYS_TICKRATE; v2[1]=0;
+            float h0 = h2; double dist = 0;
+            for (int t = 0; t < 120; t++) {
+                float bx = p2[0], by = p2[1];
+                slide = phys_car_step(p2, v2, &h2, &s2, 1.0f, 1.0f, 0,
+                                      &PHYS_SURF_ROAD, &pv[c]);
+                dist += sqrt((double)((p2[0]-bx)*(p2[0]-bx) + (p2[1]-by)*(p2[1]-by)));
+            }
+            float yaw = h2 - h0;
+            float rad = yaw > 1e-4f ? (float)(dist / yaw) : 0.0f;
+            printf("  %-10s %10.3f %10.2f %12.2f %12.2f %10.5f\n", nmv[c],
+                   t100 < 0 ? -1.0f : t100/60.0f, top, rad, yaw*57.29578f, slide);
+        }
+        printf("\n");
+        return 0;
+    }
+    if (fleetc) {   /* M121: measured geometry of every drivable car, GL-free, exit */
+        enum { FC_MAXCARS = 128 };
+        static char cl[FC_MAXCARS][64]; int sel2 = 0;
+        int nc = res_list_cars(dataroot, cl, FC_MAXCARS, "", &sel2);
+        printf("MILESTONE: 121  fleet geometry census  (%d cars)\n", nc);
+        printf("  %-14s %7s %7s %7s %9s %7s %7s %8s %8s\n", "car", "len", "wid", "hgt",
+               "volume", "wheelR", "wheelW", "axleWB", "trackF");
+        static float vol[FC_MAXCARS], wbv[FC_MAXCARS], trk[FC_MAXCARS], twd[FC_MAXCARS];
+        int n = 0;
+        for (int i = 0; i < nc; i++) {
+            char gp2[1024]; snprintf(gp2, sizeof gp2, "%s/CARS/%s/GEOMETRY.BIN", dataroot, cl[i]);
+            long gl2 = 0; unsigned char *gd2 = n2_read_file(gp2, &gl2);
+            if (!gd2) continue;
+            N2Scene cs = {0}; N2CarConfig cc0 = { 0, 0, 0, 0 };
+            uint32_t nk2[1];
+            int nmc = n2_load_car(gd2, gl2, &cs, nk2, 0, &cc0);
+            if (nmc > 0) {
+                N2CarProfile cp; memset(&cp, 0, sizeof cp);
+                n2_car_profile(&cs, cl[i], WHEEL_SEED_FRONTF, WHEEL_SEED_REARF,
+                               WHEEL_SEED_TRACKF, n2_car_brake_radius(gd2, 0, gl2), &cp);
+                float L = cp.body[1]-cp.body[0], W = cp.body[3]-cp.body[2],
+                      H = cp.body[5]-cp.body[4];
+                VehicleWheelConfig wc = wheel_config_for(cl[i], &cp, NULL, 0, &sel2);
+                float wb = wc.front_axle - wc.rear_axle;
+                printf("  %-14s %7.3f %7.3f %7.3f %9.3f %7.3f %7.3f %8.3f %8.3f\n",
+                       cl[i], L, W, H, L*W*H, cp.wheel_r, cp.wheel_w, wb, wc.front_track);
+                vol[n] = L*W*H; wbv[n] = wb; trk[n] = wc.front_track; twd[n] = cp.wheel_w; n++;
+            }
+            for (int k = 0; k < cs.count; k++) {
+                free(cs.meshes[k].verts); free(cs.meshes[k].idx); free(cs.meshes[k].vcol); }
+            free(cs.meshes); free(gd2);
+        }
+        { /* medians: sort copies, take the middle */
+            float *a[4] = { vol, wbv, trk, twd };
+            const char *nmz[4] = { "body volume", "axle wheelbase", "front track", "tyre width" };
+            for (int k = 0; k < 4; k++) {
+                for (int p2 = 1; p2 < n; p2++) { float v = a[k][p2]; int q = p2-1;
+                    while (q >= 0 && a[k][q] > v) { a[k][q+1] = a[k][q]; q--; } a[k][q+1] = v; }
+                printf("  median %-16s %.4f   (min %.4f max %.4f, n=%d)\n",
+                       nmz[k], a[k][n/2], a[k][0], a[k][n-1], n);
+            }
+        }
+        return 0;
+    }
     char carp[1024], cartexp[1024], pathp[1024], troot[1024];
     snprintf(troot,   sizeof troot,   "%s/TRACKS", dataroot);
     snprintf(carp,    sizeof carp,    "%s/CARS/%s/GEOMETRY.BIN", dataroot, carname);
@@ -2420,6 +2527,23 @@ int main(int argc, char **argv) {
         wR = carprof.wheel_r; wHW = 0.5f * carprof.wheel_w;
         if (wHW < 0.04f) wHW = 0.04f;
         carWheelR = carprof.wheel_r;               /* aftermarket rims fit to this */
+        /* M121: this car's handling comes from its own measurements -- body AABB,
+           AttribSys axle line and the tyre mesh -- normalised against the fleet
+           medians, never from a per-car table. */
+        {
+            float bl = carbb[3]-carbb[0], bw = carbb[4]-carbb[1], bh = carbb[5]-carbb[2];
+            float wb = g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle;
+            g_vehicle = phys_vehicle_from_geometry(bl, bw, bh, wb,
+                                                   g_dbg.wheel.front_track, carprof.wheel_w);
+            printf("vehicle profile %-12s body %.3f x %.3f x %.3f = %.3f m3  wb %.3f  "
+                   "track %.3f  tyre %.3f\n", carname, bl, bw, bh, bl*bw*bh, wb,
+                   g_dbg.wheel.front_track, carprof.wheel_w);
+            printf("  fleet-normalised  volume %.4f  wheelbase %.4f  track %.4f  tyre %.4f\n",
+                   (bl*bw*bh)/PHYS_FLEET_VOLUME, wb/PHYS_FLEET_WHEELBASE,
+                   g_dbg.wheel.front_track/PHYS_FLEET_TRACK, carprof.wheel_w/PHYS_FLEET_TYREW);
+            printf("  active factors    accel %.4f  brake %.4f  steer %.4f  lat %.4f\n",
+                   g_vehicle.accel, g_vehicle.brake, g_vehicle.steer, g_vehicle.lat);
+        }
         printf("wheel stance %-12s axle F%+.3f R%+.3f (wb %.3f)  track F%.3f R%.3f  ride %+.3f  [%s]\n",
                carprof.name, g_dbg.wheel.front_axle, g_dbg.wheel.rear_axle,
                g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle,
@@ -3919,7 +4043,7 @@ int main(int argc, char **argv) {
         float dmag = sstatic ? 0.0f
                    : race_auto ? speed/60.0f
                    : phys_car_step(carpos, vel, &heading, &speed,
-                                   throttle, steer, handbrake, &surf_now);
+                                   throttle, steer, handbrake, &surf_now, &g_vehicle);
         float nf[2] = { cosf(heading), sinf(heading) }, nr[2] = { nf[1], -nf[0] };
         /* engine note: 6-speed virtual gearbox drives RPM + load; shifts cut
            the throttle for 150ms and let the revs sag (idles during the

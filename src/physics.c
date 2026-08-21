@@ -26,10 +26,37 @@ const PhysSurface PHYS_SURF_ROAD    = { 1.00f, 1.00f, PHYS_FRICTION, PHYS_GRIP, 
  * so a hill has to be climbed slowly and slid across instead of railed up. */
 const PhysSurface PHYS_SURF_TERRAIN = { 0.55f, 0.50f, 0.99800f,     0.94f,     0.75f };
 
+static float pv_clamp(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+PhysVehicle phys_vehicle_from_geometry(float body_len, float body_wid, float body_hgt,
+                                       float wheelbase, float track, float tyre_w) {
+    PhysVehicle v = { 1.0f, 1.0f, 1.0f, 1.0f };
+    float vol = body_len * body_wid * body_hgt;
+    if (vol > 1e-3f) {
+        /* mass/inertia proxy: sqrt so the 17x volume spread across the fleet
+           (8.3 to 141.7 m^3) cannot swamp the model before the clamp does */
+        float m = sqrtf(PHYS_FLEET_VOLUME / vol);
+        v.accel = pv_clamp(m, 0.75f, 1.25f);
+        v.brake = pv_clamp(m, 0.75f, 1.25f);
+    }
+    if (wheelbase > 0.5f)
+        v.steer = pv_clamp(PHYS_FLEET_WHEELBASE / wheelbase, 0.80f, 1.20f);
+    if (tyre_w > 0.02f && track > 0.5f) {
+        /* wider tyre and wider track = less sideways scrub. lat is RETENTION,
+           so a grippier car gets a smaller multiplier. */
+        float g = sqrtf(PHYS_FLEET_TYREW / tyre_w)
+                * powf(PHYS_FLEET_TRACK / track, 0.25f);
+        v.lat = pv_clamp(g, 0.90f, 1.10f);
+    }
+    return v;
+}
+
 float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
                     float throttle, float steer, int handbrake,
-                    const PhysSurface *sf) {
+                    const PhysSurface *sf, const PhysVehicle *vh) {
+    static const PhysVehicle NEUTRAL = { 1.0f, 1.0f, 1.0f, 1.0f };
     if (!sf) sf = &PHYS_SURF_ROAD;
+    if (!vh) vh = &NEUTRAL;
     float top = g_phys_tune.top_kmh / 3.6f / PHYS_TICKRATE * sf->topfrac;
     float hf[2] = { cosf(*heading), sinf(*heading) };
     float fwd = vel[0]*hf[0] + vel[1]*hf[1];   /* signed forward speed */
@@ -37,11 +64,12 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
         /* throttle tapers as speed builds: punchy off the line, eases near top */
         float sp = *speed < 0 ? -*speed : *speed;
         float a = PHYS_ACCEL * g_phys_tune.accel * (1.15f - 0.55f*sp/PHYS_MAXSPD)
-                  * throttle * sf->accel;
+                  * throttle * sf->accel * vh->accel;
         vel[0] += hf[0]*a; vel[1] += hf[1]*a;
     } else if (throttle < 0) {
         /* moving forward = brakes (strong); at rest / rolling back = reverse */
-        float a = PHYS_ACCEL * (fwd > 0.01f ? BRAKE_ACCEL*g_phys_tune.brake : REVERSE_ACCEL);
+        float a = PHYS_ACCEL * (fwd > 0.01f ? BRAKE_ACCEL*g_phys_tune.brake*vh->brake
+                                            : REVERSE_ACCEL);
         vel[0] += hf[0]*a*throttle; vel[1] += hf[1]*a*throttle;
     } else {
         vel[0] *= COAST_DRAG; vel[1] *= COAST_DRAG;
@@ -52,13 +80,17 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
     float sfac = spd/(PHYS_MAXSPD*TURN_RAMP_FRAC); if (sfac > 1) sfac = 1;
     float hifrac = spd/PHYS_MAXSPD; if (hifrac > 1) hifrac = 1;
     *heading += steer * PHYS_TURN * g_phys_tune.turn * sfac
-                * (1.0f - TURN_HISPD_DROP*hifrac) * dir * sf->steer;
+                * (1.0f - TURN_HISPD_DROP*hifrac) * dir * sf->steer * vh->steer;
     /* decompose velocity in the new heading frame, clamp forward, scrub side */
     float nf[2] = { cosf(*heading), sinf(*heading) }, nr[2] = { nf[1], -nf[0] };
     float vf = vel[0]*nf[0]+vel[1]*nf[1], vl = vel[0]*nr[0]+vel[1]*nr[1];
     if (vf >  top) vf =  top;
     if (vf < -top*REVERSE_SPD_FRAC) vf = -top*REVERSE_SPD_FRAC;
-    vl *= handbrake ? HANDBRAKE_GRIP : sf->lat;
+    /* surface and vehicle both scale retention; keep the product a contraction
+       so a slide can never be amplified. */
+    { float lat = sf->lat * vh->lat;
+      if (lat > 0.99f) lat = 0.99f; if (lat < 0.50f) lat = 0.50f;
+      vl *= handbrake ? HANDBRAKE_GRIP : lat; }
     vel[0] = nf[0]*vf + nr[0]*vl; vel[1] = nf[1]*vf + nr[1]*vl;
     *speed = vf;                      /* forward speed, for HUD/collision */
     pos[0] += vel[0]; pos[1] += vel[1];
@@ -71,7 +103,7 @@ void phys_selftest(void) {
     float pos[3]={0,0,0}, vel[2]={0,0}, h=0, spd=0;
     int t100 = -1;
     for (int t = 1; t <= 60*60; t++) {
-        phys_car_step(pos, vel, &h, &spd, 1.0f, 0, 0, NULL);
+        phys_car_step(pos, vel, &h, &spd, 1.0f, 0, 0, NULL, NULL);
         if (t100 < 0 && PHYS_KMH(spd) >= 100.0f) t100 = t;
     }
     assert(t100 > 2*60 && t100 < 6*60);
@@ -80,7 +112,7 @@ void phys_selftest(void) {
     vel[0] = cosf(h)*100.0f/3.6f/PHYS_TICKRATE; vel[1] = sinf(h)*100.0f/3.6f/PHYS_TICKRATE;
     int tstop = -1;
     for (int t = 1; t <= 8*60 && tstop < 0; t++) {
-        phys_car_step(pos, vel, &h, &spd, -1.0f, 0, 0, NULL);
+        phys_car_step(pos, vel, &h, &spd, -1.0f, 0, 0, NULL, NULL);
         if (spd <= 0.0f) tstop = t;
     }
     assert(tstop > 0 && tstop < 5*60);
@@ -92,8 +124,8 @@ void phys_selftest(void) {
         float rp[3]={0,0,0}, rv[2]={0,0}, rh=0, rs=0;
         float tp[3]={0,0,0}, tv[2]={0,0}, th=0, ts=0;
         for (int t = 0; t < 60*60; t++) {
-            phys_car_step(rp, rv, &rh, &rs, 1.0f, 0, 0, &PHYS_SURF_ROAD);
-            phys_car_step(tp, tv, &th, &ts, 1.0f, 0, 0, &PHYS_SURF_TERRAIN);
+            phys_car_step(rp, rv, &rh, &rs, 1.0f, 0, 0, &PHYS_SURF_ROAD, NULL);
+            phys_car_step(tp, tv, &th, &ts, 1.0f, 0, 0, &PHYS_SURF_TERRAIN, NULL);
         }
         assert(PHYS_KMH(ts) < 0.65f * PHYS_KMH(rs));   /* materially slower */
         assert(PHYS_KMH(ts) > 5.0f);                   /* still drivable */
@@ -104,10 +136,49 @@ void phys_selftest(void) {
         av[0]=bv[0]=30.0f/3.6f/PHYS_TICKRATE; av[1]=bv[1]=0;
         float dr = 0, dt2 = 0;
         for (int t = 0; t < 30; t++) {
-            dr  = phys_car_step(ap, av, &ah, &as2, 1.0f, 1.0f, 0, &PHYS_SURF_ROAD);
-            dt2 = phys_car_step(bp, bv, &bh, &bs,  1.0f, 1.0f, 0, &PHYS_SURF_TERRAIN);
+            dr  = phys_car_step(ap, av, &ah, &as2, 1.0f, 1.0f, 0, &PHYS_SURF_ROAD, NULL);
+            dt2 = phys_car_step(bp, bv, &bh, &bs,  1.0f, 1.0f, 0, &PHYS_SURF_TERRAIN, NULL);
         }
         assert(dt2 > dr);                              /* more lateral slide */
+    }
+
+    /* --- vehicle profiles (M121) ---------------------------------------------
+     * Geometry-derived factors must stay inside their clamps for anything the
+     * fleet can hand us, including the extremes (8.3 m^3 hatchback, 141.7 m^3
+     * bus) and degenerate/missing measurements. */
+    {
+        const float ex[][6] = {
+            {  3.9f, 1.9f, 1.2f, 2.43f, 1.43f, 0.188f },   /* smallest measured */
+            {  4.8f, 2.5f, 1.8f, 3.11f, 1.76f, 0.284f },   /* HUMMER */
+            { 12.0f, 2.6f, 4.5f, 7.88f, 2.63f, 0.489f },   /* largest measured */
+            {  0.0f, 0.0f, 0.0f, 0.00f, 0.00f, 0.000f },   /* nothing measured */
+        };
+        for (int i = 0; i < 4; i++) {
+            PhysVehicle v = phys_vehicle_from_geometry(ex[i][0], ex[i][1], ex[i][2],
+                                                       ex[i][3], ex[i][4], ex[i][5]);
+            assert(v.accel >= 0.75f && v.accel <= 1.25f);
+            assert(v.brake >= 0.75f && v.brake <= 1.25f);
+            assert(v.steer >= 0.80f && v.steer <= 1.20f);
+            assert(v.lat   >= 0.90f && v.lat   <= 1.10f);
+        }
+        /* a neutral profile must reproduce the NULL path exactly */
+        PhysVehicle nv = { 1.0f, 1.0f, 1.0f, 1.0f };
+        float ap[3]={0,0,0}, av[2]={0,0}, ah=0, as3=0;
+        float bp[3]={0,0,0}, bv[2]={0,0}, bh=0, bs2=0;
+        for (int t = 0; t < 600; t++) {
+            phys_car_step(ap, av, &ah, &as3, 1.0f, 0.5f, 0, NULL, NULL);
+            phys_car_step(bp, bv, &bh, &bs2, 1.0f, 0.5f, 0, NULL, &nv);
+        }
+        assert(ap[0] == bp[0] && ap[1] == bp[1] && ah == bh && as3 == bs2);
+        /* braking still stops a heavy car: the slowest brake factor is 0.75 */
+        PhysVehicle hv = { 0.75f, 0.75f, 1.0f, 1.0f };
+        float cp2[3]={0,0,0}, cv[2], ch=0, cs3=0; int stop = -1;
+        cv[0]=100.0f/3.6f/PHYS_TICKRATE; cv[1]=0;
+        for (int t = 1; t <= 10*60 && stop < 0; t++) {
+            phys_car_step(cp2, cv, &ch, &cs3, -1.0f, 0, 0, NULL, &hv);
+            if (cs3 <= 0.0f) stop = t;
+        }
+        assert(stop > 0 && stop < 7*60);
     }
 }
 
