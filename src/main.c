@@ -1061,6 +1061,7 @@ int main(int argc, char **argv) {
     const char *wprobe = NULL; float wpx = 0, wpy = 0, wpz = 0; int wpzset = 0;
     int gaudit = 0;   /* --grid-audit EVENTID (M118) */
     int rband = 0;    /* --rail-band (M119): whole-region rail-predicate survey */
+    int rtrace = 0;   /* --race-trace (M120): gate targeting + route forensics */
     int shovr = 0; float shx = 0, shy = 0;
     const char *baudit = NULL, *bmesh = NULL;   /* --batch-audit REGION MESHNAME */
     int vcensus = 0;   /* --vista-census: measure every region's backdrop candidates */
@@ -1112,6 +1113,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rail-census")) world_rail_census = 1;
         else if (!strcmp(argv[i], "--grid-audit") && i+1 < argc) gaudit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rail-band")) rband = 1;
+        else if (!strcmp(argv[i], "--race-trace")) rtrace = 1;
         else if (!strcmp(argv[i], "--wall-probe") && i+3 < argc) {
             wprobe = argv[++i]; wpx = (float)atof(argv[++i]); wpy = (float)atof(argv[++i]);
             if (i+1 < argc && (isdigit((unsigned char)argv[i+1][0]) ||
@@ -3840,6 +3842,24 @@ int main(int argc, char **argv) {
                     int mode = world.mode; world.mode = MODE_FREEROAM;
                     rpn = world_route(&world, s, gnode, rpath, 8192, NULL);
                     world.mode = mode;
+                }
+                if (rtrace) {
+                    const WGate *G = &world.race.gate[world.race.next];
+                    float gz4 = 0;
+                    int c4 = world_ground_at(&scene, G->x, G->y, carpos[2], &gz4);
+                    printf("RT retarget: next=%d/%d  gate(%.3f %.3f) node %d  "
+                           "car(%.3f %.3f) start-node %d  route %d nodes  "
+                           "gate-support %s z %.3f  lap %d cleared %d\n",
+                           world.race.next, world.race.ngate, G->x, G->y, gnode,
+                           carpos[0], carpos[1], s, rpn,
+                           c4 == WSURF_ROAD ? "ROAD" : c4 == WSURF_TERRAIN ? "TERRAIN"
+                                                                           : "NONE", gz4,
+                           world.race.lap, world.race.cleared);
+                    if (rpn > 1)
+                        printf("RT   route ends at node %d (%.3f %.3f), gate node "
+                               "%d (%.3f %.3f)\n", rpath[rpn-1],
+                               world.nav[rpath[rpn-1]*2], world.nav[rpath[rpn-1]*2+1],
+                               gnode, world.nav[gnode*2], world.nav[gnode*2+1]);
                 }
                 rp_gate = world.race.next; rp_at = 0;
             }
