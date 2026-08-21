@@ -57,6 +57,11 @@ DbgState g_dbg = {
     .show_body = 1, .show_glass = 1, .show_lights = 1, .show_tires = 1,
     .show_misc = 1, .show_track = 1,
     .hud_hide_menu = 1,   /* only consulted under DEBUG_UI; see debug.h */
+    /* Momentary "switch to this car/track" requests. dbgui_frame() clears them
+       to -1 at the top of every panel build, so they MUST start at -1: a zero
+       default is a valid list index, and with the panel hidden (M122) nothing
+       would ever clear it -- main.c would relaunch the process every frame. */
+    .want_car = -1, .want_track = -1,
 };
 
 /* ---- Per-car wheel stance ------------------------------------------------
@@ -478,6 +483,12 @@ typedef struct { int grp; long f; } M94Ev;
 #define M94_MAXEV 256
 static M94Ev m94ev[M94_MAXEV]; static int m94nev = 0;
 static float m94_prex, m94_prey, m94_prez;   /* car pose before this frame's pushes */
+/* Developer overlay master switch (M122). Off at launch in EVERY build, so the
+ * game opens on a clean world/car view; F1 shows the ImGui panels (debug builds)
+ * and the provisional pixel-font viewport HUD (both builds) together. Nothing is
+ * deleted -- while it is off the ImGui frame is not built at all, so ImGui takes
+ * no mouse or keyboard and gameplay input is untouched. */
+static int g_devui = 0;
 static PhysVehicle g_vehicle = { 1.0f, 1.0f, 1.0f, 1.0f };   /* M121: this car */
 static int   g_m107 = 0;          /* M107: three-heading menu capture, audit only */
 static float g_m107_h[3];
@@ -3710,9 +3721,17 @@ int main(int argc, char **argv) {
         }
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F1 &&
+                !e.key.repeat) {
+                g_devui = !g_devui;
+                printf("developer overlay: %s\n", g_devui ? "on (F1)" : "off (F1)");
+                continue;
+            }
 #ifdef DEBUG_UI
-            dbgui_event(&e);
-            if ((e.type==SDL_KEYDOWN||e.type==SDL_KEYUP) && dbgui_want_keyboard()) continue;
+            if (g_devui) {
+                dbgui_event(&e);
+                if ((e.type==SDL_KEYDOWN||e.type==SDL_KEYUP) && dbgui_want_keyboard()) continue;
+            }
 #endif
             if (e.type == SDL_QUIT) running = 0;
             /* freecam mouse-look: hold right button to rotate (keeps the cursor
@@ -5073,9 +5092,9 @@ int main(int argc, char **argv) {
             g_dbg.race_lap = p_lap<LAP_TARGET?p_lap+1:LAP_TARGET; g_dbg.race_laps = LAP_TARGET;
         } else g_dbg.race_cars = 0;   /* not racing: ImGui readout hides itself */
 #ifdef DEBUG_UI
-        int draw_race_hud = !g_dbg.hud_hide_menu;
+        int draw_race_hud = g_devui && !g_dbg.hud_hide_menu;
 #else
-        int draw_race_hud = 1;
+        int draw_race_hud = g_devui;
 #endif
         if (nai > 0 && race_state != 3 && draw_race_hud) {
             glDisable(GL_DEPTH_TEST);
@@ -5180,9 +5199,9 @@ int main(int argc, char **argv) {
            build (session info lives in the ImGui panel instead, see below) —
            re-enable it live with the panel's "show 3D menu HUD" checkbox.
            Plain (non-debug) builds always draw it: it is their ONLY UI. */
-        int draw_menu_hud = !g_dbg.hud_hide_menu;
+        int draw_menu_hud = g_devui && !g_dbg.hud_hide_menu;
 #else
-        int draw_menu_hud = 1;
+        int draw_menu_hud = g_devui;
 #endif
         if (race_state == 3 && draw_menu_hud) {
             /* car selector (Left/Right): a tight row of pips, chosen lit white */
@@ -5231,7 +5250,7 @@ int main(int argc, char **argv) {
             glUniform3f(uColor,0.15f*pulse,0.85f*pulse,0.3f*pulse);
             draw_gpumesh(&quad);
             g_dbg.drawn++;
-        } else if (race_state == 0) {         /* 3-2-1 / GO, big and centred */
+        } else if (draw_menu_hud && race_state == 0) {  /* 3-2-1 / GO, big and centred */
             if (racetimer >= COUNTDOWN-24) {
                 glUniform3f(uColor,0.2f,0.95f,0.3f);
                 draw_text(&quad, uMVP, "GO", -text_width("GO",0.13f)/2, 0.44f, 0.13f, 0.17f);
@@ -5240,7 +5259,7 @@ int main(int argc, char **argv) {
                 glUniform3f(uColor,0.95f,0.25f,0.15f);
                 draw_text(&quad, uMVP, b, -text_width(b,0.13f)/2, 0.44f, 0.13f, 0.17f);
             }
-        } else if (race_state == 2) {         /* finished: FINISH + place */
+        } else if (draw_menu_hud && race_state == 2) {  /* finished: FINISH + place */
             glUniform3f(uColor,0.95f,0.8f,0.2f);
             draw_text(&quad, uMVP, "FINISH", -text_width("FINISH",0.07f)/2, 0.36f, 0.07f, 0.10f);
             char b[16]; snprintf(b,sizeof b,"P%d/%d", finish_place, nai+1);
@@ -5345,8 +5364,10 @@ int main(int argc, char **argv) {
         if (g_dbg.wheel_style < 1) g_dbg.wheel_style = wheel_style;
         g_dbg.car_list = (const char (*)[64])carlist;
         g_dbg.track_list = (const char (*)[64])tracklist;
-        dbgui_frame();
-        dbgui_render();
+        if (g_devui) { dbgui_frame(); dbgui_render(); }
+        else { g_dbg.want_car = -1; g_dbg.want_track = -1;
+               g_dbg.mode_request = 0; g_dbg.race_start_request = 0;
+               g_dbg.race_stop_request = 0; }
         /* the Session panel's car/track combos ask for a switch the same
            way the arrow keys do: a clean process relaunch (see relaunch()
            above) — there's no in-place teardown/reload path for the ~30
