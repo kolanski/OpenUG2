@@ -1041,7 +1041,8 @@ int world_district_at(const World *w, float x, float y, float maxdist) {
    ROAD/TERRAIN only, barycentric coverage with the -0.01 edge tolerance, and
    the reference key that biases UP-steps by 3x so a curb lip above the car
    never beats the road just below it. */
-static int wg_pick(const N2Scene *s, float x, float y, float refz, float *outz) {
+static int wg_pick(const N2Scene *s, const int *srcmap, float x, float y, float refz,
+                   float *outz, float outn[3], WGroundHit *hit) {
     float best = 0.0f, bestkey = 1e30f; int found = 0, bestcat = WSURF_NONE;
     int highest = (refz >= N2_GROUND_HIGHEST);
     for (int m = 0; m < s->count; m++) {
@@ -1065,6 +1066,40 @@ static int wg_pick(const N2Scene *s, float x, float y, float refz, float *outz) 
             if (!found || key < bestkey) {
                 bestkey = key; best = z; found = 1;
                 bestcat = (mc == N2_ROAD) ? WSURF_ROAD : WSURF_TERRAIN;
+                if (hit) {
+                    hit->mesh = srcmap ? srcmap[m] : m;
+                    hit->tri = t / 3;
+                    hit->cat = bestcat;
+                    hit->z = z;
+                }
+                if (outn) {
+                    float e1x=b[0]-a[0], e1y=b[1]-a[1], e1z=b[2]-a[2];
+                    float e2x=c[0]-a[0], e2y=c[1]-a[1], e2z=c[2]-a[2];
+                    float nx=e1y*e2z-e1z*e2y;
+                    float ny=e1z*e2x-e1x*e2z;
+                    float nz=e1x*e2y-e1y*e2x;
+                    float nl=sqrtf(nx*nx+ny*ny+nz*nz);
+                    if (nl > 1e-9f) {
+                        if (nz < 0) { nx=-nx; ny=-ny; nz=-nz; }
+                        outn[0]=nx/nl; outn[1]=ny/nl; outn[2]=nz/nl;
+                    }
+                }
+                if (hit) {
+                    float *hn = hit->normal;
+                    if (outn) { hn[0]=outn[0]; hn[1]=outn[1]; hn[2]=outn[2]; }
+                    else {
+                        float e1x=b[0]-a[0], e1y=b[1]-a[1], e1z=b[2]-a[2];
+                        float e2x=c[0]-a[0], e2y=c[1]-a[1], e2z=c[2]-a[2];
+                        float nx=e1y*e2z-e1z*e2y;
+                        float ny=e1z*e2x-e1x*e2z;
+                        float nz=e1x*e2y-e1y*e2x;
+                        float nl=sqrtf(nx*nx+ny*ny+nz*nz);
+                        if (nl > 1e-9f) {
+                            if (nz < 0) { nx=-nx; ny=-ny; nz=-nz; }
+                            hn[0]=nx/nl; hn[1]=ny/nl; hn[2]=nz/nl;
+                        } else { hn[0]=0.0f; hn[1]=0.0f; hn[2]=1.0f; }
+                    }
+                }
             }
         }
     }
@@ -1072,30 +1107,208 @@ static int wg_pick(const N2Scene *s, float x, float y, float refz, float *outz) 
     return found ? bestcat : WSURF_NONE;
 }
 
-int world_ground_at(const N2Scene *s, float x, float y, float fallback, float *outz) {
+static int wg_at(const N2Scene *s, float x, float y, float fallback,
+                 float *outz, float outn[3], WGroundHit *hit) {
     /* `fallback` is the caller's current Z at every callsite, so it doubles as
        the layer reference: pick the surface nearest it, not the highest deck
        overhead (Phase 73). A sentinel fallback (|z| huge) means "no reference". */
     float refz = (fallback > -2000.0f && fallback < 4000.0f) ? fallback
                                                              : N2_GROUND_HIGHEST;
     *outz = fallback;
+    if (outn) { outn[0]=0.0f; outn[1]=0.0f; outn[2]=1.0f; }
+    if (hit) { hit->mesh=-1; hit->tri=-1; hit->cat=WSURF_NONE; hit->z=fallback;
+               hit->normal[0]=0.0f; hit->normal[1]=0.0f; hit->normal[2]=1.0f; }
     if (s->meshes != g_grid.meshes)                        /* not the loaded world */
-        return wg_pick(s, x, y, refz, outz);
+        return wg_pick(s, NULL, x, y, refz, outz, outn, hit);
     int cx = (int)((x - g_grid.x0) / GCELL), cy = (int)((y - g_grid.y0) / GCELL);
     if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) return WSURF_NONE;
     /* borrow the cell's meshes into a scratch scene and reuse the exact scan */
     static N2Mesh scratch[512];
+    static int srcmap[512];
     N2Scene sub = { scratch, 0, 512 };
     int c = cy*g_grid.gw + cx;
-    for (int k = g_grid.start[c]; k < g_grid.start[c+1] && sub.count < 512; k++)
-        scratch[sub.count++] = s->meshes[g_grid.list[k]];
-    return wg_pick(&sub, x, y, refz, outz);
+    for (int k = g_grid.start[c]; k < g_grid.start[c+1] && sub.count < 512; k++) {
+        int src = g_grid.list[k];
+        srcmap[sub.count] = src;
+        scratch[sub.count++] = s->meshes[src];
+    }
+    return wg_pick(&sub, srcmap, x, y, refz, outz, outn, hit);
+}
+
+/* Highest ROAD/TERRAIN triangle covering (x,y) inside [wz-down, wz+up]. Same
+   coverage test and the same grid fast path as wg_pick; only the acceptance
+   rule differs, so this cannot select a surface the wheel cannot reach. */
+static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
+                    float wz, float up, float down, WGroundHit *hit,
+                    WGroundHit *nearest, float *neard) {
+    int bestcat = WSURF_NONE; float bestad = 1e30f;
+    for (int m = 0; m < s->count; m++) {
+        int mc = s->meshes[m].cat;
+        if (mc != N2_ROAD && mc != N2_TERRAIN) continue;
+        const N2Mesh *me = &s->meshes[m];
+        for (int t = 0; t + 2 < me->nidx; t += 3) {
+            const float *a = me->verts + me->idx[t]*5;
+            const float *b = me->verts + me->idx[t+1]*5;
+            const float *c = me->verts + me->idx[t+2]*5;
+            float d = (b[1]-c[1])*(a[0]-c[0]) + (c[0]-b[0])*(a[1]-c[1]);
+            if (d > -1e-9f && d < 1e-9f) continue;
+            float u = ((b[1]-c[1])*(x-c[0]) + (c[0]-b[0])*(y-c[1])) / d;
+            float v = ((c[1]-a[1])*(x-c[0]) + (a[0]-c[0])*(y-c[1])) / d;
+            float w = 1.0f - u - v;
+            if (u < -0.01f || v < -0.01f || w < -0.01f) continue;
+            float z = u*a[2] + v*b[2] + w*c[2];
+            int cat = (mc == N2_ROAD) ? WSURF_ROAD : WSURF_TERRAIN;
+            float dz = z - wz, ad = dz < 0 ? -dz : dz;
+            if (ad < *neard) {                       /* remember for diagnostics */
+                *neard = ad;
+                if (nearest) { nearest->mesh = srcmap ? srcmap[m] : m; nearest->tri = t/3;
+                               nearest->cat = cat; nearest->z = z;
+                               nearest->normal[0]=0; nearest->normal[1]=0; nearest->normal[2]=1; }
+            }
+            if (dz > up || dz < -down) continue;     /* out of the wheel's reach */
+            /* CLOSEST candidate wins. This is what keeps a stacked deck out:
+               standing on ROAD at -9.114 the road itself is 0 m away, so the
+               TERRAIN 13 m overhead can never be selected -- no distance bias,
+               no reference flip. */
+            if (bestcat != WSURF_NONE && ad >= bestad) continue;
+            bestcat = cat; bestad = ad;
+            if (hit) {
+                hit->mesh = srcmap ? srcmap[m] : m; hit->tri = t/3;
+                hit->cat = cat; hit->z = z;
+                float e1x=b[0]-a[0], e1y=b[1]-a[1], e1z=b[2]-a[2];
+                float e2x=c[0]-a[0], e2y=c[1]-a[1], e2z=c[2]-a[2];
+                float nx=e1y*e2z-e1z*e2y, ny=e1z*e2x-e1x*e2z, nz=e1x*e2y-e1y*e2x;
+                float nl=sqrtf(nx*nx+ny*ny+nz*nz);
+                if (nl > 1e-9f) { if (nz < 0) { nx=-nx; ny=-ny; nz=-nz; }
+                                  hit->normal[0]=nx/nl; hit->normal[1]=ny/nl; hit->normal[2]=nz/nl; }
+                else { hit->normal[0]=0; hit->normal[1]=0; hit->normal[2]=1; }
+            }
+        }
+    }
+    return bestcat;
+}
+
+int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
+                        float reach_up, float reach_down,
+                        WGroundHit *hit, int *reason) {
+    WGroundHit near; float neard = 1e30f;
+    near.mesh=-1; near.tri=-1; near.cat=WSURF_NONE; near.z=wheel_z;
+    near.normal[0]=0; near.normal[1]=0; near.normal[2]=1;
+    if (hit) { hit->mesh=-1; hit->tri=-1; hit->cat=WSURF_NONE; hit->z=wheel_z;
+               hit->normal[0]=0; hit->normal[1]=0; hit->normal[2]=1; }
+    int cat;
+    if (s->meshes != g_grid.meshes)
+        cat = wws_pick(s, NULL, x, y, wheel_z, reach_up, reach_down, hit, &near, &neard);
+    else {
+        int cx = (int)((x - g_grid.x0) / GCELL), cy = (int)((y - g_grid.y0) / GCELL);
+        if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) {
+            if (reason) *reason = 0;
+            return WSURF_NONE;
+        }
+        static N2Mesh scratch[512];
+        static int srcmap[512];
+        N2Scene sub = { scratch, 0, 512 };
+        int c = cy*g_grid.gw + cx;
+        for (int k = g_grid.start[c]; k < g_grid.start[c+1] && sub.count < 512; k++) {
+            int src = g_grid.list[k]; srcmap[sub.count] = src; scratch[sub.count++] = s->meshes[src];
+        }
+        cat = wws_pick(&sub, srcmap, x, y, wheel_z, reach_up, reach_down, hit, &near, &neard);
+    }
+    if (cat == WSURF_NONE) {
+        if (hit && near.mesh >= 0) *hit = near;      /* attribution for the audit */
+        if (reason) *reason = near.mesh < 0 ? 0 : (near.z > wheel_z ? 1 : 2);
+    } else if (reason) *reason = -1;
+    return cat;
+}
+
+int world_ground_at(const N2Scene *s, float x, float y, float fallback, float *outz) {
+    return wg_at(s, x, y, fallback, outz, NULL, NULL);
+}
+
+int world_ground_pose(const N2Scene *s, float x, float y, float fallback,
+                      float *outz, float outn[3]) {
+    return wg_at(s, x, y, fallback, outz, outn, NULL);
+}
+
+int world_ground_hit(const N2Scene *s, float x, float y, float fallback,
+                     WGroundHit *hit) {
+    float z = fallback, n[3] = {0,0,1};
+    return wg_at(s, x, y, fallback, &z, n, hit);
+}
+
+int world_ground_patch_normal(const N2Scene *s, float x, float y, float heading,
+                              float front, float rear, float halftrack,
+                              const WGroundHit *centre, float outn[3]) {
+    if (!s || !centre || centre->cat == WSURF_NONE || front <= 0.05f ||
+        rear >= -0.05f || halftrack <= 0.05f) return 0;
+    float fx=cosf(heading), fy=sinf(heading), lx=-fy, ly=fx;
+    float px[4]={x+fx*front, x+fx*rear, x+lx*halftrack, x-lx*halftrack};
+    float py[4]={y+fy*front, y+fy*rear, y+ly*halftrack, y-ly*halftrack};
+    float dist[4]={front,-rear,halftrack,halftrack};
+    WGroundHit h[4];
+    float maxslope = centre->cat == WSURF_ROAD ? 0.55f : 0.85f;
+    for (int i=0;i<4;i++) {
+        int cat=world_ground_hit(s,px[i],py[i],centre->z,&h[i]);
+        if (cat != centre->cat) return 0;
+        if (fabsf(h[i].z-centre->z) > 0.20f+dist[i]*maxslope) return 0;
+    }
+    float span=front-rear;
+    float zlong=(h[0].z*(-rear)+h[1].z*front)/span;
+    float zlat=0.5f*(h[2].z+h[3].z);
+    float centre_tol=centre->cat == WSURF_ROAD ? 0.35f : 0.75f;
+    if (fabsf(zlong-centre->z)>centre_tol || fabsf(zlat-centre->z)>centre_tol ||
+        fabsf(zlong-zlat)>centre_tol) return 0;
+    float along=(h[0].z-h[1].z)/span;
+    float across=(h[2].z-h[3].z)/(2.0f*halftrack);
+    outn[0]=-along*fx-across*lx;
+    outn[1]=-along*fy-across*ly;
+    outn[2]=1.0f;
+    float len=sqrtf(outn[0]*outn[0]+outn[1]*outn[1]+1.0f);
+    outn[0]/=len; outn[1]/=len; outn[2]/=len;
+    return 1;
 }
 
 float world_ground_z(const N2Scene *s, float x, float y, float fallback) {
     float z = fallback;
     world_ground_at(s, x, y, fallback, &z);
     return z;
+}
+
+void world_ground_selftest(void) {
+    /* Two stacked decks with different normals: reference Z must select one
+       triangle and return that SAME triangle's height and orientation. */
+    float lower_v[15]={0,0,0,0,0, 2,0,0,0,0, 0,2,0,0,0};
+    float upper_v[15]={0,0,10,0,0, 2,0,11,0,0, 0,2,10,0,0};
+    uint16_t tri[3]={0,1,2};
+    N2Mesh m[2]; memset(m,0,sizeof m);
+    m[0].verts=lower_v; m[0].nverts=3; m[0].idx=tri; m[0].nidx=3; m[0].cat=N2_ROAD;
+    m[1].verts=upper_v; m[1].nverts=3; m[1].idx=tri; m[1].nidx=3; m[1].cat=N2_ROAD;
+    N2Scene s={m,2,2}; float z=0,n[3]; WGroundHit hit;
+    assert(world_ground_pose(&s,0.25f,0.25f,0.0f,&z,n)==WSURF_ROAD);
+    assert(fabsf(z)<1e-6f && fabsf(n[2]-1.0f)<1e-6f);
+    assert(world_ground_pose(&s,0.25f,0.25f,10.0f,&z,n)==WSURF_ROAD);
+    assert(world_ground_hit(&s,0.25f,0.25f,10.0f,&hit)==WSURF_ROAD);
+    assert(hit.mesh==1 && hit.tri==0 && fabsf(hit.z-z)<1e-6f);
+    assert(fabsf(hit.normal[0]-n[0])<1e-6f &&
+           fabsf(hit.normal[1]-n[1])<1e-6f &&
+           fabsf(hit.normal[2]-n[2])<1e-6f);
+    assert(z>10.0f && z<11.0f && n[0]<-0.4f && n[2]>0.8f);
+
+    /* A noisy centre-triangle normal must not pitch the entire chassis when
+       the footprint itself lies on one coherent shallow road plane. */
+    { float pv[20]={-5,-5,-0.5f,0,0, 5,-5,0.5f,0,0,
+                     5, 5, 0.5f,0,0, -5,5,-0.5f,0,0};
+      uint16_t pi[6]={0,1,2,0,2,3};
+      N2Mesh pm; memset(&pm,0,sizeof pm);
+      pm.verts=pv; pm.nverts=4; pm.idx=pi; pm.nidx=6; pm.cat=N2_ROAD;
+      N2Scene ps={&pm,1,1};
+      WGroundHit centre={0,0,WSURF_ROAD,0.0f,{0.6f,0.0f,0.8f}};
+      float pn[3]={0,0,1};
+      assert(world_ground_patch_normal(&ps,0,0,0,1.2f,-1.2f,0.7f,
+                                       &centre,pn));
+      assert(fabsf(pn[0]+0.0995037f)<1e-4f && fabsf(pn[1])<1e-5f &&
+             fabsf(pn[2]-0.995037f)<1e-4f);
+    }
 }
 
 /* Guardrail/fence collision (Phase 58). Rails are NOT separate meshes with a
@@ -1190,33 +1403,4 @@ int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit) {
         }
     }
     return pushed;
-}
-
-/* Unit up-normal of the highest ROAD/TERRAIN triangle under (x,y); (0,0,1) if
-   off any ground triangle. Drives the car's pitch/roll (Phase 58). */
-void world_ground_normal(const N2Scene *s, float x, float y, float n[3]) {
-    n[0]=0; n[1]=0; n[2]=1;
-    if (s->meshes != g_grid.meshes) return;
-    int cx = (int)((x - g_grid.x0) / GCELL), cy = (int)((y - g_grid.y0) / GCELL);
-    if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) return;
-    int c = cy*g_grid.gw + cx; float best = -1e30f;
-    for (int k = g_grid.start[c]; k < g_grid.start[c+1]; k++) {
-        const N2Mesh *m = &s->meshes[g_grid.list[k]];
-        for (int t = 0; t+2 < m->nidx; t += 3) {
-            const float *a=m->verts+m->idx[t]*5, *b=m->verts+m->idx[t+1]*5, *cc=m->verts+m->idx[t+2]*5;
-            float d = (b[1]-cc[1])*(a[0]-cc[0]) + (cc[0]-b[0])*(a[1]-cc[1]);
-            if (d > -1e-9f && d < 1e-9f) continue;
-            float u = ((b[1]-cc[1])*(x-cc[0]) + (cc[0]-b[0])*(y-cc[1])) / d;
-            float v = ((cc[1]-a[1])*(x-cc[0]) + (a[0]-cc[0])*(y-cc[1])) / d;
-            if (u < -0.01f || v < -0.01f || 1.0f-u-v < -0.01f) continue;
-            float z = u*a[2]+v*b[2]+(1.0f-u-v)*cc[2];
-            if (z <= best) continue;
-            best = z;
-            float e1x=b[0]-a[0],e1y=b[1]-a[1],e1z=b[2]-a[2], e2x=cc[0]-a[0],e2y=cc[1]-a[1],e2z=cc[2]-a[2];
-            float nx=e1y*e2z-e1z*e2y, ny=e1z*e2x-e1x*e2z, nz=e1x*e2y-e1y*e2x;
-            float len = sqrtf(nx*nx+ny*ny+nz*nz); if (len < 1e-9f) continue;
-            if (nz < 0) { nx=-nx; ny=-ny; nz=-nz; }
-            n[0]=nx/len; n[1]=ny/len; n[2]=nz/len;
-        }
-    }
 }

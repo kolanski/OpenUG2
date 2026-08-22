@@ -474,6 +474,10 @@ static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, (long)ni * 2, bi, GL_STATIC_DRAW);
     b->index_count = ni; b->tex = tex; b->nmesh = i1 - i0; b->emit_idx = bidx;
     b->texkey = s->meshes[ent[i0].idx].texkey;
+    for (int k = i0; k < i1; k++) {
+        int sc = s->meshes[ent[k].idx].scen;
+        if (sc >= 0 && sc < 8) b->scen_count[sc]++;
+    }
     for (int c = 0; c < 3; c++) { b->bbox_min[c] = mn[c]; b->bbox_max[c] = mx[c]; }
     free(bv); free(bi);
 }

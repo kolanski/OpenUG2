@@ -1527,6 +1527,8 @@ typedef struct {
     char  name[32];
     int   has_tire;      /* 0 = radius came from the body-length ratio, not a tyre */
     float wheel_r;       /* EXACT from the tyre mesh (or car-derived if !has_tire) */
+    float wheel_rx;      /* tyre half-extent along model X (diagnostic/rolling radius) */
+    float wheel_rz;      /* tyre half-extent along model Z (vertical contact radius) */
     float wheel_w;       /* EXACT tyre width */
     float hub_z;         /* EXACT hub centre Z in model space (0.000 fleet-wide) */
     float body[6];       /* EXACT body AABB: x0,x1,y0,y1,z0,z1 */
@@ -1621,7 +1623,9 @@ static void n2_car_profile(const N2Scene *s, const char *name,
     p->body[4]=b0[2]; p->body[5]=b1[2];
     if (ntv) {                                  /* exact, from this car's tyre */
         p->has_tire = 1;
-        p->wheel_r  = 0.25f * ((t1[0]-t0[0]) + (t1[2]-t0[2]));
+        p->wheel_rx = 0.5f * (t1[0]-t0[0]);
+        p->wheel_rz = 0.5f * (t1[2]-t0[2]);
+        p->wheel_r  = 0.5f * (p->wheel_rx + p->wheel_rz);
         p->wheel_w  = t1[1]-t0[1];
         p->hub_z    = 0.5f * (t0[2]+t1[2]);
     } else {                                    /* car-derived, never absolute */
@@ -1634,6 +1638,8 @@ static void n2_car_profile(const N2Scene *s, const char *name,
            the road. 2 cm margin keeps the sills clear of camber. */
         float rmin = -b0[2] + 0.02f;
         if (p->wheel_r < rmin) p->wheel_r = rmin;
+        p->wheel_rx = p->wheel_r;
+        p->wheel_rz = p->wheel_r;
         p->wheel_w  = p->wheel_r * 0.62f;       /* fleet-median width/radius */
         p->hub_z    = 0.0f;
     }

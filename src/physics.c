@@ -1,6 +1,7 @@
 /* physics.c — OpenUG2 Physics module implementation. */
 #include <math.h>
 #include <assert.h>
+#include <string.h>
 
 #include "physics.h"
 
@@ -27,6 +28,136 @@ const PhysSurface PHYS_SURF_ROAD    = { 1.00f, 1.00f, PHYS_FRICTION, PHYS_GRIP, 
 const PhysSurface PHYS_SURF_TERRAIN = { 0.55f, 0.50f, 0.99800f,     0.94f,     0.75f };
 
 static float pv_clamp(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+float phys_steer_response(float current, float target) {
+    target=pv_clamp(target,-1.0f,1.0f);
+    float k=fabsf(target)<0.001f ? 0.18f : 0.14f;
+    return current+(target-current)*k;
+}
+
+/* ---- sprung ride / four-wheel contact (M130) ------------------------------ */
+
+/* Wheel offsets re-centred on their own centroid, so four equal contact forces
+   produce exactly zero pitch and roll torque and a resting car cannot drift. */
+static void pr_axes(const PhysRideSupport *s, float ax[4], float ay[4],
+                    float *ipitch, float *iroll) {
+    float mx = 0, my = 0;
+    for (int k = 0; k < 4; k++) { mx += s->ax[k]; my += s->ay[k]; }
+    mx *= 0.25f; my *= 0.25f;
+    float sp = 0, sr = 0;
+    for (int k = 0; k < 4; k++) {
+        ax[k] = s->ax[k] - mx; ay[k] = s->ay[k] - my;
+        sp += ax[k]*ax[k]; sr += ay[k]*ay[k];
+    }
+    *ipitch = sp > 1e-4f ? sp : 1e-4f;
+    *iroll  = sr > 1e-4f ? sr : 1e-4f;
+}
+
+float phys_ride_wheel_z(const PhysRideState *r, const PhysRideSupport *s, int k) {
+    float ax[4], ay[4], ip, ir; pr_axes(s, ax, ay, &ip, &ir);
+    return r->z + ax[k]*r->pitch + ay[k]*r->roll;
+}
+
+void phys_ride_init(PhysRideState *r, const PhysRideSupport *s) {
+    memset(r, 0, sizeof *r);
+    float sum = 0; int n = 0;
+    for (int k = 0; k < 4; k++) if (s->valid[k]) { sum += s->z[k]; n++; }
+    r->z = n ? sum / n : s->z[0];
+    r->contact_mask = 0;
+    for (int k = 0; k < 4; k++) if (s->valid[k]) r->contact_mask |= 1u << k;
+    /* An unsupported spawn is NOT silently grounded: it starts airborne and
+       falls, exactly as a mid-air placement should. */
+    r->air_frames = n ? 0 : 1;
+}
+
+void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
+    const float w    = 6.2831853f * PHYS_RIDE_FREQ;   /* rad/s */
+    const float K    = w * w;                          /* 1/s^2 per metre       */
+    const float C    = 2.0f * PHYS_RIDE_ZETA * w;      /* 1/s                   */
+    float ax[4], ay[4], ip, ir; pr_axes(s, ax, ay, &ip, &ir);
+
+    unsigned was = r->contact_mask;
+    r->impact = 0.0f;
+
+    /* per-wheel compression and force. The +G preload makes zero compression
+       the resting equilibrium, so a fully supported car sits exactly on its
+       contacts instead of sagging by an invented amount. */
+    float force[4] = {0,0,0,0};
+    unsigned mask = 0;
+    for (int k = 0; k < 4; k++) {
+        float wz = r->z + ax[k]*r->pitch + ay[k]*r->roll;
+        float wv = r->vz + ax[k]*r->pitch_rate + ay[k]*r->roll_rate;
+        if (!s->valid[k]) {                       /* hangs at full droop */
+            r->compression[k] = -PHYS_RIDE_DROOP;
+            continue;
+        }
+        float c = s->z[k] - wz;
+        if (c < -PHYS_RIDE_DROOP) {      /* tracked, but hanging clear of it */
+            r->compression[k] = -PHYS_RIDE_DROOP;
+            continue;                    /* no contact, no force: it falls */
+        }
+        mask |= 1u << k;
+        if (c > PHYS_RIDE_BUMP) c = PHYS_RIDE_BUMP;
+        r->compression[k] = c;
+        force[k] = K*c - C*wv + PHYS_RIDE_G;
+    }
+    r->contact_mask = mask;
+
+    if (!mask) {                                   /* free flight */
+        r->vz -= PHYS_RIDE_G * dt;
+        r->z  += r->vz * dt;
+        /* bleed angular rates so an airborne car cannot tumble without bound */
+        r->pitch_rate *= 0.98f; r->roll_rate *= 0.98f;
+        r->pitch += r->pitch_rate * dt; r->roll += r->roll_rate * dt;
+        r->air_frames++;
+    } else {
+        if (!was) r->impact = r->vz < 0 ? -r->vz : r->vz;   /* landing frame */
+        float fz = 0, tp = 0, tr = 0;
+        for (int k = 0; k < 4; k++) { fz += force[k]; tp += ax[k]*force[k]; tr += ay[k]*force[k]; }
+        r->vz         += (fz * 0.25f - PHYS_RIDE_G) * dt;
+        r->pitch_rate += (tp / ip) * dt;
+        r->roll_rate  += (tr / ir) * dt;
+        if (r->impact > 0.0f) {                    /* bounded landing rebound */
+            float rb = r->impact * PHYS_RIDE_REBOUND;
+            if (rb > 1.5f) rb = 1.5f;
+            if (r->vz < rb) r->vz = rb;
+        }
+        r->z     += r->vz * dt;
+        r->pitch += r->pitch_rate * dt;
+        r->roll  += r->roll_rate  * dt;
+        r->air_frames = 0;
+    }
+
+    if (r->pitch >  PHYS_RIDE_MAXTILT) { r->pitch =  PHYS_RIDE_MAXTILT; if (r->pitch_rate > 0) r->pitch_rate = 0; }
+    if (r->pitch < -PHYS_RIDE_MAXTILT) { r->pitch = -PHYS_RIDE_MAXTILT; if (r->pitch_rate < 0) r->pitch_rate = 0; }
+    if (r->roll  >  PHYS_RIDE_MAXTILT) { r->roll  =  PHYS_RIDE_MAXTILT; if (r->roll_rate  > 0) r->roll_rate  = 0; }
+    if (r->roll  < -PHYS_RIDE_MAXTILT) { r->roll  = -PHYS_RIDE_MAXTILT; if (r->roll_rate  < 0) r->roll_rate  = 0; }
+
+    /* bump stop: no wheel may end the frame compressed past its travel, so the
+       body can never settle through a surface it is standing on. */
+    float pen = 0;
+    for (int k = 0; k < 4; k++) {
+        if (!s->valid[k]) continue;
+        float wz = r->z + ax[k]*r->pitch + ay[k]*r->roll;
+        float over = (s->z[k] - wz) - PHYS_RIDE_BUMP;
+        if (over > pen) pen = over;
+    }
+    if (pen > 0) {                       /* rate-limited so recovery is fast
+                                            but never an instant teleport */
+        if (pen > PHYS_RIDE_LIFT_MAX) pen = PHYS_RIDE_LIFT_MAX;
+        r->z += pen; if (r->vz < 0) r->vz = 0;
+    }
+
+    /* refresh the reported compressions after the clamp/bump-stop */
+    for (int k = 0; k < 4; k++) {
+        if (!s->valid[k]) { r->compression[k] = -PHYS_RIDE_DROOP; continue; }
+        float wz = r->z + ax[k]*r->pitch + ay[k]*r->roll;
+        float c = s->z[k] - wz;
+        if (c >  PHYS_RIDE_BUMP)  c =  PHYS_RIDE_BUMP;
+        if (c < -PHYS_RIDE_DROOP) c = -PHYS_RIDE_DROOP;
+        r->compression[k] = c;
+    }
+}
 
 PhysVehicle phys_vehicle_from_geometry(float body_len, float body_wid, float body_hgt,
                                        float wheelbase, float track, float tyre_w) {
@@ -117,6 +248,23 @@ void phys_selftest(void) {
     }
     assert(tstop > 0 && tstop < 5*60);
 
+    /* Full keyboard lock at 50 km/h must remain an arcade turn, not rotate the
+       car through a U-turn and beyond in two seconds. */
+    {
+        float p[3]={0,0,0}, v[2]={50.0f/3.6f/PHYS_TICKRATE,0}, hd=0, s=0;
+        for (int t=0;t<120;t++) phys_car_step(p,v,&hd,&s,1.0f,1.0f,0,NULL,NULL);
+        assert(hd > 1.40f && hd < 2.15f);       /* about 80..123 degrees */
+    }
+    {
+        float st=0.0f;
+        st=phys_steer_response(st,1.0f);
+        assert(st > 0.05f && st < 0.20f);       /* no instant full lock */
+        for (int t=1;t<10;t++) st=phys_steer_response(st,1.0f);
+        assert(st > 0.70f && st < 0.90f);       /* responsive inside 1/6 s */
+        for (int t=0;t<16;t++) st=phys_steer_response(st,0.0f);
+        assert(fabsf(st) < 0.05f);              /* recentres promptly */
+    }
+
     /* --- surface profiles (M114) --------------------------------------------
      * Flat ground, sustained full throttle, identical inputs: terrain must
      * settle materially below road speed and must slide measurably more. */
@@ -180,6 +328,7 @@ void phys_selftest(void) {
         }
         assert(stop > 0 && stop < 7*60);
     }
+
 }
 
 /* Does this mesh present an actual wall to the car here? Near-vertical face,

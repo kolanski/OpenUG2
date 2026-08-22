@@ -93,6 +93,48 @@ static VehicleWheelConfig wheel_config_for(const char *name, const N2CarProfile 
     return c;
 }
 
+/* Stock body-to-wheel suspension trim. The model and wheel data share a hub
+ * origin, but NFSU2 also has per-car stance/suspension tuning outside the mesh.
+ * That table is not decoded yet; keep the known tune explicit and local rather
+ * than moving the tyre off the road or corrupting the asset coordinates. */
+static float stock_body_drop(const char *name) {
+    return name && !strcmp(name, "MIATA") ? 0.040f : 0.0f;
+}
+
+/* Read-only contact audit for the four wheels exactly where the renderer puts
+ * their hubs. `mat_car` supplies the chassis basis, then wheelT adds axle/track
+ * and local hub Z. Subtract the rendered tyre radius along chassis-up and
+ * compare that bottom point with the selected world layer at its own XY. */
+static void wheel_contact_residuals(const N2Scene *scene, const float pos[3],
+                                    float heading, const float up[3],
+                                    const VehicleWheelConfig *wc,
+                                    float wheel_ride, float wheel_radius,
+                                    float out[4], int cat[4]) {
+    float f[3]={cosf(heading),sinf(heading),0};
+    float fd=f[0]*up[0]+f[1]*up[1]+f[2]*up[2];
+    f[0]-=fd*up[0]; f[1]-=fd*up[1]; f[2]-=fd*up[2];
+    float fl=sqrtf(f[0]*f[0]+f[1]*f[1]+f[2]*f[2]);
+    if (fl<1e-6f) { f[0]=cosf(heading); f[1]=sinf(heading); f[2]=0; fl=1; }
+    f[0]/=fl; f[1]/=fl; f[2]/=fl;
+    float l[3]={up[1]*f[2]-up[2]*f[1],
+                up[2]*f[0]-up[0]*f[2],
+                up[0]*f[1]-up[1]*f[0]};
+    float ax[4]={wc->front_axle,wc->front_axle,wc->rear_axle,wc->rear_axle};
+    float sy[4]={wc->front_track*.5f,-wc->front_track*.5f,
+                 wc->rear_track*.5f,-wc->rear_track*.5f};
+    for (int i=0;i<4;i++) {
+        float hub[3];
+        for (int a=0;a<3;a++)
+            hub[a]=pos[a]+up[a]*(wheel_ride+wc->ride_y)+f[a]*ax[i]+l[a]*sy[i];
+        float bottom[3]={hub[0]-up[0]*wheel_radius,
+                         hub[1]-up[1]*wheel_radius,
+                         hub[2]-up[2]*wheel_radius};
+        WGroundHit h;
+        cat[i]=world_ground_hit(scene,bottom[0],bottom[1],pos[2],&h);
+        out[i]=cat[i]==WSURF_NONE ? 0.0f : bottom[2]-h.z;
+    }
+}
+
 /* Switching car or track means a whole new asset load (world batches, car
  * buffers/textures, physics obstacles, AI paths — ~30 pieces of long-lived
  * state with no teardown path), so both the menu's arrow keys and the
@@ -489,6 +531,49 @@ static float m94_prex, m94_prey, m94_prez;   /* car pose before this frame's pus
  * deleted -- while it is off the ImGui frame is not built at all, so ImGui takes
  * no mouse or keyboard and gameplay input is untouched. */
 static int g_devui = 0;
+/* M130: the player's authoritative vertical pose. carpos[0..1] stay owned by
+   the XY arcade model; carpos[2], the chassis tilt and every wheel's own height
+   now come from here. There is exactly one body-pose filter, not two. */
+static PhysRideState  g_ride;
+static PhysRideSupport g_sup;
+static int   g_ride_ready = 0;
+static float g_ride_maxdz = 0.0f;   /* largest single-frame body dZ, audit only */
+static long  g_ride_air = 0, g_ride_rejhigh = 0, g_ride_rejlow = 0, g_ride_nocover = 0;
+static float g_ride_maximpact = 0.0f;
+
+/* Fill the four wheel footprints for the current pose and ask the world for
+   REACHABLE support under each. Returns the number of supported wheels. */
+static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
+                       const VehicleWheelConfig *wc, float wheel_r,
+                       PhysRideSupport *sup, WGroundHit hit[4], int reason[4]) {
+    float fx = cosf(heading), fy = sinf(heading);
+    float lx = -fy, ly = fx;                     /* +y = left, matching ax/ay */
+    float ax[4] = { wc->front_axle, wc->front_axle, wc->rear_axle, wc->rear_axle };
+    float ay[4] = { wc->front_track*0.5f, -wc->front_track*0.5f,
+                    wc->rear_track *0.5f, -wc->rear_track *0.5f };
+    int n = 0;
+    for (int k = 0; k < 4; k++) {
+        sup->ax[k] = ax[k]; sup->ay[k] = ay[k];
+        float wx = pos[0] + fx*ax[k] + lx*ay[k];
+        float wy = pos[1] + fy*ax[k] + ly*ay[k];
+        /* reference = where this wheel's contact sits under the CURRENT body
+           pose, so reach is measured from the wheel, not from the car centre */
+        float wz = g_ride_ready ? phys_ride_wheel_z(&g_ride, sup, k) : pos[2];
+        int why = 0;
+        int cat = world_wheel_support(sc, wx, wy, wz,
+                                      PHYS_RIDE_REACH_UP, PHYS_RIDE_REACH_DOWN,
+                                      &hit[k], &why);
+        reason[k] = why;
+        sup->valid[k] = cat != WSURF_NONE;
+        sup->z[k] = sup->valid[k] ? hit[k].z : wz;
+        if (sup->valid[k]) n++;
+        else if (why == 1) g_ride_rejhigh++;
+        else if (why == 2) g_ride_rejlow++;
+        else g_ride_nocover++;
+    }
+    (void)wheel_r;
+    return n;
+}
 static PhysVehicle g_vehicle = { 1.0f, 1.0f, 1.0f, 1.0f };   /* M121: this car */
 static int   g_m107 = 0;          /* M107: three-heading menu capture, audit only */
 static float g_m107_h[3];
@@ -611,6 +696,7 @@ static int race_place_on_grid(const World *w, const N2Scene *sc,
     carpos[0] = w->race.grid[best][0];
     carpos[1] = w->race.grid[best][1];
     carpos[2] = bestz;                       /* the layer under the slot */
+        g_ride_ready = 0;   /* M130: re-arm the ride at every placement */
     /* the records carry no orientation (their direction fields are all zero),
        so face along the event's own route: gate 0 towards the next gate. */
     if (w->race.ngate > 1) {
@@ -1036,6 +1122,7 @@ static int er_find_paths(const char *troot, const char *stem, int skip, char *ou
 int main(int argc, char **argv) {
     collide_walls_selftest();
     phys_selftest();
+    world_ground_selftest();
     audio_selftest();
     /* Point at your own NFSU2 install/data directory (contains TRACKS/, CARS/).
        Usage: nfsu2 [DATA_DIR] [options]
@@ -1079,6 +1166,7 @@ int main(int argc, char **argv) {
     int shovr = 0; float shx = 0, shy = 0;
     const char *baudit = NULL, *bmesh = NULL;   /* --batch-audit REGION MESHNAME */
     int vcensus = 0;   /* --vista-census: measure every region's backdrop candidates */
+    int mapaudit = 0;  /* --map-audit: texture resolution + production distance-cull census */
     float vthresh = 3000.0f;   /* --vista-census [METRES]: candidate XY-span floor */
     int rendermode = 0, daylight = 0;   /* --rendermode 0..3 / --daylight: headless F3 matrix */
     const char *carname = "HUMMER", *trackname = "ALL";
@@ -1162,6 +1250,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--vista-census")) { vcensus = 1;
             if (i+1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9') vthresh = (float)atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--map-audit")) mapaudit = 1;
         else dataroot = argv[i];
     }
     /* --shot-static (Milestone 77): a STATIC world capture. Reuses --shot's
@@ -2413,7 +2502,17 @@ int main(int argc, char **argv) {
         int wi = -1;
         for (int i = 0; i < world.nev; i++) if (world.ev[i].id == want_event_id) wi = i;
         if (wi < 0) fprintf(stderr, "--event %d: no such race event\n", want_event_id);
-        else world_race_start(&world, troot, wi, want_laps);
+        else {
+            world_race_start(&world, troot, wi, want_laps);
+            if (rtrace) {
+                printf("RT closures: %d\n", world.nbar);
+                for (int b=0; b<world.nbar; b++)
+                    printf("RT   barrier %d at (%.3f %.3f) dir(%.4f %.4f) nodes %d->%d\n",
+                           b, world.bar[b].x, world.bar[b].y,
+                           world.bar[b].dx, world.bar[b].dy,
+                           world.bar[b].a, world.bar[b].b);
+            }
+        }
     }
 
     /* Scripted-object entity DEFINITIONS from the district companion L4R*.BUN.
@@ -2431,6 +2530,19 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nm; i++)
         for (int j = 0; j < ntmap; j++)
             if (tmapkey[j] == scene.meshes[i].texkey) { mtex[i] = tmaptex[j]; break; }
+    if (mapaudit) {
+        int keyed[8]={0}, unresolved[8]={0}, nokey[8]={0};
+        for (int i=0;i<nm;i++) {
+            int sc=scene.meshes[i].scen;
+            if (sc<0 || sc>=8) sc=0;
+            if (!scene.meshes[i].texkey) nokey[sc]++;
+            else { keyed[sc]++; if (!mtex[i]) unresolved[sc]++; }
+        }
+        printf("MAP texture resolution (source meshes):\n");
+        for (int sc=1;sc<=N2_SC_OTHER;sc++)
+            printf("  %-9s keyed=%5d unresolved=%5d no-key=%5d\n",
+                   n2_scen_name(sc),keyed[sc],unresolved[sc],nokey[sc]);
+    }
     /* load a car and drop it on the track (36-byte vertex format) */
     long clen; unsigned char *cdata = n2_read_file(carp, &clen);
     long ctlen; unsigned char *ctdata = n2_read_file(cartexp, &ctlen);
@@ -2560,9 +2672,10 @@ int main(int argc, char **argv) {
                g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle,
                g_dbg.wheel.front_track, g_dbg.wheel.rear_track, g_dbg.wheel.ride_y,
                wheel_from_global ? "GLOBAL AttribSys" : "body-box fallback");
-        printf("car profile %-12s wheel R %.3f W %.3f%s  hubZ %+.3f  ride %.3f  "
+        printf("car profile %-12s wheel R %.3f (X %.3f Z %.3f) W %.3f%s  hubZ %+.3f  ride %.3f  "
                "wheelbase %.2f  track %.2f  clearance %.3f\n",
-               carprof.name, carprof.wheel_r, carprof.wheel_w,
+               carprof.name, carprof.wheel_r, carprof.wheel_rx, carprof.wheel_rz,
+               carprof.wheel_w,
                carprof.has_tire ? "" : " (no tyre mesh: derived from body length)",
                carprof.hub_z, carprof.ride, carprof.wheelbase, carprof.track_f,
                carprof.clearance);
@@ -3655,7 +3768,6 @@ int main(int argc, char **argv) {
        colour; badges/vinyls overlay as decals). The debug pane's paint
        override still allows any colour live. */
     float paint[3] = { 0.70f, 0.70f, 0.75f };
-    if (!strcmp(carname, "MIATA")) { paint[0]=0.55f; paint[1]=0.10f; paint[2]=0.09f; }  /* reference showroom red */
     float carpos[3] = { spawn[0], spawn[1], spawn[2] };
     float car_up[3] = { 0, 0, 1 };   /* chassis up, lerped toward the ground normal */
     if (shot && !sstatic && !daudit && aipath.n > 0) {
@@ -3670,6 +3782,7 @@ int main(int argc, char **argv) {
     /* an armed race wins: start on its own grid, facing through the start line */
     if (!sstatic) race_place_on_grid(&world, &scene, carpos, &heading0);
     float heading = heading0, speed = 0.0f, vel[2] = {0,0};
+    float steer_filtered = 0.0f;
     float cam[3] = { spawn[0], spawn[1], spawn[2]+5 };
     if (sstatic) {
         /* Documented static view: the ordinary chase pose, placed analytically
@@ -3680,6 +3793,10 @@ int main(int argc, char **argv) {
         cam[1] = carpos[1] - sinf(heading0)*g_dbg.chase_distance;
         cam[2] = carpos[2] + g_dbg.chase_height;
     }
+    const float car_body_drop = stock_body_drop(carname);
+    if (car_body_drop > 0.0f)
+        printf("stock suspension %-12s body drop %.3f m (wheels remain on contact)\n",
+               carname, car_body_drop);
     float fc[3] = { spawn[0]-6, spawn[1], spawn[2]+3 };   /* freecam eye */
     float fyaw = 0.0f, fpitch = -0.25f;                   /* freecam look angles */
     int   mlook = 0;                                      /* right-drag mouse look active */
@@ -3699,6 +3816,13 @@ int main(int argc, char **argv) {
     float prevL[3] = {0,0,0}, prevR[3] = {0,0,0}; int skidpen = 0;  /* pen-down state */
     #define MAXSMOKE 512
     static struct { float p[3], v[3], life, size; } smoke[MAXSMOKE]; int smoken = 0;
+    /* Contact-forensics accumulators. Audit-only reads; no production state is
+       fed back from these measurements. Index is WSURF_ROAD / TERRAIN. */
+    long ca_frames[3]={0}, ca_patch_ok[3]={0}, ca_patch_bad[3]={0};
+    long ca_missing[3]={0}, ca_mixed[3]={0};
+    float ca_fmin[3]={1e30f,1e30f,1e30f}, ca_fmax[3]={-1e30f,-1e30f,-1e30f};
+    float ca_rmin[3]={1e30f,1e30f,1e30f}, ca_rmax[3]={-1e30f,-1e30f,-1e30f};
+    float ca_axlemax[3]={0,0,0};
     while (running) {
         /* M89 race audit: one synthetic RETURN at 1 s, delivered through SDL so
            the production race_state==3 Enter branch runs exactly as written. */
@@ -3707,6 +3831,8 @@ int main(int argc, char **argv) {
         static int ra_walls = 0, ra_rails = 0, ra_clamp = 0, ra_stall = -1, ra_bad = 0;
         static double ra_clampsum = 0; static int ra_cd = -1; static int ra_done = 0;
         static float ra_maxresid = 0, ra_maxpre = 0;
+        static int ra_prev_mask = -1;
+        static WGroundHit ra_prev_ground; static int ra_have_ground = 0, ra_ground_spikes = 0;
         if (raudit) {
             if (ra_f == 0)
                 printf("RA menu showcase pos(%.3f %.3f %.3f) hdg %+.4f  race_state %d\n",
@@ -3750,7 +3876,11 @@ int main(int argc, char **argv) {
             else if (e.type == SDL_KEYDOWN) {
                 SDL_Keycode k = e.key.keysym.sym;
                 if (k == SDLK_ESCAPE) running = 0;
-                else if (k == SDLK_f) {       /* toggle freecam; seed it from the current view */
+                else if (k == SDLK_f && race_state != 3) {
+                    /* In the pre-race menu F starts free-roam below. Once
+                       driving, the same key remains the existing freecam
+                       toggle. Keeping the menu out of this branch fixes the
+                       old shadowing that made the free-roam action unreachable. */
                     g_dbg.freecam ^= 1;
                     if (g_dbg.freecam) {
                         fc[0]=cam[0]; fc[1]=cam[1]; fc[2]=cam[2];
@@ -3804,7 +3934,17 @@ int main(int argc, char **argv) {
                     /* car and track each mean a whole new load, so they re-launch
                        the process (see relaunch()); circuit is a cheap in-place
                        reload. */
-                    if ((k==SDLK_LEFT || k==SDLK_RIGHT) && ncars > 1) {
+                    if (k==SDLK_f) {
+                        /* Free-roam is a gameplay mode, not a debug camera: keep
+                           the supported showcase road pose, open the whole loaded
+                           bundle's nav graph, and enable ordinary WASD physics. */
+                        world_set_mode(&world, MODE_FREEROAM, -1);
+                        world.race.active = 0;
+                        vel[0]=vel[1]=0; speed=0; p_lap=p_prev=0;
+                        race_state = 1; racetimer = 0;
+                        printf("freeroam: whole %s bundle driveable from (%.3f %.3f %.3f)\n",
+                               trackname, carpos[0], carpos[1], carpos[2]);
+                    } else if ((k==SDLK_LEFT || k==SDLK_RIGHT) && ncars > 1) {
                         selcar = (selcar + (k==SDLK_RIGHT?1:ncars-1)) % ncars;
                         relaunch(selfexe, dataroot, carlist[selcar], trackname);
                     } else if ((k==SDLK_UP || k==SDLK_DOWN) && ntrack > 1) {
@@ -3821,6 +3961,7 @@ int main(int argc, char **argv) {
                         nai = load_circuit(dataroot, circlist[selcirc], &scene,
                                            &aipath, ais, spawn, &heading0, &start_idx, densx, densy);
                         carpos[0]=spawn[0]; carpos[1]=spawn[1]; carpos[2]=spawn[2];
+        g_ride_ready = 0;   /* M130: re-arm the ride at every placement */
                         heading=heading0; vel[0]=vel[1]=0; speed=0; p_lap=p_prev=0;
                     } else if (k==SDLK_RETURN || k==SDLK_SPACE) {
                         /* Snap the player from the showcase spot to the circuit
@@ -3860,6 +4001,7 @@ int main(int argc, char **argv) {
                                 start_idx = si;              /* lap logic uses the real start */
                                 carpos[0]=aipath.xy[si*2]; carpos[1]=aipath.xy[si*2+1];
                                 carpos[2]=sz; heading=sh;
+                            g_ride_ready = 0;   /* M130: re-arm the ride at every placement */
                                 printf("start line: waypoint %d (%.3f, %.3f, %.3f) "
                                        "heading %+.4f [first safe forward candidate]\n",
                                        si, carpos[0], carpos[1], carpos[2], heading);
@@ -3869,6 +4011,7 @@ int main(int argc, char **argv) {
                                        "unchanged\n", start_idx);
                                 carpos[0]=aipath.xy[start_idx*2]; carpos[1]=aipath.xy[start_idx*2+1];
                                 carpos[2]=world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
+                                g_ride_ready = 0;
                                 int nx=(start_idx+1)%aipath.n;
                                 heading=atan2f(aipath.xy[nx*2+1]-carpos[1], aipath.xy[nx*2]-carpos[0]);
                             }
@@ -3941,8 +4084,9 @@ int main(int argc, char **argv) {
             else               { throttle =  0.0f; steer = 0.0f; }
             handbrake = 0;
         }
-        /* Surface-aware handling (M114): ask the one ground-contact query what the
-           car is standing on, then EASE the active profile toward that surface's
+        steer_filtered=phys_steer_response(steer_filtered,steer);
+        /* Surface-aware handling (M114): query the selected centre contact layer,
+           then EASE the active profile toward that surface's
            profile over ~0.15 s. Blending the profile (not the velocity) means
            crossing a road edge cannot snap speed, heading or camera; nothing
            here moves the car or invents a height. WSURF_NONE keeps the road
@@ -3950,8 +4094,8 @@ int main(int argc, char **argv) {
         static PhysSurface surf_now = { 1.00f, 1.00f, 0.99886f, 0.86f, 1.00f };
         static int surf_id = WSURF_ROAD, surf_prev = WSURF_ROAD;
         {
-            float sz = carpos[2];
-            int sid = world_ground_at(&scene, carpos[0], carpos[1], carpos[2], &sz);
+            float surface_z=carpos[2];
+            int sid=world_ground_at(&scene,carpos[0],carpos[1],carpos[2],&surface_z);
             surf_prev = surf_id;
             if (sid != WSURF_NONE) surf_id = sid;
             const PhysSurface *tgt = (surf_id == WSURF_TERRAIN) ? &PHYS_SURF_TERRAIN
@@ -4062,7 +4206,7 @@ int main(int argc, char **argv) {
         float dmag = sstatic ? 0.0f
                    : race_auto ? speed/60.0f
                    : phys_car_step(carpos, vel, &heading, &speed,
-                                   throttle, steer, handbrake, &surf_now, &g_vehicle);
+                                   throttle, steer_filtered, handbrake, &surf_now, &g_vehicle);
         float nf[2] = { cosf(heading), sinf(heading) }, nr[2] = { nf[1], -nf[0] };
         /* engine note: 6-speed virtual gearbox drives RPM + load; shifts cut
            the throttle for 150ms and let the revs sag (idles during the
@@ -4073,16 +4217,15 @@ int main(int argc, char **argv) {
           g_road_vol = sp*sp*0.35f; }   /* tyre/wind roar rises with speed */
         float fwd[3] = { nf[0], nf[1], 0 };
         /* building collision: push the car out of any wall footprint it entered.*/
-        /* The car's world-space vertical envelope, matching the RENDER
-           transform exactly: mat_car() puts the model origin at pos + up*ride,
-           so with the body AABB's local Z range the drawn car spans
-           [carpos.z + ride + carbb.z0, carpos.z + ride + carbb.z1].
-           car_ride is the single shared expression -- the renderer below uses
-           this same variable, so the two can never drift apart. */
+        /* Body collision envelope at the exact gameplay contact. The renderer
+           uses the same contact and body ride; wheels use car_ride unchanged so
+           a per-car body drop never moves the tyre off the road. */
         float car_ride = carprof.ride
                        * (g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f);
-        float car_z0 = carpos[2] + car_ride + carbb[2];
-        float car_z1 = carpos[2] + car_ride + carbb[5];
+        float car_body_ride = car_ride - car_body_drop;
+        if (car_body_ride < 0.05f) car_body_ride = 0.05f;
+        float car_z0 = carpos[2] + car_body_ride + carbb[2];
+        float car_z1 = carpos[2] + car_body_ride + carbb[5];
         if (car_z1 - car_z0 < 0.5f) car_z1 = car_z0 + 1.5f;   /* no car body loaded */
         m94_prex = carpos[0]; m94_prey = carpos[1]; m94_prez = carpos[2];
         if (raudit && race_state == 1 && !race_auto && !sstatic) {
@@ -4123,17 +4266,64 @@ int main(int argc, char **argv) {
         }
         /* checkpoint / lap tracking, after the pushes so it sees the final XY */
         if (race_state == 1 && !race_auto && !sstatic) world_race_update(&world, carpos[0], carpos[1]);
-        /* Sit ON the road/terrain surface: exact contact projection, not a
-           smoothed chase. The old 0.35 lerp fell up to a metre behind on the
-           SH-hill descent at 120 km/h (M92), which reads as the car sinking
-           into the road. world_ground_z is unchanged -- its nearest-to-
-           reference layer pick is what keeps stacked decks correct, and when
-           nothing covers the XY it returns the reference, so this adds no
-           invented height. */
-        float gz = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]);
-        float da_dz = gz - carpos[2];          /* pre-projection delta */
-        if (!sstatic) carpos[2] = gz;
+        /* Stable contact pose: select ONE triangle using the same reference-Z
+           rule for height, surface class and normal. The previous four-wheel
+           experiment could combine four different stacked layers, making the
+           body float, sink or invent a ramp. Suspension remains a later,
+           visual/per-wheel system; the gameplay collision reference stays
+           exactly on the selected road/terrain layer. */
+        float pre_vert_z=carpos[2], gz=carpos[2];
+        WGroundHit ground_hit;
+        int ground_cat=world_ground_hit(&scene,carpos[0],carpos[1],carpos[2],
+                                        &ground_hit);
+        if (ground_cat != WSURF_NONE) {
+            gz = ground_hit.z;
+        }
+        float da_dz=gz-pre_vert_z;
+        /* M130: the centre query above still classifies the surface and feeds
+           the audit, but it no longer sets height. Four wheel footprints ask for
+           REACHABLE support; the sprung integrator owns carpos[2], pitch and
+           roll. A layer 12.96 m away is rejected as support instead of being
+           handed to a spring (L4RB frames 940->956). */
+        static WGroundHit ride_hit[4]; static int ride_reason[4];
+        int ride_nsup = 0;
+        if (!sstatic && !race_auto) {
+            float wr = carprof.wheel_r*(g_dbg.wheel_scale>0.05f?g_dbg.wheel_scale:1.0f);
+            ride_nsup = ride_gather(&scene, carpos, heading, &g_dbg.wheel, wr,
+                                    &g_sup, ride_hit, ride_reason);
+            if (!g_ride_ready) { phys_ride_init(&g_ride, &g_sup); g_ride_ready = 1; }
+            float zprev = g_ride.z;
+            phys_ride_step(&g_ride, &g_sup, 1.0f/60.0f);
+            carpos[2] = g_ride.z;
+            float dzf = g_ride.z - zprev; if (dzf < 0) dzf = -dzf;
+            if (dzf > g_ride_maxdz) g_ride_maxdz = dzf;
+            if (!g_ride.contact_mask) g_ride_air++;
+            if (g_ride.impact > g_ride_maximpact) g_ride_maximpact = g_ride.impact;
+        } else if (ground_cat != WSURF_NONE && !race_auto) carpos[2] = gz;
+        (void)ride_nsup;
         if (raudit) {   /* observe the production state, after every push */
+            float adz = da_dz < 0 ? -da_dz : da_dz;
+            if (ground_cat != WSURF_NONE && adz > 0.10f && ra_ground_spikes < 80) {
+                const N2Mesh *gm = ground_hit.mesh >= 0 && ground_hit.mesh < scene.count
+                                 ? &scene.meshes[ground_hit.mesh] : NULL;
+                const N2Mesh *pm = ra_have_ground && ra_prev_ground.mesh >= 0 &&
+                                   ra_prev_ground.mesh < scene.count
+                                 ? &scene.meshes[ra_prev_ground.mesh] : NULL;
+                printf("RA GROUND STEP f%-6ld dz=%+.4f at (%.3f %.3f) "
+                       "prev mesh=%d tri=%d %-28s z=%.3f -> "
+                       "mesh=%d tri=%d %-28s z=%.3f cat=%s\n",
+                       ra_f, da_dz, carpos[0], carpos[1],
+                       ra_have_ground ? ra_prev_ground.mesh : -1,
+                       ra_have_ground ? ra_prev_ground.tri : -1,
+                       pm && pm->sname[0] ? pm->sname : "(none)",
+                       ra_have_ground ? ra_prev_ground.z : pre_vert_z,
+                       ground_hit.mesh, ground_hit.tri,
+                       gm && gm->sname[0] ? gm->sname : "(unnamed)",
+                       ground_hit.z,
+                       ground_hit.cat == WSURF_ROAD ? "ROAD" : "TERRAIN");
+                ra_ground_spikes++;
+            }
+            if (ground_cat != WSURF_NONE) { ra_prev_ground = ground_hit; ra_have_ground = 1; }
             if (race_state == 1 && ra_start < 0) {
                 ra_start = (int)ra_f; ra_cd = (int)ra_f - 60;
                 printf("RA countdown complete at frame %ld (%.2f s after Enter); "
@@ -4157,20 +4347,36 @@ int main(int argc, char **argv) {
             if (carpos[2] < -500.0f || carpos[2] > 500.0f) ra_bad |= 2;
             if (carpos[0]<-8000||carpos[0]>8000||carpos[1]<-8000||carpos[1]>8000) ra_bad |= 4;
             if (ra_start >= 0 && ra_f == ra_start)
-                printf("RA ENVELOPE contact_z %.4f  effective_ride %.4f "
-                       "(carprof.ride %.4f x wheel_scale %.4f)  body local Z [%.4f %.4f]"
+                printf("RA ENVELOPE contact_z %.4f  body_ride %.4f "
+                       "(wheel ride %.4f, stock drop %.4f)  body local Z [%.4f %.4f]"
                        "  ->  world collision Z [%.4f %.4f]  (= contact + ride + local)\n",
-                       carpos[2], car_ride, carprof.ride,
-                       g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f,
+                       carpos[2], car_body_ride, car_ride, car_body_drop,
                        carbb[2], carbb[5], car_z0, car_z1);
-            /* residual: re-query the surface with the car's NEW Z as the
-               reference, so this measures whether the projection actually
-               landed on a layer that is stable under itself. */
-            float resid = world_ground_z(&scene, carpos[0], carpos[1], carpos[2]) - carpos[2];
+            float check_z=carpos[2], check_n[3];
+            int check_cat=world_ground_pose(&scene,carpos[0],carpos[1],carpos[2],
+                                            &check_z,check_n);
+            float resid=check_cat==WSURF_NONE ? 0.0f : check_z-carpos[2];
             { float ar = resid < 0 ? -resid : resid;
               if (ar > ra_maxresid) ra_maxresid = ar;
               float ad = da_dz < 0 ? -da_dz : da_dz;
               if (ad > ra_maxpre) ra_maxpre = ad; }
+            if (g_ride_ready && (ra_f % 30 == 0 || g_ride.impact > 0.0f ||
+                                 (unsigned)ra_prev_mask != g_ride.contact_mask)) {
+                printf("RA RIDE f%-6ld z %9.4f vz %+7.3f  pitch %+6.4f/%+6.3f "
+                       "roll %+6.4f/%+6.3f  mask 0x%x air %d impact %5.3f  "
+                       "sup[%9.3f %9.3f %9.3f %9.3f] comp[%+.3f %+.3f %+.3f %+.3f] "
+                       "cat[%d %d %d %d] mesh[%d %d %d %d] tri[%d %d %d %d]\n",
+                       ra_f, g_ride.z, g_ride.vz, g_ride.pitch, g_ride.pitch_rate,
+                       g_ride.roll, g_ride.roll_rate, g_ride.contact_mask,
+                       g_ride.air_frames, g_ride.impact,
+                       g_sup.z[0],g_sup.z[1],g_sup.z[2],g_sup.z[3],
+                       g_ride.compression[0],g_ride.compression[1],
+                       g_ride.compression[2],g_ride.compression[3],
+                       ride_hit[0].cat,ride_hit[1].cat,ride_hit[2].cat,ride_hit[3].cat,
+                       ride_hit[0].mesh,ride_hit[1].mesh,ride_hit[2].mesh,ride_hit[3].mesh,
+                       ride_hit[0].tri,ride_hit[1].tri,ride_hit[2].tri,ride_hit[3].tri);
+                ra_prev_mask = (int)g_ride.contact_mask;
+            }
             if (surf_id != surf_prev)
                 printf("RA %-6ld t=%6.2fs SURFACE %s -> %s at (%.3f %.3f %.3f) "
                        "spd %.2f km/h\n", ra_f, ra_f/60.0,
@@ -4191,14 +4397,32 @@ int main(int argc, char **argv) {
                        trackname, spawn[0], spawn[1], spawn[2]);
                 printf("RA SUMMARY peak=%.2f km/h final=%.2f km/h travelled=%.2f m\n",
                        PHYS_KMH(ra_peak), PHYS_KMH(sk), ra_dist);
-                printf("RA SUMMARY ground-clamp frames=%d (sum |pre_dz| %.2f m) wall=%d rail=%d\n",
+                printf("RA SUMMARY vertical-target delta frames=%d (sum |pre_dz| %.2f m) "
+                       "wall=%d rail=%d\n",
                        ra_clamp, ra_clampsum, ra_walls, ra_rails);
-                printf("RA SUMMARY max |pre-projection delta|=%.4f m  "
-                       "max |post-projection residual|=%.4f m\n", ra_maxpre, ra_maxresid);
+                printf("RA SUMMARY ride: max body dZ/frame=%.4f m  airborne frames=%ld  "
+                       "max landing impact=%.3f m/s\n", g_ride_maxdz, g_ride_air, g_ride_maximpact);
+                printf("RA SUMMARY ride rejects: too-high layer=%ld too-low(air)=%ld "
+                       "no-cover=%ld\n", g_ride_rejhigh, g_ride_rejlow, g_ride_nocover);
+                printf("RA SUMMARY max |support delta|=%.4f m  "
+                       "max |post-contact residual|=%.4f m\n", ra_maxpre, ra_maxresid);
                 printf("RA SUMMARY first throttle-active <1km/h frame=%d (%.2f s after start) "
                        "status: nan=%d oob_z=%d oob_xy=%d\n", ra_stall,
                        ra_stall < 0 ? -1.0 : (ra_stall - ra_start)/60.0,
                        !!(ra_bad&1), !!(ra_bad&2), !!(ra_bad&4));
+                for (int sc=WSURF_ROAD; sc<=WSURF_TERRAIN; sc++) if (ca_frames[sc]) {
+                    printf("CONTACT %-7s frames=%ld patch-ok=%ld patch-held=%ld "
+                           "missing-probes=%ld mixed-layer-probes=%ld\n",
+                           sc==WSURF_ROAD?"ROAD":"TERRAIN",ca_frames[sc],
+                           ca_patch_ok[sc],ca_patch_bad[sc],ca_missing[sc],ca_mixed[sc]);
+                    if (ca_fmin[sc]<1e20f)
+                        printf("CONTACT %-7s rendered tyre-bottom residual: "
+                               "front[%+.3f..%+.3f] rear[%+.3f..%+.3f] "
+                               "max axle mismatch %.3f m  (negative=sunk)\n",
+                               sc==WSURF_ROAD?"ROAD":"TERRAIN",
+                               ca_fmin[sc],ca_fmax[sc],ca_rmin[sc],ca_rmax[sc],
+                               ca_axlemax[sc]);
+                }
                 if (world_rail_census) {
                     static const char *bn[8] = { "<0.5","0.5-1","1-1.5","1.5-2",
                                                  "2-3","3-5","5-10",">=10" };
@@ -4313,7 +4537,7 @@ int main(int argc, char **argv) {
                        trackname, spawn[0], spawn[1], spawn[2], heading0);
                 printf("DA SUMMARY peak=%.2f km/h final=%.2f km/h travelled=%.2f m\n",
                        PHYS_KMH(da_peak), PHYS_KMH(sk2), da_dist);
-                printf("DA SUMMARY ground-clamp frames=%d (sum |dz| %.2f m) "
+                printf("DA SUMMARY vertical-target delta frames=%d (sum |dz| %.2f m) "
                        "wall-response=%d rail-response=%d\n",
                        da_clamp, da_clampsum, da_walls, da_rails);
                 printf("DA SUMMARY first throttle-active <1km/h frame=%d (%.2f s)  "
@@ -4323,12 +4547,71 @@ int main(int argc, char **argv) {
             }
             da_f++;
         }
-        /* chassis pitch/roll: ease the body up-vector toward the ground normal
-           (slow lerp so sharp mesh seams don't snap the car). */
-        { float gn[3]; world_ground_normal(&scene, carpos[0], carpos[1], gn);
-          for (int a = 0; a < 3; a++) car_up[a] += (gn[a] - car_up[a]) * 0.10f;
+        /* Gameplay contact stays the exact centre triangle, but the chassis is
+           wider than one triangle. Derive its visual plane from supported
+           front/rear/left/right footprint probes on the SAME layer. If the
+           patch straddles a deck edge or has a missing probe, keep the last
+           stable pose instead of snapping to whichever tiny triangle happens
+           to cover the centre this frame. This is rigid-body road alignment,
+           not the later per-wheel suspension system. */
+        int chassis_patch_ok=0;
+        if (!sstatic && !race_auto && g_ride_ready) {
+            /* Body tilt IS the ride pitch/roll -- no second smoothing filter.
+               up = world Z tilted back by pitch and toward the low side by roll. */
+            float fx=cosf(heading), fy=sinf(heading), lx=-fy, ly=fx;
+            float sp=sinf(g_ride.pitch), sr=sinf(g_ride.roll);
+            float u[3] = { -fx*sp - lx*sr, -fy*sp - ly*sr, 1.0f };
+            float ul=sqrtf(u[0]*u[0]+u[1]*u[1]+u[2]*u[2]);
+            if (ul>1e-6f){ car_up[0]=u[0]/ul; car_up[1]=u[1]/ul; car_up[2]=u[2]/ul; }
+            chassis_patch_ok = g_ride.contact_mask == 0xF;
+        } else
+        { float gn[3] = {car_up[0],car_up[1],car_up[2]};
+          float k = 0.040f;
+          float halftrack=0.25f*(g_dbg.wheel.front_track+g_dbg.wheel.rear_track);
+          int patch_ok = ground_cat != WSURF_NONE &&
+              world_ground_patch_normal(&scene,carpos[0],carpos[1],heading,
+                                        g_dbg.wheel.front_axle,
+                                        g_dbg.wheel.rear_axle,halftrack,
+                                        &ground_hit,gn);
+          chassis_patch_ok=patch_ok;
+          if (!patch_ok && ground_cat == WSURF_NONE) {
+              gn[0]=0; gn[1]=0; gn[2]=1; k=0.015f;
+          }
+          if (patch_ok) {
+              float gh=sqrtf(gn[0]*gn[0]+gn[1]*gn[1]);
+              float maxgrade=(ground_cat==WSURF_TERRAIN ? 0.4663f : 0.2679f)
+                            * (gn[2] > 0.1f ? gn[2] : 0.1f); /* tan(25/15 deg) */
+              if (gh > maxgrade && gh > 1e-6f) {
+                  float q=maxgrade/gh; gn[0]*=q; gn[1]*=q;
+                  float gl=sqrtf(gn[0]*gn[0]+gn[1]*gn[1]+gn[2]*gn[2]);
+                  gn[0]/=gl; gn[1]/=gl; gn[2]/=gl;
+              }
+          }
+          for (int a = 0; a < 3; a++) car_up[a] += (gn[a] - car_up[a]) * k;
           float l = sqrtf(car_up[0]*car_up[0]+car_up[1]*car_up[1]+car_up[2]*car_up[2]);
           if (l > 1e-6f) { car_up[0]/=l; car_up[1]/=l; car_up[2]/=l; } }
+
+        if ((raudit || daudit) && (ground_cat==WSURF_ROAD || ground_cat==WSURF_TERRAIN)) {
+            float wr=carprof.wheel_r*(g_dbg.wheel_scale>0.05f?g_dbg.wheel_scale:1.0f);
+            float res[4]; int wcat[4]; int coherent=1;
+            wheel_contact_residuals(&scene,carpos,heading,car_up,&g_dbg.wheel,
+                                    car_ride,wr,res,wcat);
+            ca_frames[ground_cat]++;
+            if (chassis_patch_ok) ca_patch_ok[ground_cat]++;
+            else ca_patch_bad[ground_cat]++;
+            for (int i=0;i<4;i++) {
+                if (wcat[i]==WSURF_NONE) { ca_missing[ground_cat]++; coherent=0; }
+                else if (wcat[i]!=ground_cat) { ca_mixed[ground_cat]++; coherent=0; }
+            }
+            if (coherent) {
+                float fr=.5f*(res[0]+res[1]), rr=.5f*(res[2]+res[3]);
+                if (fr<ca_fmin[ground_cat]) ca_fmin[ground_cat]=fr;
+                if (fr>ca_fmax[ground_cat]) ca_fmax[ground_cat]=fr;
+                if (rr<ca_rmin[ground_cat]) ca_rmin[ground_cat]=rr;
+                if (rr>ca_rmax[ground_cat]) ca_rmax[ground_cat]=rr;
+                float ad=fabsf(fr-rr); if(ad>ca_axlemax[ground_cat])ca_axlemax[ground_cat]=ad;
+            }
+        }
 
         /* drifting? extend the tyre ribbons + puff smoke at the rear wheels */
         int drifting = (dmag > PHYS_MAXSPD*0.2f && speed > PHYS_MAXSPD*0.22f);
@@ -4337,7 +4620,8 @@ int main(int argc, char **argv) {
                ? (0.12f + 0.45f*(dmag - PHYS_MAXSPD*0.2f)/PHYS_MAXSPD) : 0.0f;
         if (g_skid > 0.35f) g_skid = 0.35f;
         if (drifting) {
-            float rx = carpos[0]-nf[0]*1.6f, ry = carpos[1]-nf[1]*1.6f, rz = carpos[2]+0.05f;
+            float rx = carpos[0]-nf[0]*1.6f, ry = carpos[1]-nf[1]*1.6f;
+            float rz = carpos[2]+0.05f;
             float curL[3]={rx+nr[0], ry+nr[1], rz}, curR[3]={rx-nr[0], ry-nr[1], rz};
             if (skidpen) {   /* connect last frame's wheel points into ribbon segments */
                 float *seg;
@@ -4494,6 +4778,8 @@ int main(int argc, char **argv) {
         int ndrawn = 0;
         g_dbg.drawn = 0;   /* per-frame draw-call tally (text glyphs excluded) */
         int wbdrawn = 0;   /* world batches only (g_dbg.drawn also counts car/HUD) */
+        int vis_scen[8] = {0};
+        int far_scen[8] = {0}, far_meshes = 0, far_batches = 0;
         static int viskept[4096]; int nviskept = 0;   /* M78: opaque batches drawn */
         if (g_debug_mode == 0 || !dbgprog) {   /* --- default textured world pass --- */
         GLuint lasttex = (GLuint)-1;
@@ -4505,7 +4791,11 @@ int main(int argc, char **argv) {
                      : (cam[0] > b->bbox_max[0] ? cam[0]-b->bbox_max[0] : 0);
             float dy = cam[1] < b->bbox_min[1] ? b->bbox_min[1]-cam[1]
                      : (cam[1] > b->bbox_max[1] ? cam[1]-b->bbox_max[1] : 0);
-            if (dx*dx + dy*dy > VIEW_DIST*VIEW_DIST) continue;
+            if (dx*dx + dy*dy > VIEW_DIST*VIEW_DIST) {
+                far_meshes += b->nmesh; far_batches++;
+                for (int sc=0;sc<8;sc++) far_scen[sc] += b->scen_count[sc];
+                continue;
+            }
             ndrawn += b->nmesh;
             if (b->tex != lasttex) {
                 if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
@@ -4513,6 +4803,7 @@ int main(int argc, char **argv) {
                 lasttex = b->tex;
             }
             draw_batch(b);
+            for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
             g_dbg.drawn++; wbdrawn++;
             if (nviskept < 4096) viskept[nviskept++] = k;
         }
@@ -4525,6 +4816,46 @@ int main(int argc, char **argv) {
             glUseProgram(rp.prog);
             glUniform1f(rp.uVColor, 0.0f);
             ndrawn += nbatch; g_dbg.drawn += nbatch; wbdrawn += nbatch;
+        }
+
+        /* Active race road closures. The navigation/collision barriers existed
+           since Phase 71 but production rendered nothing at their coordinates;
+           only the debug minimap showed a red tick, so a real collision looked
+           like an invisible wall. Draw a lightweight neon barricade across each
+           nearby closed road. Geometry comes from the exact WBarrier used by
+           world_barrier_push -- no second placement rule. */
+        if (world.mode == MODE_RACE_EVENT && world.nbar > 0 && race_state != 3) {
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glDepthMask(GL_FALSE);
+            glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,0.0f);
+            glUniform3f(uColor, 1.0f, 0.10f, 0.03f); glUniform1f(uAlpha,0.78f);
+            for (int bi=0; bi<world.nbar; bi++) {
+                const WBarrier *b=&world.bar[bi];
+                float qx=b->x-carpos[0], qy=b->y-carpos[1];
+                if (qx*qx+qy*qy > 180.0f*180.0f) continue;
+                float px=-b->dy, py=b->dx;
+                float bz=world_ground_z(&scene,b->x,b->y,carpos[2]);
+                /* two luminous cross-bars, 18 m wide */
+                for (int h=0; h<2; h++) {
+                    float z=bz+(h?1.05f:0.35f), H=0.18f, Wb=18.0f;
+                    float M[16]={px*Wb,py*Wb,0,0, 0,0,H,0, 0,0,1,0,
+                                 b->x-px*Wb*0.5f,b->y-py*Wb*0.5f,z,1};
+                    float MV[16]; mat_mul(MVP,M,MV);
+                    glUniformMatrix4fv(uMVP,1,GL_FALSE,MV); draw_gpumesh(&quad); g_dbg.drawn++;
+                }
+                /* five posts make the closure readable from oblique angles */
+                for (int p=-2; p<=2; p++) {
+                    float off=p*4.0f, Wp=0.18f, Hp=1.45f;
+                    float M[16]={px*Wp,py*Wp,0,0, 0,0,Hp,0, 0,0,1,0,
+                                 b->x+px*off-px*Wp*0.5f,
+                                 b->y+py*off-py*Wp*0.5f,bz,1};
+                    float MV[16]; mat_mul(MVP,M,MV);
+                    glUniformMatrix4fv(uMVP,1,GL_FALSE,MV); draw_gpumesh(&quad); g_dbg.drawn++;
+                }
+            }
+            glUniform1f(uAlpha,1.0f); glUniform1f(uUnlit,0.0f);
+            glUniformMatrix4fv(uMVP,1,GL_FALSE,MVP);
+            glDepthMask(GL_TRUE); glDisable(GL_BLEND);
         }
 
         /* car shadows: a soft dark blob on the ground under each car, so they
@@ -4628,28 +4959,29 @@ int main(int argc, char **argv) {
         }
 
         /* car: solid-shaded, positioned + banked to the road (up = car_up) */
+        float player_body_model[16]; int player_body_model_valid = 0;
         if (ncar) {
-            float Model[16], MVPc[16];
-            /* Ride height = this car's OWN wheel radius. Measured across every
-               car: the stock N2_CAR_TIRE hub centre sits at model Z = 0.000, so
-               the body origin must ride exactly one wheel radius above the road
-               for the tyre to touch and the hub to land inside the arch. The old
-               fixed 0.43 was wrong for every vehicle (TT floated +0.053 m, 350Z
-               +0.042, Hummer sank -0.049) -- that mismatch is what read as the
-               chassis hovering above dislocated wheels.
-               The wheel mesh is additionally scaled by wheel_scale in its own
-               matrix, so the effective radius is carWheelR*wheel_scale -- ride
-               tracks that product, keeping the car flush at any slider value. */
-            float ride = car_ride;   /* the exact value the collision envelope used */
-            mat_car(carpos, heading, car_up, ride, Model);
+            float Model[16], MVPc[16], WheelModel[16], MVPwheel[16];
+            /* Wheel contact ride is this car's own measured tyre radius. Body
+               ride may sit slightly lower for a per-car stock suspension tune;
+               both use the exact gameplay contact with no render-only Z lag. */
+            float ride = car_body_ride;   /* body collision envelope uses this ride */
+            float bodypos[3] = { carpos[0], carpos[1], carpos[2] };
+            mat_car(bodypos, heading, car_up, ride, Model);
+            memcpy(player_body_model, Model, sizeof player_body_model);
+            player_body_model_valid = 1;
             mat_mul(MVP, Model, MVPc);
+            /* Wheels never inherit the body spring/drop: their hub stays one
+               scaled tyre radius above the exact gameplay contact. */
+            mat_car(carpos, heading, car_up, car_ride, WheelModel);
+            mat_mul(MVP, WheelModel, MVPwheel);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
             /* normals stay model-space, so counter-rotate the sun into car
                space — otherwise the lit side turns with the car's heading.
                The camera goes into model space the same way, for the
                shader's reflection vector. */
             { float ch=cosf(heading), sh=sinf(heading);
-              float dx=cam[0]-carpos[0], dy=cam[1]-carpos[1], dz=cam[2]-(carpos[2]+ride);
+              float dx=cam[0]-bodypos[0], dy=cam[1]-bodypos[1], dz=cam[2]-(bodypos[2]+ride);
               glUniform3f(uLight, ch*N2_SUN_X + sh*N2_SUN_Y,
                                  -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
               glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
@@ -4665,8 +4997,8 @@ int main(int argc, char **argv) {
                  the angle step is exactly speed/wR rad (the earlier *1/60 made the
                  tread crawl ~60x too slow -- ~3 rad/s instead of ~205 at 220 km/h). */
               static float vsteer = 0.0f;
-              /* visual steer: ease the raw -1/0/1 key state toward a ~28 deg lock
-                 so the front wheels swing smoothly instead of snapping. Rotation is
+              /* Visual steer follows the same filtered input as the physics and
+                 eases it once more toward a ~28 degree wheel lock. Rotation is
                  about the wheel's own centre (the mesh is modelled at the origin and
                  the arch position lives in the translation column), so steering and
                  spin can't swing it out of the arch. Demo mode drives both from a
@@ -4678,7 +5010,7 @@ int main(int argc, char **argv) {
                   vsteer += (sinf(dt) * 0.5f - vsteer) * 0.25f;    /* +/-0.5 rad oscillation */
               } else {
                   wang += speed / wR;
-                  vsteer += (steer*0.50f - vsteer) * 0.25f;
+                  vsteer += (steer_filtered*0.50f - vsteer) * 0.25f;
               }
               wang = fmodf(wang, 6.2831853f);
               float c = cosf(wang), sn = sinf(wang);
@@ -4695,15 +5027,21 @@ int main(int argc, char **argv) {
               float wp[4][2]={{g_dbg.wheel.front_axle, fht},{g_dbg.wheel.front_axle,-fht},
                               {g_dbg.wheel.rear_axle,  rht},{g_dbg.wheel.rear_axle, -rht}};
               for(int k=0;k<4;k++){ float sy=(k&1)?-s:s;
+                  /* M130: each wheel carries its OWN suspension travel, so a
+                     grounded wheel stays on its contact while the sprung body
+                     heaves, pitches and rolls above it. A single shared height
+                     would float or sink tyres on every bump. */
+                  float wzk = wz + (g_ride_ready && !sstatic ? g_ride.compression[k] : 0.0f);
                   /* rear axle: plain scale * rotY(wang) */
                   float M[16]={s*c,0,-s*sn,0, 0,sy,0,0, s*sn,0,s*c,0,
-                               wp[k][0],wp[k][1],wz,1};
-                  memcpy(wheelTAI[k],M,sizeof(M));   /* unsteered: AI reuse these */
+                               wp[k][0],wp[k][1],wzk,1};
+                  { float Mai[16]; memcpy(Mai,M,sizeof Mai); Mai[14]=wz;
+                    memcpy(wheelTAI[k],Mai,sizeof Mai); }  /* AI: no player travel */
                   if (k < 2) {   /* front axle: rotZ(steer) * that, per column */
                       float m2[16]={ s*c*sc,  s*c*ss,  -s*sn, 0,
                                      -sy*ss,  sy*sc,    0,    0,
                                      s*sn*sc, s*sn*ss,  s*c,  0,
-                                     wp[k][0], wp[k][1], wz,  1 };
+                                     wp[k][0], wp[k][1], wzk, 1 };
                       memcpy(M, m2, sizeof M);
                   }
                   memcpy(wheelT[k],M,sizeof(M)); } }
@@ -4926,7 +5264,7 @@ int main(int argc, char **argv) {
                     glUniform1f(uUseTex, stex?1.0f:0.0f); glUniform1f(rp.uEnv, 0.25f);
                     glUniform1f(uSpec, 0.5f); glUniform3f(uColor,0.6f,0.6f,0.62f);
                     if (stex) glBindTexture(GL_TEXTURE_2D, stex);
-                    for (int k=0;k<4;k++){ float MVPw[16]; mat_mul(MVPc, wheelT[k], MVPw);
+                    for (int k=0;k<4;k++){ float MVPw[16]; mat_mul(MVPwheel, wheelT[k], MVPw);
                         glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPw); draw_gpumesh(&cgm[stock_wheel]); }
                     g_dbg.drawn+=4; glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
                     goto wheels_drawn;
@@ -4957,7 +5295,7 @@ int main(int argc, char **argv) {
                     glBindTexture(GL_TEXTURE_2D,
                         PHYS_KMH(speed) > WHEEL_BLUR_KMH ? texWheelBlur : texWheel);
                 }
-                for (int k=0;k<4;k++){ float MVPw[16]; mat_mul(MVPc, wheelT[k], MVPw);
+                for (int k=0;k<4;k++){ float MVPw[16]; mat_mul(MVPwheel, wheelT[k], MVPw);
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPw);
                     draw_gpumesh(geo ? &wheelgm[0] : &wheelmesh); }
                 g_dbg.drawn += 4;
@@ -4970,9 +5308,13 @@ int main(int argc, char **argv) {
             glUniform1f(rp.uEnv, 0.35f);
             /* AI opponents — same body, each in its own colour */
             for (int k = 0; k < nai; k++) {
-                float aup[3]; world_ground_normal(&scene, ais[k].pos[0], ais[k].pos[1], aup);
+                float aup[3], aiz=ais[k].pos[2];
+                float AIWheelModel[16], AIWheelMVP[16];
+                world_ground_pose(&scene,ais[k].pos[0],ais[k].pos[1],ais[k].pos[2],&aiz,aup);
                 mat_car(ais[k].pos, ais[k].head, aup, ride, Model);   /* AI: same per-car ride */
                 mat_mul(MVP, Model, MVPc);
+                mat_car(ais[k].pos, ais[k].head, aup, car_ride, AIWheelModel);
+                mat_mul(MVP, AIWheelModel, AIWheelMVP);
                 glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPc);
                 { float ch=cosf(ais[k].head), sh=sinf(ais[k].head);
                   float dx=cam[0]-ais[k].pos[0], dy=cam[1]-ais[k].pos[1];
@@ -4985,7 +5327,7 @@ int main(int argc, char **argv) {
                     if (cgm[i].cat != N2_CAR_TIRE) { draw_gpumesh(&cgm[i]); g_dbg.drawn++; }
                 if (have_wheel && g_dbg.show_tires) {     /* procedural tyres */
                     glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, texWheel);
-                    for (int w=0;w<4;w++){ float MVPw[16]; mat_mul(MVPc, wheelTAI[w], MVPw);
+                    for (int w=0;w<4;w++){ float MVPw[16]; mat_mul(AIWheelMVP, wheelTAI[w], MVPw);
                         glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPw); draw_gpumesh(&wheelmesh); }
                     g_dbg.drawn += 4;
                     glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
@@ -5014,7 +5356,21 @@ int main(int argc, char **argv) {
                 float hd = c==0 ? heading : ais[c-1].head;
                 float fx=cosf(hd), fy=sinf(hd), rx=-fy, ry=fx;
                 for (int side=-1; side<=1; side+=2) {
-                    float bx=cp[0]-fx*1.9f+rx*0.6f*side, by=cp[1]-fy*1.9f+ry*0.6f*side, bz=cp[2]+0.5f;
+                    float bx,by,bz;
+                    int bi = side < 0 ? 2 : 3;   /* car-local rear light clusters */
+                    if (c==0 && player_body_model_valid && bloomc[bi][3]>0.5f) {
+                        float lx=bloomc[bi][0], ly=bloomc[bi][1], lz2=bloomc[bi][2];
+                        bx=player_body_model[0]*lx+player_body_model[4]*ly+
+                           player_body_model[8]*lz2+player_body_model[12];
+                        by=player_body_model[1]*lx+player_body_model[5]*ly+
+                           player_body_model[9]*lz2+player_body_model[13];
+                        bz=player_body_model[2]*lx+player_body_model[6]*ly+
+                           player_body_model[10]*lz2+player_body_model[14];
+                    } else {
+                        bx=cp[0]-fx*1.9f+rx*0.6f*side;
+                        by=cp[1]-fy*1.9f+ry*0.6f*side;
+                        bz=cp[2]+0.5f;
+                    }
                     float s=1.1f;
                     float cxp=bx-(rt[0]+up[0])*s*0.5f, cyp=by-(rt[1]+up[1])*s*0.5f, czp=bz-(rt[2]+up[2])*s*0.5f;
                     float M[16]={rt[0]*s,rt[1]*s,rt[2]*s,0, up[0]*s,up[1]*s,up[2]*s,0, 0,0,1,0, cxp,cyp,czp,1};
@@ -5561,6 +5917,17 @@ int main(int argc, char **argv) {
             free(px); free(fl);
             printf("frame avg: %.1f ms (vsync on), %d/%d world meshes drawn, %d draw calls\n",
                    (SDL_GetTicks()-t0)/(float)shotframe, ndrawn, nm, g_dbg.drawn);
+            printf("visible scenery:");
+            for (int sc=1; sc<=N2_SC_OTHER; sc++)
+                if (vis_scen[sc]) printf("  %s=%d", n2_scen_name(sc), vis_scen[sc]);
+            printf("\n");
+            if (mapaudit) {
+                printf("MAP rejected by %.0f m XY distance: %d meshes in %d batches",
+                       (double)VIEW_DIST,far_meshes,far_batches);
+                for (int sc=1;sc<=N2_SC_OTHER;sc++)
+                    if (far_scen[sc]) printf("  %s=%d",n2_scen_name(sc),far_scen[sc]);
+                printf("\n");
+            }
             printf("camera XYZ: (%.1f, %.1f, %.1f)  looking at car (%.1f, %.1f, %.1f)\n",
                    cam[0], cam[1], cam[2], carpos[0], carpos[1], carpos[2]);
             if (sstatic) {
@@ -5600,6 +5967,21 @@ int main(int argc, char **argv) {
                                viskept[a], b3->nmesh, b3->texkey, lo, hi,
                                sx > sy ? sx : sy, b3->bbox_max[2]-b3->bbox_min[2]);
                     }
+                }
+            }
+            if (raudit || daudit) {
+                for (int sc=WSURF_ROAD; sc<=WSURF_TERRAIN; sc++) if (ca_frames[sc]) {
+                    printf("CONTACT %-7s frames=%ld patch-ok=%ld patch-held=%ld "
+                           "missing-probes=%ld mixed-layer-probes=%ld\n",
+                           sc==WSURF_ROAD?"ROAD":"TERRAIN",ca_frames[sc],
+                           ca_patch_ok[sc],ca_patch_bad[sc],ca_missing[sc],ca_mixed[sc]);
+                    if (ca_fmin[sc]<1e20f)
+                        printf("CONTACT %-7s rendered tyre-bottom residual: "
+                               "front[%+.3f..%+.3f] rear[%+.3f..%+.3f] "
+                               "max axle mismatch %.3f m  (negative=sunk)\n",
+                               sc==WSURF_ROAD?"ROAD":"TERRAIN",
+                               ca_fmin[sc],ca_fmax[sc],ca_rmin[sc],ca_rmax[sc],
+                               ca_axlemax[sc]);
                 }
             }
             { float f[3]={cosf(heading),sinf(heading),0};   /* pitch/roll from car_up */

@@ -184,10 +184,45 @@ enum { WSURF_NONE = 0, WSURF_ROAD, WSURF_TERRAIN };
  * layer-selection rule, not two. */
 int world_ground_at(const N2Scene *s, float x, float y, float fallback, float *outz);
 
-float world_ground_z(const N2Scene *s, float x, float y, float fallback);
+/* Same layer-selection rule, with the selected triangle's unit normal. Height
+ * and chassis orientation therefore cannot come from different stacked decks. */
+int world_ground_pose(const N2Scene *s, float x, float y, float fallback,
+                      float *outz, float outn[3]);
 
-/* Unit up-normal of the ground triangle under (x,y); (0,0,1) if off-track. */
-void world_ground_normal(const N2Scene *s, float x, float y, float n[3]);
+/* Full result from the same ground selector. `mesh` is always an index in the
+ * caller's scene (also when the world grid fast path uses a scratch scene).
+ * Intended for contact diagnostics; it does not change selection behaviour. */
+typedef struct {
+    int mesh, tri, cat;
+    float z, normal[3];
+} WGroundHit;
+int world_ground_hit(const N2Scene *s, float x, float y, float fallback,
+                     WGroundHit *hit);
+
+/* Derive a chassis plane from the footprint around an already-selected centre
+ * contact. Returns 0 when the footprint cannot be supported by one coherent
+ * layer; callers then keep their previous stable orientation. */
+int world_ground_patch_normal(const N2Scene *s, float x, float y, float heading,
+                              float front, float rear, float halftrack,
+                              const WGroundHit *centre, float outn[3]);
+
+/* Reachable wheel support (M130). Unlike world_ground_hit, which always returns
+ * the layer nearest the reference, this rejects a covering surface that is not
+ * within the wheel's own bump/droop reach of `wheel_z`. That rejection is the
+ * whole point: on L4RB the selected layer jumped from ROAD z=-9.114 to TERRAIN
+ * z=+4.224 in 16 frames, and a surface 12.96 m away is not suspension support.
+ * Among reachable candidates the HIGHEST wins, so a kerb lip inside bump travel
+ * is ridden over instead of being ignored for the road under it.
+ * Returns WSURF_* on success, WSURF_NONE otherwise. On failure `hit` still
+ * carries the nearest covering surface (if any) and *reason is:
+ *   0 nothing covers the XY, 1 the nearest candidate is too far ABOVE,
+ *   2 the nearest candidate is too far BELOW (the wheel should be airborne). */
+int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
+                        float reach_up, float reach_down,
+                        WGroundHit *hit, int *reason);
+
+float world_ground_z(const N2Scene *s, float x, float y, float fallback);
+void world_ground_selftest(void);
 
 /* Push the car circle (centre pos[3], radius r) out of any near-vertical
    guardrail/fence face baked into the road/terrain. Returns 1 if it pushed. */

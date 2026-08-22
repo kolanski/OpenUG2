@@ -15,7 +15,7 @@
 #define PHYS_MAXSPD   (61.0f/PHYS_TICKRATE)   /* 220 km/h cap (m/tick) */
 #define PHYS_ACCEL    (7.0f/(PHYS_TICKRATE*PHYS_TICKRATE)) /* 7 m/s^2 peak thrust */
 #define PHYS_FRICTION 0.99886f /* rolling+air drag; equilibrium lands at MAXSPD */
-#define PHYS_TURN     0.045f   /* steering rate at full authority (rad/tick) */
+#define PHYS_TURN     0.024f   /* full-lock yaw gain; ~105 deg/2s at 50 km/h */
 #define PHYS_GRIP     0.86f    /* lateral scrub per tick (lower = grippier) */
 /* km/h for the HUD from a m/tick forward speed */
 #define PHYS_KMH(v)   ((v) * PHYS_TICKRATE * 3.6f)
@@ -66,6 +66,77 @@ typedef struct {
  * lateral grip. Every factor is clamped, so a bus cannot invert the model. */
 PhysVehicle phys_vehicle_from_geometry(float body_len, float body_wid, float body_hgt,
                                        float wheelbase, float track, float tyre_w);
+
+/* Keyboard/gamepad steering response: fast enough to catch a corner, gradual
+ * enough that one A/D frame cannot command instant full lock. */
+float phys_steer_response(float current, float target);
+
+/* ---- sprung ride / four-wheel contact (M130) --------------------------------
+ * The player used to be pinned to one centre triangle: carpos[2] = gz every
+ * frame. That copied every seam exactly, teleported the car 12.96 m when the
+ * selected layer changed on L4RB, and made airborne motion impossible.
+ *
+ * This is the replacement foundation: four independent wheel contacts drive one
+ * sprung body with heave, pitch and roll. It is deliberately pure -- no scene,
+ * no GL, no SDL, no hidden statics -- so the world query and the integrator can
+ * be tested apart.
+ *
+ * UNITS. Everything here is metres, seconds and radians, and dt is passed in
+ * explicitly. The horizontal arcade model above uses m/tick; do NOT mix them.
+ */
+
+/* Travel and response. Justified by the acceptance targets rather than taste:
+ *   PHYS_RIDE_FREQ / ZETA give a settle time of 4/(zeta*omega) = 0.32 s, so a
+ *   0.25 m displacement is inside 2 cm well within the 1.5 s budget, and a
+ *   0.20 m step cannot be absorbed instantly because BUMP caps the compression
+ *   the spring can see in one frame.
+ *   REACH_UP/REACH_DOWN bound the SEARCH, not the travel; the upper-deck guard
+ *   is closest-|dz|-wins in world_wheel_support, not the band itself. */
+#define PHYS_RIDE_BUMP     0.12f   /* max compression, m                        */
+#define PHYS_RIDE_DROOP    0.18f   /* max extension before the wheel hangs, m   */
+/* Reach is the SEARCH band, not the travel band. A band alone cannot separate a
+ * legitimate support change (0.82 m at 100 km/h on L4RA) from a bogus layer
+ * switch (12.96 m on L4RB), because a car that has sunk under a deck needs a
+ * wide UP reach to climb back out. The upper-deck guard is closest-|dz|-wins in
+ * world_wheel_support: standing on a road, the road is 0 m away, so a deck
+ * overhead can never win no matter how wide REACH_UP is. Support found below
+ * full droop is still tracked, but it exerts no force, so the car free-falls
+ * toward it instead of being yanked, and LIFT_MAX rate-limits the climb out. */
+#define PHYS_RIDE_REACH_UP   10.00f   /* recover a sunk car; closest-wins keeps
+                                         a real upper deck out regardless      */
+#define PHYS_RIDE_REACH_DOWN  3.00f   /* beyond this the wheel is in free fall */
+#define PHYS_RIDE_LIFT_MAX    0.50f   /* max bump-stop correction per frame, m */
+#define PHYS_RIDE_FREQ     2.25f   /* undamped natural frequency, Hz            */
+#define PHYS_RIDE_ZETA     0.90f   /* damping ratio: near-critical at rest      */
+#define PHYS_RIDE_G        9.81f   /* m/s^2                                     */
+#define PHYS_RIDE_MAXTILT  0.35f   /* pitch/roll clamp, rad (~20 deg)           */
+#define PHYS_RIDE_REBOUND  0.25f   /* fraction of impact speed returned         */
+
+typedef struct {
+    float z, vz;                 /* sprung body reference plane, m and m/s      */
+    float pitch, pitch_rate;     /* + = nose up,     rad, rad/s                 */
+    float roll,  roll_rate;      /* + = left side up, rad, rad/s                */
+    float compression[4];        /* m, + = compressed, - = drooping             */
+    unsigned contact_mask;       /* bit k set = wheel k has reachable support   */
+    int   air_frames;            /* consecutive frames with no contact at all   */
+    float impact;                /* |vz| at the frame contact was regained, m/s */
+} PhysRideState;
+
+/* One frame of support, gathered by the caller from the world. ax/ay are the
+ * wheel offsets in body space (+x forward, +y left); the integrator re-centres
+ * them on their own centroid so a car at rest generates exactly zero torque. */
+typedef struct {
+    float z[4];      /* world support height under each wheel, m */
+    int   valid[4];  /* 1 = reachable support this frame          */
+    float ax[4], ay[4];
+} PhysRideSupport;
+
+/* Static equilibrium on the given support: zero velocity, zero impact, level. */
+void phys_ride_init(PhysRideState *r, const PhysRideSupport *s);
+/* Advance one fixed step. dt in seconds (the game passes 1.0f/60.0f). */
+void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt);
+/* World Z of wheel k's contact point under the current body pose. */
+float phys_ride_wheel_z(const PhysRideState *r, const PhysRideSupport *s, int k);
 
 /* sf == NULL is the road profile; vh == NULL is a neutral car. */
 float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,

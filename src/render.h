@@ -44,6 +44,7 @@ typedef struct {
     uint32_t texkey;          /* first member mesh's TPK key (debugging) */
     GLuint tex;               /* resolved GL texture (0 = untextured fallback) */
     int nmesh;                /* source meshes merged in (drawn-mesh metric) */
+    int scen_count[8];        /* source N2_SC_* membership (visibility audit) */
     int emit_idx;             /* pre-sort emission index: upload_world_batches
                                  re-sorts by texture, so the draw-time array
                                  index is NOT the index batch_emit saw (M79) */

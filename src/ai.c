@@ -80,8 +80,9 @@ void ai_step(AiCar *ai, int k, const N2Path *aipath, N2Scene *scene,
     if (ai->spd < PHYS_MAXSPD*0.11f) ai->spd = PHYS_MAXSPD*0.11f;
     ai->pos[0] += cosf(ai->head)*ai->spd;
     ai->pos[1] += sinf(ai->head)*ai->spd;
-    float agz = world_ground_z(scene, ai->pos[0], ai->pos[1], ai->pos[2]);
-    ai->pos[2] += (agz - ai->pos[2]) * 0.35f;
+    float agz=ai->pos[2];
+    if (world_ground_at(scene,ai->pos[0],ai->pos[1],ai->pos[2],&agz)!=WSURF_NONE)
+        ai->pos[2]=agz;  /* same stable contact rule as the player */
     /* lap: count when loop-progress wraps past the start/finish */
     int rel = (n2_nearest_wp(aipath, ai->pos[0], ai->pos[1]) - start_idx
                + aipath->n) % aipath->n;
