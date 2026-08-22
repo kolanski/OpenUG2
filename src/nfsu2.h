@@ -590,13 +590,21 @@ static int n2_mesh_texslots(const unsigned char *d, long beg, long end,
                             uint32_t *out, int cap);
 static uint32_t n2_resolve_key(uint32_t v, const uint32_t *keys, int nkeys);
 
-static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *scene,
+/* M132: when set, vista/LOD impostors are EMITTED into this scene instead of
+ * being dropped on the floor. They still never reach the ordinary world scene,
+ * so ground, collision, navigation and spawn selection are untouched -- those
+ * all query the world scene. NULL restores the old discard exactly. */
+static N2Scene *n2_vista_out = NULL;
+static long n2_vista_objs = 0, n2_vista_pan = 0, n2_vista_fam = 0;
+
+static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *scene0,
                            const uint32_t *keys, int nkeys) {
     long o = beg;
     while (o + 8 <= end) {
         uint32_t magic = n2_u32(d + o), size = n2_u32(d + o + 4);
         long ds = o + 8;
         if (magic == 0x80134010u) {
+            N2Scene *scene = scene0;   /* redirected below for vista impostors */
             int cat = n2_mesh_category(d, ds, ds + size);
             char anm[40]; n2_mesh_name(d, ds, ds + size, anm, sizeof anm);
             int sc = n2_scen_class(anm);
@@ -609,7 +617,10 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                centroids form the coherent city that matches the nav graph), so
                cull only the impostors. ponytail: cull, not a backdrop-ring pass --
                re-add far-plane billboards if the empty horizon ever matters. */
-            if (!strncmp(anm, "PAN", 3)) { o = ds + size; continue; }
+            if (!strncmp(anm, "PAN", 3)) {
+                if (!n2_vista_out) { o = ds + size; continue; }
+                scene = n2_vista_out; n2_vista_objs++; n2_vista_pan++;
+            }
             uint32_t tk = n2_mesh_texkey_cat(d, ds, ds + size, cat, keys, nkeys);
             float objm[16]; n2_obj_matrix(d, ds, ds + size, objm);   /* world placement */
             /* Backdrop impostors the PAN_ prefix above does not catch: retail
@@ -617,10 +628,13 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                they were reaching the world as ordinary opaque TERRAIN and walling
                the camera in (Milestone 75). Family test first -- it is free, and
                the geometry measure below allocates. */
-            if (n2_vista_family(anm)) {
+            if (scene == scene0 && n2_vista_family(anm)) {
                 N2Geom vg;
                 if (n2_obj_geom(d, ds, ds + size, objm, &vg) &&
-                    n2_is_vista_impostor(anm, &vg)) { o = ds + size; continue; }
+                    n2_is_vista_impostor(anm, &vg)) {
+                    if (!n2_vista_out) { o = ds + size; continue; }
+                    scene = n2_vista_out; n2_vista_objs++; n2_vista_fam++;
+                }
             }
             N2Leaf vtx[64], idx[64]; int nv = 0, ni = 0;
             n2_find_leaves(d, ds, ds + size, 0x00134B01u, vtx, &nv, 64);
@@ -738,7 +752,7 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                 }
             }
         } else if (magic != 0 && (magic >> 28) == 8) {
-            n2_walk_meshes(d, ds, ds + size, scene, keys, nkeys);
+            n2_walk_meshes(d, ds, ds + size, scene0, keys, nkeys);
         }
         o = ds + size;
     }

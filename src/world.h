@@ -74,6 +74,11 @@ typedef struct {
     int    active_ev;  /* index into ev[], -1 in freeroam */
     int    nmasked;    /* directed CSR links disabled by the active barriers */
     WRace  race;       /* checkpoint / lap tracking (Phase 72) */
+    /* M132: authored backdrop impostors (PAN_*, TRN_PANARAMA*, *_WORLD_LOD),
+     * kept in their own scene. They are rendered as a background pass and are
+     * deliberately invisible to ground selection, wheel support, collision,
+     * navigation and spawn -- every one of those queries w->scene. */
+    N2Scene vista;
 } World;
 
 /* Load the navigation graph for the loaded regions from TRACKS/ROUTES<REGION>/

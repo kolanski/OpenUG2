@@ -196,7 +196,9 @@ int world_load(World *w, const char *troot, const char *trackname) {
                     ntk += n2_tpk_keys(w->master, w->mastertpk, tkeys + ntk, 16384 - ntk);
             }
         }
+        n2_vista_out = &w->vista;      /* backdrop impostors go here, not away */
         n2_walk_meshes(g->data, 0, g->len, &w->scene, tkeys, ntk);
+        n2_vista_out = NULL;
         g->mesh1 = w->scene.count;
         if (!w->have_grass)
             w->have_grass = n2_load_texture(g->data, g->len, "TRN_GRASSC", &w->grass);
@@ -277,6 +279,21 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
             if (ok && !n2_tex_noise(&tt)) { keys[n] = tk; texs[n] = upload_tex(&tt); n++; }
             if (ok) { free(tt.rgb); free(tt.dxt); }
         }
+        /* M132: vista impostors carry their own authored texture keys and are
+           decoded from the same TPK, in the same pass, before the region bytes
+           are released. They are not region-tagged, so every region gets a
+           chance at every key; a miss is silent and harmless. */
+        for (int i = 0; i < w->vista.count; i++) {
+            uint32_t tk = w->vista.meshes[i].texkey; if (!tk) continue;
+            int seen = 0; for (int j = 0; j < n; j++) if (keys[j] == tk) seen = 1;
+            if (seen || n >= cap) continue;
+            N2Tex tt = {0};
+            int ok = n2_tpk_decode(g->data, g->len, g->tpk, tk, &tt);
+            if (!ok && w->loc4) ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
+            if (!ok && w->master) ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
+            if (ok && !n2_tex_noise(&tt)) { keys[n] = tk; texs[n] = upload_tex(&tt); n++; }
+            if (ok) { free(tt.rgb); free(tt.dxt); }
+        }
         free(g->data); g->data = NULL;   /* meshes + textures live on the GPU now */
     }
     return n;
@@ -331,6 +348,36 @@ static void grid_build(World *w) {
     g_grid.meshes = s->meshes; g_grid.x0 = x0; g_grid.y0 = y0;
     g_grid.gw = gw; g_grid.gh = gh; g_grid.start = start;
     printf("ground grid: %dx%d cells, %d mesh refs\n", gw, gh, start[gw*gh]);
+    if (w->vista.count) {
+        float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f}; long tri=0;
+        for (int i = 0; i < w->vista.count; i++) {
+            const N2Mesh *m = &w->vista.meshes[i]; tri += m->nidx/3;
+            for (int v = 0; v < m->nverts; v++)
+                for (int c = 0; c < 3; c++) {
+                    float q = m->verts[v*5+c];
+                    if (q < mn[c]) mn[c] = q; if (q > mx[c]) mx[c] = q;
+                }
+        }
+        if (getenv("OPENUG2_VISTA_CENSUS")) {
+            printf("VISTA per-mesh census (name, tris, world AABB, planarity proxy):\n");
+            for (int i = 0; i < w->vista.count; i++) {
+                const N2Mesh *m = &w->vista.meshes[i];
+                float a[3]={1e30f,1e30f,1e30f}, b[3]={-1e30f,-1e30f,-1e30f};
+                for (int v = 0; v < m->nverts; v++)
+                    for (int c = 0; c < 3; c++) {
+                        float q=m->verts[v*5+c];
+                        if (q<a[c]) a[c]=q; if (q>b[c]) b[c]=q;
+                    }
+                printf("VISTA %-28s tris %5d  x[%8.0f %8.0f] y[%8.0f %8.0f] z[%8.0f %8.0f]\n",
+                       m->sname[0]?m->sname:"?", m->nidx/3,
+                       a[0],b[0],a[1],b[1],a[2],b[2]);
+            }
+        }
+        printf("vista: %d meshes (%ld tris) from %ld objects (%ld PAN_, %ld family) "
+               "bounds x[%.0f %.0f] y[%.0f %.0f] z[%.0f %.0f]\n",
+               w->vista.count, tri, n2_vista_objs, n2_vista_pan, n2_vista_fam,
+               mn[0],mx[0],mn[1],mx[1],mn[2],mx[2]);
+    } else printf("vista: none in this region\n");
 }
 
 /* ---- scripted-object entity definitions (read-only decode) ----

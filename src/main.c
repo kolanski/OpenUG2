@@ -1152,6 +1152,7 @@ int main(int argc, char **argv) {
     const char *selfexe = argv[0];   /* for the menu's track-switch re-exec */
     const char *dataroot = ".", *shot = NULL, *objdump = NULL, *carinfo = NULL;
     const char *xaudit = NULL;   /* --transform-audit REGION: GL-free placement forensics */
+    float shotyaw = 1e9f;        /* --shot-yaw DEG: fixed capture heading (M132) */
     const char *sshot = NULL;    /* --shot-static: deterministic region-local world capture */
     int passmode = 0;            /* --shot-static-pass: 0 full, 1 opaque, 2 glow, 3 sky */
     int passbatch = -1, passbatch2 = -1;   /* opaque:N or opaque:A-B -- sky + that range (M79) */
@@ -1205,6 +1206,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rendermode") && i+1 < argc) rendermode = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--daylight")) daylight = 1;
         else if (!strcmp(argv[i], "--shot-static") && i+1 < argc) sshot = argv[++i];
+        else if (!strcmp(argv[i], "--shot-yaw") && i+1 < argc)
+            shotyaw = (float)atof(argv[++i]) * 3.14159265f / 180.0f;
         else if (!strcmp(argv[i], "--static-spawn-audit") && i+1 < argc) sspawn = trackname = argv[++i];
         else if (!strcmp(argv[i], "--surface-stack") && i+3 < argc) {
             sstack = trackname = argv[++i]; stx = (float)atof(argv[++i]); sty = (float)atof(argv[++i]); }
@@ -3795,6 +3798,52 @@ int main(int argc, char **argv) {
     printf("sky: %d batch(es)%s, neon/glow: %d batch(es)\n", nsky,
            nsky ? "" : " (no SKYDOME mesh found in this region set)", nglow);
 
+    /* M132: authored backdrop impostors, batched into their own list. They come
+       from world.vista, which no ground / collision / nav / spawn query can see,
+       so this is purely a rendering tier. */
+    N2Batch *vbatch = NULL; int nvista = 0; long vista_tris = 0;
+    float vista_far = 2000.0f;
+    if (world.vista.count) {
+        GLuint *vtex = (GLuint *)calloc((size_t)world.vista.count, sizeof *vtex);
+        for (int i = 0; i < world.vista.count; i++)
+            for (int j = 0; j < ntmap; j++)
+                if (tmapkey[j] == world.vista.meshes[i].texkey) { vtex[i] = tmaptex[j]; break; }
+        /* Texture-merged, exactly like the world tier. The merge is deliberate:
+           the foreground test below runs on a batch AABB, so merging makes it
+           CONSERVATIVE -- a group is drawn only when the whole group is beyond
+           the ordinary cutoff. Per-mesh batching was tried and is worse: it
+           admits individual hill-ridge sheets whose own AABB clears the cutoff
+           but which still read as hard-edged slabs hanging over the camera
+           (captured: 151 of 188 batches admitted, visible artefact). */
+        for (int c = 0; c <= N2_GLOW; c++) {
+            N2Batch *part = NULL;
+            int np = upload_cat_batches(&world.vista, c, vtex, &part);
+            if (np) {
+                vbatch = (N2Batch *)realloc(vbatch, (size_t)(nvista+np) * sizeof *vbatch);
+                memcpy(vbatch + nvista, part, (size_t)np * sizeof *part);
+                nvista += np;
+            }
+            free(part);
+        }
+        int textured = 0;
+        for (int i = 0; i < world.vista.count; i++) {
+            vista_tris += world.vista.meshes[i].nidx/3;
+            if (vtex[i]) textured++;
+        }
+        /* the pass needs a frustum that actually reaches the backdrop */
+        for (int k = 0; k < nvista; k++)
+            for (int c = 0; c < 2; c++) {
+                float a = fabsf(vbatch[k].bbox_min[c]), b2 = fabsf(vbatch[k].bbox_max[c]);
+                if (a > vista_far) vista_far = a;
+                if (b2 > vista_far) vista_far = b2;
+            }
+        vista_far *= 2.5f;      /* the camera can stand on the far side of them */
+        printf("vista batched: %d meshes (%ld tris, %d textured) -> %d batches, "
+               "far plane %.0f m\n", world.vista.count, vista_tris, textured,
+               nvista, vista_far);
+        free(vtex);
+    }
+
     N2Batch *wbatch = NULL;
     int nbatch = upload_world_batches(&scene, (const float (*)[4])world.mbb,
                                       mtex, texTerr, &wbatch, bmesh);
@@ -4783,6 +4832,10 @@ int main(int argc, char **argv) {
             want[0] = carpos[0] + cosf(menuspin)*16.0f;
             want[1] = carpos[1] + sinf(menuspin)*16.0f;
             want[2] = carpos[2] + 8.0f;
+        } else if (shotyaw < 1e8f) {        /* --shot-yaw: fixed capture heading */
+            want[0] = carpos[0]-cosf(shotyaw)*g_dbg.chase_distance;
+            want[1] = carpos[1]-sinf(shotyaw)*g_dbg.chase_distance;
+            want[2] = carpos[2]+g_dbg.chase_height;
         } else {                            /* chase: behind + above, tunable */
             want[0] = carpos[0]-fwd[0]*g_dbg.chase_distance;
             want[1] = carpos[1]-fwd[1]*g_dbg.chase_distance;
@@ -4792,6 +4845,7 @@ int main(int argc, char **argv) {
            ease toward their ideal by `stiffness`/frame -- the target lag is what
            gives the spring/swing feel through corners. */
         float k = g_dbg.chase_stiffness; if (k < 0.02f) k = 0.02f; if (k > 1.0f) k = 1.0f;
+        if (shotyaw < 1e8f) k = 1.0f;   /* capture pose must be exact, not eased */
         for (int c=0;c<3;c++) cam[c] += (want[c]-cam[c])*k;
         static float camtgt[3]; static int camtgt_init = 0;
         float idealtgt[3] = { carpos[0], carpos[1], carpos[2]+1.5f };  /* car centre, slightly up */
@@ -4825,7 +4879,13 @@ int main(int argc, char **argv) {
            so clamp the world far plane to a realistic 2000 m: znear/zfar ~= 2000:1
            gives ample resolution. The skydome shell spans ~16 km and would clip
            at 2000, so it gets its own deep frustum (Psky) below. */
-        float zfar = 2000.0f;
+        /* Far plane from the same fog policy: nothing beyond the 1%-contribution
+           distance is drawn, so the depth range only has to cover it (plus 20%
+           headroom for batches straddling the gate). Vistas get their own deep
+           frustum in the background pass below, exactly as the sky does. */
+        float zfar = g_dbg.fog_density > 1e-5f
+                   ? 1.2f * sqrtf(-logf(0.01f)) / g_dbg.fog_density : 2000.0f;
+        if (zfar < 500.0f) zfar = 500.0f;
         mat_persp(0.9f, (float)W/H, znear, zfar, P);
         mat_lookat(cam, look, V);
         mat_mul(P, V, MVP);
@@ -4865,18 +4925,100 @@ int main(int argc, char **argv) {
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);   /* restore the real camera */
         }
 
+        /* M132: the ordinary-world cutoff is DERIVED from the active exp^2 fog
+           rather than a hard 700 m. fog = exp(-(d*density)^2), so a batch can
+           still contribute VIEW_MINCONTRIB of its own colour out to
+              d = sqrt(-ln(contrib)) / density
+           At the default density 0.0023 that is 933 m; the old 700 m gate threw
+           away everything from 700 m out to where the fog itself had not yet
+           reached 1%. Density 0 (fog off) has no such distance, so it falls back
+           to the world far plane. The test still uses batch AABBs, never
+           centres, so a long batch is kept while any part of it is in range. */
+        #define VIEW_MINCONTRIB 0.01f
+        float view_dist = g_dbg.fog_density > 1e-5f
+                        ? sqrtf(-logf(VIEW_MINCONTRIB)) / g_dbg.fog_density
+                        : zfar;
+        if (view_dist > zfar) view_dist = zfar;
+        #define VIEW_DIST view_dist
+        int vistadrawn = 0, vistanear = 0;
+        /* M132 vista pass: authored backdrop impostors, drawn after the sky and
+           before any ordinary geometry.
+             - world space, authored transforms, nothing re-placed;
+             - its own deep frustum, because the backdrops span kilometres and
+               the ordinary far plane is derived from fog;
+             - depth TEST on, depth WRITE off, so every real road, building and
+               car drawn afterwards overwrites them unconditionally -- a
+               backdrop can never occlude the city or cut through the road;
+             - textured through the normal lit path (uUnlit would discard the
+               texture and flat-fill them with the fog colour);
+             - its own fog density, because ordinary fog reaches 1% at 933 m and
+               would erase a backdrop standing kilometres out. Derived, not
+               chosen: the density that leaves the FURTHEST vista vertex at
+               VISTA_MINCONTRIB of its own colour, so the backdrop fades into
+               the same horizon haze instead of being deleted by it. */
+        if (nvista && g_dbg.show_track && (passmode == 0 || passmode == 1)) {
+            const float VISTA_MINCONTRIB = 0.35f;
+            float Pv[16], MVPv[16];
+            mat_persp(0.9f, (float)W/H, znear, vista_far, Pv);
+            mat_mul(Pv, V, MVPv);
+            glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPv);
+            float vd = vista_far > 1.0f
+                     ? sqrtf(-logf(VISTA_MINCONTRIB)) / vista_far : 0.0f;
+            glUniform1f(rp.uFogDensity, vd);
+            glDepthMask(GL_FALSE);
+            GLuint vlast = (GLuint)-1;
+            for (int k = 0; k < nvista; k++) {
+                N2Batch *b = &vbatch[k];
+                /* A backdrop is by definition BEHIND the ordinary world. If a
+                   vista batch reaches nearer than the ordinary cutoff, the
+                   camera is standing inside it and it is foreground, not
+                   context -- exactly the giant angled plane the earlier
+                   captures showed. Skip it here, by measurement, rather than
+                   moving it or dropping its family. */
+                float vdx = cam[0] < b->bbox_min[0] ? b->bbox_min[0]-cam[0]
+                          : (cam[0] > b->bbox_max[0] ? cam[0]-b->bbox_max[0] : 0);
+                float vdy = cam[1] < b->bbox_min[1] ? b->bbox_min[1]-cam[1]
+                          : (cam[1] > b->bbox_max[1] ? cam[1]-b->bbox_max[1] : 0);
+                if (vdx*vdx + vdy*vdy < VIEW_DIST*VIEW_DIST) {
+                    vistanear++;
+                    /* diagnostic escape hatch: OPENUG2_VISTA_NOCLIP=1 draws the
+                       rejected batches so a family can be photographed and
+                       attributed instead of merely counted. Never set in play. */
+                    static int noclip = -1;
+                    if (noclip < 0) noclip = getenv("OPENUG2_VISTA_NOCLIP") ? 1 : 0;
+                    if (!noclip) continue;
+                }
+                if (b->tex != vlast) {
+                    if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
+                    else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.30f, 0.32f, 0.38f); }
+                    vlast = b->tex;
+                }
+                draw_batch(b);
+                g_dbg.drawn++; vistadrawn++;
+            }
+            /* restore every piece of state the pass touched */
+            glDepthMask(GL_TRUE);
+            glUniform1f(rp.uFogDensity, g_dbg.fog_density);
+            glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
+        }
+
         /* track: one draw per visible (cell,texture) batch, texture-sorted so
            binds are rare; terrain fallback + untextured-gray are baked into
            the batch key at build time.
            cull: XY distance only — the old per-mesh size cull is gone, a
            batch's tiny meshes are ~free once merged. ponytail: no frustum
            test — add one if the batch count becomes the bottleneck. */
-        #define VIEW_DIST 700.0f
         int ndrawn = 0;
         g_dbg.drawn = 0;   /* per-frame draw-call tally (text glyphs excluded) */
         int wbdrawn = 0;   /* world batches only (g_dbg.drawn also counts car/HUD) */
         int vis_scen[8] = {0};
         int far_scen[8] = {0}, far_meshes = 0, far_batches = 0;
+        /* M132 band census: every world batch by AABB distance, whether drawn
+           or not, so the visibility policy can be judged against the source. */
+        static const float BAND[6] = {250,700,1000,1500,2000,1e9f};
+        static long band_b[6], band_m[6], band_sc[6][8];
+        if (ra_f == 0) { memset(band_b,0,sizeof band_b); memset(band_m,0,sizeof band_m);
+                         memset(band_sc,0,sizeof band_sc); }
         static int viskept[4096]; int nviskept = 0;   /* M78: opaque batches drawn */
         if (g_debug_mode == 0 || !dbgprog) {   /* --- default textured world pass --- */
         GLuint lasttex = (GLuint)-1;
@@ -4888,6 +5030,10 @@ int main(int argc, char **argv) {
                      : (cam[0] > b->bbox_max[0] ? cam[0]-b->bbox_max[0] : 0);
             float dy = cam[1] < b->bbox_min[1] ? b->bbox_min[1]-cam[1]
                      : (cam[1] > b->bbox_max[1] ? cam[1]-b->bbox_max[1] : 0);
+            { float dd = sqrtf(dx*dx+dy*dy); int bd = 0;
+              while (bd < 5 && dd >= BAND[bd]) bd++;
+              band_b[bd]++; band_m[bd] += b->nmesh;
+              for (int sc=0;sc<8;sc++) band_sc[bd][sc] += b->scen_count[sc]; }
             if (dx*dx + dy*dy > VIEW_DIST*VIEW_DIST) {
                 far_meshes += b->nmesh; far_batches++;
                 for (int sc=0;sc<8;sc++) far_scen[sc] += b->scen_count[sc];
@@ -6014,11 +6160,31 @@ int main(int argc, char **argv) {
             free(px); free(fl);
             printf("frame avg: %.1f ms (vsync on), %d/%d world meshes drawn, %d draw calls\n",
                    (SDL_GetTicks()-t0)/(float)shotframe, ndrawn, nm, g_dbg.drawn);
+            printf("tiers: ordinary %d/%d meshes in %d/%d batches (%d world draws), "
+                   "vista %d/%d meshes in %d/%d batches\n",
+                   ndrawn, nm, wbdrawn, nbatch, wbdrawn,
+                   vistadrawn ? world.vista.count : 0, world.vista.count,
+                   vistadrawn, nvista);
+            printf("vista: %d batches drawn, %d skipped as foreground "
+                   "(AABB nearer than the %.0f m ordinary cutoff)\n",
+                   vistadrawn, vistanear, (double)VIEW_DIST);
             printf("visible scenery:");
             for (int sc=1; sc<=N2_SC_OTHER; sc++)
                 if (vis_scen[sc]) printf("  %s=%d", n2_scen_name(sc), vis_scen[sc]);
             printf("\n");
             if (mapaudit) {
+                printf("BAND policy: fog density %.5f -> ordinary cutoff %.1f m "
+                       "(1%% contribution), far plane %.1f m\n",
+                       g_dbg.fog_density, (double)VIEW_DIST, zfar);
+                static const char *BN[6] = {"0-250","250-700","700-1000",
+                                            "1000-1500","1500-2000",">2000"};
+                for (int bd = 0; bd < 6; bd++) {
+                    printf("BAND %-10s batches %5ld  meshes %6ld ", BN[bd],
+                           band_b[bd], band_m[bd]);
+                    for (int sc=1;sc<=N2_SC_OTHER;sc++)
+                        if (band_sc[bd][sc]) printf(" %s=%ld",n2_scen_name(sc),band_sc[bd][sc]);
+                    printf("\n");
+                }
                 printf("MAP rejected by %.0f m XY distance: %d meshes in %d batches",
                        (double)VIEW_DIST,far_meshes,far_batches);
                 for (int sc=1;sc<=N2_SC_OTHER;sc++)
