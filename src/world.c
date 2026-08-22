@@ -1135,9 +1135,11 @@ static int wg_at(const N2Scene *s, float x, float y, float fallback,
     return wg_pick(&sub, srcmap, x, y, refz, outz, outn, hit);
 }
 
-/* Highest ROAD/TERRAIN triangle covering (x,y) inside [wz-down, wz+up]. Same
-   coverage test and the same grid fast path as wg_pick; only the acceptance
-   rule differs, so this cannot select a surface the wheel cannot reach. */
+/* ROAD/TERRAIN triangle covering (x,y) and CLOSEST to wz inside [wz-down,
+   wz+up]. Same coverage test and the same grid fast path as wg_pick; only the
+   acceptance rule differs, so this cannot select a surface the wheel cannot
+   reach. The nearest covering triangle overall is recorded separately in
+   *nearest, whether or not it is reachable, so a rejection stays attributable. */
 static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
                     float wz, float up, float down, WGroundHit *hit,
                     WGroundHit *nearest, float *neard) {
@@ -1165,11 +1167,11 @@ static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
                                nearest->cat = cat; nearest->z = z;
                                nearest->normal[0]=0; nearest->normal[1]=0; nearest->normal[2]=1; }
             }
-            if (dz > up || dz < -down) continue;     /* out of the wheel's reach */
-            /* CLOSEST candidate wins. This is what keeps a stacked deck out:
-               standing on ROAD at -9.114 the road itself is 0 m away, so the
-               TERRAIN 13 m overhead can never be selected -- no distance bias,
-               no reference flip. */
+            if (dz > up || dz < -down) continue;     /* candidate, not contact */
+            /* Among reachable candidates the CLOSEST wins: continuity, so the
+               surface the wheel is already riding (0 m away) always beats one
+               stacked above it. The window above is what refuses a deck the
+               wheel cannot reach; this tie-break is not load-bearing for that. */
             if (bestcat != WSURF_NONE && ad >= bestad) continue;
             bestcat = cat; bestad = ad;
             if (hit) {
@@ -1190,7 +1192,7 @@ static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
 
 int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
                         float reach_up, float reach_down,
-                        WGroundHit *hit, int *reason) {
+                        WGroundHit *hit, WGroundHit *cand, int *verdict) {
     WGroundHit near; float neard = 1e30f;
     near.mesh=-1; near.tri=-1; near.cat=WSURF_NONE; near.z=wheel_z;
     near.normal[0]=0; near.normal[1]=0; near.normal[2]=1;
@@ -1202,7 +1204,8 @@ int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
     else {
         int cx = (int)((x - g_grid.x0) / GCELL), cy = (int)((y - g_grid.y0) / GCELL);
         if (cx < 0 || cy < 0 || cx >= g_grid.gw || cy >= g_grid.gh) {
-            if (reason) *reason = 0;
+            if (cand) *cand = near;
+            if (verdict) *verdict = WWS_NOCOVER;
             return WSURF_NONE;
         }
         static N2Mesh scratch[512];
@@ -1214,11 +1217,13 @@ int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
         }
         cat = wws_pick(&sub, srcmap, x, y, wheel_z, reach_up, reach_down, hit, &near, &neard);
     }
-    if (cat == WSURF_NONE) {
-        if (hit && near.mesh >= 0) *hit = near;      /* attribution for the audit */
-        if (reason) *reason = near.mesh < 0 ? 0 : (near.z > wheel_z ? 1 : 2);
-    } else if (reason) *reason = -1;
-    return cat;
+    if (cand) *cand = near;                  /* attribution, reachable or not */
+    if (cat != WSURF_NONE) { if (verdict) *verdict = WWS_CONTACT; return cat; }
+    /* No contact: say WHY, and hand the caller the candidate it refused. */
+    if (hit && near.mesh >= 0) *hit = near;
+    if (verdict) *verdict = near.mesh < 0 ? WWS_NOCOVER
+                          : (near.z > wheel_z ? WWS_ABOVE : WWS_BELOW);
+    return WSURF_NONE;
 }
 
 int world_ground_at(const N2Scene *s, float x, float y, float fallback, float *outz) {

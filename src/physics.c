@@ -60,14 +60,59 @@ float phys_ride_wheel_z(const PhysRideState *r, const PhysRideSupport *s, int k)
 
 void phys_ride_init(PhysRideState *r, const PhysRideSupport *s) {
     memset(r, 0, sizeof *r);
-    float sum = 0; int n = 0;
-    for (int k = 0; k < 4; k++) if (s->valid[k]) { sum += s->z[k]; n++; }
+    float ax[4], ay[4], ip, ir; pr_axes(s, ax, ay, &ip, &ir);
+    float sum = 0, lo = 1e30f, hi = -1e30f; int n = 0;
+    for (int k = 0; k < 4; k++) if (s->valid[k]) {
+        sum += s->z[k]; n++;
+        if (s->z[k] < lo) lo = s->z[k];
+        if (s->z[k] > hi) hi = s->z[k];
+    }
     r->z = n ? sum / n : s->z[0];
-    r->contact_mask = 0;
-    for (int k = 0; k < 4; k++) if (s->valid[k]) r->contact_mask |= 1u << k;
+    (void)lo; (void)hi;
+    /* Fit the resting plane. Three coherent contacts are the minimum that
+       defines one; below that do not invent a pose out of two points. */
+    if (n >= 3) {
+        float sp = 0, sr = 0, wp = 0, wr = 0;
+        for (int k = 0; k < 4; k++) if (s->valid[k]) {
+            float d = s->z[k] - r->z;
+            sp += ax[k]*d; wp += ax[k]*ax[k];
+            sr += ay[k]*d; wr += ay[k]*ay[k];
+        }
+        if (wp > 1e-4f) r->pitch = sp / wp;
+        if (wr > 1e-4f) r->roll  = sr / wr;
+        /* Coherence is judged on the RESIDUAL, not on the raw spread: a car on
+           an 8% grade legitimately sees 0.25 m across a 3.1 m wheelbase, and
+           that is one plane. A wheel standing on a different layer is not, and
+           shows up as a residual no plane can absorb. */
+        float res = 0;
+        for (int k = 0; k < 4; k++) if (s->valid[k]) {
+            float e = s->z[k] - (r->z + ax[k]*r->pitch + ay[k]*r->roll);
+            if (e < 0) e = -e;
+            if (e > res) res = e;
+        }
+        float ap = r->pitch < 0 ? -r->pitch : r->pitch;
+        float ar = r->roll  < 0 ? -r->roll  : r->roll;
+        if (res > PHYS_RIDE_PLANE_SPREAD ||
+            ap > PHYS_RIDE_MAXTILT || ar > PHYS_RIDE_MAXTILT) {
+            r->pitch = 0; r->roll = 0;       /* unrelated layers: stay level */
+        }
+    }
+    for (int k = 0; k < 4; k++) {
+        if (!s->valid[k]) { r->compression[k] = -PHYS_RIDE_DROOP; continue; }
+        r->contact_mask |= 1u << k;
+        float c = s->z[k] - (r->z + ax[k]*r->pitch + ay[k]*r->roll);
+        if (c >  PHYS_RIDE_BUMP)  c =  PHYS_RIDE_BUMP;
+        if (c < -PHYS_RIDE_DROOP) c = -PHYS_RIDE_DROOP;
+        r->compression[k] = c;
+    }
     /* An unsupported spawn is NOT silently grounded: it starts airborne and
        falls, exactly as a mid-air placement should. */
     r->air_frames = n ? 0 : 1;
+}
+
+float phys_ride_reach_down(const PhysRideState *r, float dt) {
+    float fall = r->vz < 0 ? -r->vz * dt : 0.0f;
+    return PHYS_RIDE_DROOP + fall;
 }
 
 void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
@@ -78,6 +123,7 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
 
     unsigned was = r->contact_mask;
     r->impact = 0.0f;
+    r->lift   = 0.0f;
 
     /* per-wheel compression and force. The +G preload makes zero compression
        the resting equilibrium, so a fully supported car sits exactly on its
@@ -111,17 +157,18 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
         r->pitch += r->pitch_rate * dt; r->roll += r->roll_rate * dt;
         r->air_frames++;
     } else {
-        if (!was) r->impact = r->vz < 0 ? -r->vz : r->vz;   /* landing frame */
+        /* Landing frame: record the arrival speed for the caller, then let the
+           spring and damper absorb it. There is deliberately NO restitution
+           term. One used to force vz to 0.25*impact here, AFTER the damper had
+           already resolved the frame, so landing energy was handled twice and a
+           single 4.4 m/s arrival on a continuous -6% road launched the car into
+           a 6-hop, 174-of-180-frame ballistic cycle (M130-R2 case 1). */
+        if (!was) r->impact = r->vz < 0 ? -r->vz : r->vz;
         float fz = 0, tp = 0, tr = 0;
         for (int k = 0; k < 4; k++) { fz += force[k]; tp += ax[k]*force[k]; tr += ay[k]*force[k]; }
         r->vz         += (fz * 0.25f - PHYS_RIDE_G) * dt;
         r->pitch_rate += (tp / ip) * dt;
         r->roll_rate  += (tr / ir) * dt;
-        if (r->impact > 0.0f) {                    /* bounded landing rebound */
-            float rb = r->impact * PHYS_RIDE_REBOUND;
-            if (rb > 1.5f) rb = 1.5f;
-            if (r->vz < rb) r->vz = rb;
-        }
         r->z     += r->vz * dt;
         r->pitch += r->pitch_rate * dt;
         r->roll  += r->roll_rate  * dt;
@@ -142,10 +189,14 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
         float over = (s->z[k] - wz) - PHYS_RIDE_BUMP;
         if (over > pen) pen = over;
     }
-    if (pen > 0) {                       /* rate-limited so recovery is fast
-                                            but never an instant teleport */
-        if (pen > PHYS_RIDE_LIFT_MAX) pen = PHYS_RIDE_LIFT_MAX;
-        r->z += pen; if (r->vz < 0) r->vz = 0;
+    if (pen > 0) {
+        /* Bounded by the travel that produced it: one frame cannot push a valid
+           contact further than full bump past its stop, so this can correct a
+           penetration but can never lift the body across a surface. Only
+           reachable contacts reach this loop, so an out-of-reach deck overhead
+           contributes nothing. */
+        if (pen > PHYS_RIDE_PEN_MAX) pen = PHYS_RIDE_PEN_MAX;
+        r->z += pen; r->lift = pen; if (r->vz < 0) r->vz = 0;
     }
 
     /* refresh the reported compressions after the clamp/bump-stop */

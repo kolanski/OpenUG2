@@ -89,28 +89,47 @@ float phys_steer_response(float current, float target);
  *   PHYS_RIDE_FREQ / ZETA give a settle time of 4/(zeta*omega) = 0.32 s, so a
  *   0.25 m displacement is inside 2 cm well within the 1.5 s budget, and a
  *   0.20 m step cannot be absorbed instantly because BUMP caps the compression
- *   the spring can see in one frame.
- *   REACH_UP/REACH_DOWN bound the SEARCH, not the travel; the upper-deck guard
- *   is closest-|dz|-wins in world_wheel_support, not the band itself. */
+ *   the spring can see in one frame. */
 #define PHYS_RIDE_BUMP     0.12f   /* max compression, m                        */
 #define PHYS_RIDE_DROOP    0.18f   /* max extension before the wheel hangs, m   */
-/* Reach is the SEARCH band, not the travel band. A band alone cannot separate a
- * legitimate support change (0.82 m at 100 km/h on L4RA) from a bogus layer
- * switch (12.96 m on L4RB), because a car that has sunk under a deck needs a
- * wide UP reach to climb back out. The upper-deck guard is closest-|dz|-wins in
- * world_wheel_support: standing on a road, the road is 0 m away, so a deck
- * overhead can never win no matter how wide REACH_UP is. Support found below
- * full droop is still tracked, but it exerts no force, so the car free-falls
- * toward it instead of being yanked, and LIFT_MAX rate-limits the climb out. */
-#define PHYS_RIDE_REACH_UP   10.00f   /* recover a sunk car; closest-wins keeps
-                                         a real upper deck out regardless      */
-#define PHYS_RIDE_REACH_DOWN  3.00f   /* beyond this the wheel is in free fall */
-#define PHYS_RIDE_LIFT_MAX    0.50f   /* max bump-stop correction per frame, m */
+
+/* CONTACT REACH (M130-R). This is the window in which a covering triangle is a
+ * suspension CONTACT. It is not a search band: the world query may look as far
+ * as it likes for attribution, but only a candidate inside this window may set
+ * valid[k], carry spring force, or seed the initial pose.
+ *
+ * UP is bounded by what the wheel can physically climb, in centimetres:
+ * BUMP (0.12 m) is what the spring absorbs, and the remaining 0.13 m is tyre
+ * roll-over -- still under half the smallest fleet tyre radius (~0.30 m), so it
+ * is a lip a tyre can mount rather than a wall. Cross-checked against speed: at
+ * the 220 km/h cap the car covers 61.1/60 = 1.018 m per frame, so 0.25 m is a
+ * 24.6% grade (13.8 deg) -- steeper than any drivable authored road, and the
+ * allowance only grows as a share of the frame step as the car slows.
+ *
+ * DOWN is suspension droop, plus the distance the wheel actually falls during
+ * the frame (phys_ride_reach_down). The swept term is not a widened band: it is
+ * the segment the contact point sweeps, so a fast landing cannot tunnel through
+ * a floor between two samples. At the 35 m/s worst case measured on L4RA it is
+ * 0.58 m; at rest it is exactly DROOP.
+ *
+ * There is deliberately NO multi-metre reach and no recovery lift. A body under
+ * a deck stays under it and remains observable; climbing out is a respawn or
+ * collision problem, not a suspension one. */
+#define PHYS_RIDE_REACH_UP    0.25f   /* bump travel + tyre roll-over, m       */
+#define PHYS_RIDE_REACH_DOWN  PHYS_RIDE_DROOP  /* static part; see reach_down  */
+/* Penetration guard bound: one frame can push a valid contact at most this far
+ * past full bump, so the correction can never exceed the travel that produced
+ * it. Applies to reachable contacts only. */
+#define PHYS_RIDE_PEN_MAX  (PHYS_RIDE_BUMP + 0.001f)
+/* Largest per-wheel RESIDUAL a fitted spawn plane may leave. Judged on the
+ * residual rather than the raw spread, because a car on an 8% grade
+ * legitimately sees 0.25 m across a 3.1 m wheelbase and that IS one plane,
+ * while a wheel on another layer leaves an error no plane can absorb. */
+#define PHYS_RIDE_PLANE_SPREAD (PHYS_RIDE_BUMP + PHYS_RIDE_DROOP)
 #define PHYS_RIDE_FREQ     2.25f   /* undamped natural frequency, Hz            */
 #define PHYS_RIDE_ZETA     0.90f   /* damping ratio: near-critical at rest      */
 #define PHYS_RIDE_G        9.81f   /* m/s^2                                     */
 #define PHYS_RIDE_MAXTILT  0.35f   /* pitch/roll clamp, rad (~20 deg)           */
-#define PHYS_RIDE_REBOUND  0.25f   /* fraction of impact speed returned         */
 
 typedef struct {
     float z, vz;                 /* sprung body reference plane, m and m/s      */
@@ -120,6 +139,7 @@ typedef struct {
     unsigned contact_mask;       /* bit k set = wheel k has reachable support   */
     int   air_frames;            /* consecutive frames with no contact at all   */
     float impact;                /* |vz| at the frame contact was regained, m/s */
+    float lift;                  /* penetration guard applied this frame, m     */
 } PhysRideState;
 
 /* One frame of support, gathered by the caller from the world. ax/ay are the
@@ -131,8 +151,17 @@ typedef struct {
     float ax[4], ay[4];
 } PhysRideSupport;
 
-/* Static equilibrium on the given support: zero velocity, zero impact, level. */
+/* Static equilibrium on the given support. Solves heave, pitch and roll from
+ * the valid wheel heights (least squares on the re-centred offsets), so a car
+ * spawned on a slope starts ON that slope with zero residual, zero velocity,
+ * zero impact and no first-frame bump-stop correction. Needs three coherent
+ * contacts: with fewer, or with a support spread wider than
+ * PHYS_RIDE_PLANE_SPREAD (unrelated stacked layers), no plane is invented and
+ * the pose starts level. With no valid support it starts airborne. */
 void phys_ride_init(PhysRideState *r, const PhysRideSupport *s);
+/* Downward contact reach for the NEXT gather: droop plus the distance the body
+ * falls during one step, so a fast landing cannot tunnel past a floor. */
+float phys_ride_reach_down(const PhysRideState *r, float dt);
 /* Advance one fixed step. dt in seconds (the game passes 1.0f/60.0f). */
 void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt);
 /* World Z of wheel k's contact point under the current body pose. */

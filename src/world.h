@@ -206,20 +206,34 @@ int world_ground_patch_normal(const N2Scene *s, float x, float y, float heading,
                               float front, float rear, float halftrack,
                               const WGroundHit *centre, float outn[3]);
 
-/* Reachable wheel support (M130). Unlike world_ground_hit, which always returns
- * the layer nearest the reference, this rejects a covering surface that is not
- * within the wheel's own bump/droop reach of `wheel_z`. That rejection is the
- * whole point: on L4RB the selected layer jumped from ROAD z=-9.114 to TERRAIN
- * z=+4.224 in 16 frames, and a surface 12.96 m away is not suspension support.
- * Among reachable candidates the HIGHEST wins, so a kerb lip inside bump travel
- * is ridden over instead of being ignored for the road under it.
- * Returns WSURF_* on success, WSURF_NONE otherwise. On failure `hit` still
- * carries the nearest covering surface (if any) and *reason is:
- *   0 nothing covers the XY, 1 the nearest candidate is too far ABOVE,
- *   2 the nearest candidate is too far BELOW (the wheel should be airborne). */
+/* Reachable wheel support (M130, corrected in M130-R).
+ *
+ * CANDIDATE vs CONTACT. A triangle covering the wheel XY is a CANDIDATE. Only a
+ * candidate inside the wheel's own contact window -- [wheel_z - reach_down,
+ * wheel_z + reach_up], both measured in centimetres, not metres -- is a
+ * suspension CONTACT. The distinction is the whole point: on L4RB the selected
+ * layer jumped from ROAD z=-9.114 to TERRAIN z=+4.224 in 16 frames, and a
+ * surface metres overhead is a candidate the wheel can see, never support it
+ * can stand on. There is no recovery reach: a car under a deck stays under it.
+ *
+ * SELECTION RULE among reachable candidates: the one CLOSEST to wheel_z wins
+ * (smallest |dz|). Continuity, not height: the surface the wheel is already
+ * riding is 0 m away and therefore always beats anything stacked above it, and
+ * when the layer the wheel is on ends, the window -- not the tie-break -- is
+ * what refuses the remaining layer overhead. (Measured: with the window at
+ * 0.25/0.18 the L4RB deck 7.0 m up is rejected outright.)
+ *
+ * Returns WSURF_* when there is a contact and fills `hit` with it; returns
+ * WSURF_NONE otherwise. `cand` (optional) always receives the nearest covering
+ * candidate, contact or not, so a rejection can still be attributed to a mesh
+ * and triangle. *verdict is one of: */
+#define WWS_CONTACT  0   /* reachable contact; `hit` is valid                  */
+#define WWS_ABOVE    1   /* nearest candidate is above the contact window      */
+#define WWS_BELOW    2   /* nearest candidate is below it: the wheel is in air */
+#define WWS_NOCOVER  3   /* no triangle covers the XY at all                   */
 int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
                         float reach_up, float reach_down,
-                        WGroundHit *hit, int *reason);
+                        WGroundHit *hit, WGroundHit *cand, int *verdict);
 
 float world_ground_z(const N2Scene *s, float x, float y, float fallback);
 void world_ground_selftest(void);

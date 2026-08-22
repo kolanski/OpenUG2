@@ -539,18 +539,25 @@ static PhysRideSupport g_sup;
 static int   g_ride_ready = 0;
 static float g_ride_maxdz = 0.0f;   /* largest single-frame body dZ, audit only */
 static long  g_ride_air = 0, g_ride_rejhigh = 0, g_ride_rejlow = 0, g_ride_nocover = 0;
+static float g_ride_maxlift = 0.0f;   /* largest penetration correction, audit  */
+static float g_ride_maxdelta = 0.0f;  /* largest ACCEPTED contact delta, audit  */
+static float g_ride_maxover = 0.0f;   /* worst overshoot of the contact window   */
 static float g_ride_maximpact = 0.0f;
 
 /* Fill the four wheel footprints for the current pose and ask the world for
    REACHABLE support under each. Returns the number of supported wheels. */
 static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
-                       const VehicleWheelConfig *wc, float wheel_r,
-                       PhysRideSupport *sup, WGroundHit hit[4], int reason[4]) {
+                       const VehicleWheelConfig *wc, PhysRideSupport *sup,
+                       WGroundHit hit[4], WGroundHit cand[4], int verdict[4]) {
     float fx = cosf(heading), fy = sinf(heading);
     float lx = -fy, ly = fx;                     /* +y = left, matching ax/ay */
     float ax[4] = { wc->front_axle, wc->front_axle, wc->rear_axle, wc->rear_axle };
     float ay[4] = { wc->front_track*0.5f, -wc->front_track*0.5f,
                     wc->rear_track *0.5f, -wc->rear_track *0.5f };
+    /* droop plus this frame's fall: the swept segment, so a fast landing cannot
+       tunnel through a floor between two samples. Never a recovery reach. */
+    float down = g_ride_ready ? phys_ride_reach_down(&g_ride, 1.0f/60.0f)
+                              : PHYS_RIDE_REACH_DOWN;
     int n = 0;
     for (int k = 0; k < 4; k++) {
         sup->ax[k] = ax[k]; sup->ay[k] = ay[k];
@@ -559,19 +566,26 @@ static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
         /* reference = where this wheel's contact sits under the CURRENT body
            pose, so reach is measured from the wheel, not from the car centre */
         float wz = g_ride_ready ? phys_ride_wheel_z(&g_ride, sup, k) : pos[2];
-        int why = 0;
-        int cat = world_wheel_support(sc, wx, wy, wz,
-                                      PHYS_RIDE_REACH_UP, PHYS_RIDE_REACH_DOWN,
-                                      &hit[k], &why);
-        reason[k] = why;
+        int why = WWS_NOCOVER;
+        int cat = world_wheel_support(sc, wx, wy, wz, PHYS_RIDE_REACH_UP, down,
+                                      &hit[k], &cand[k], &why);
+        verdict[k] = why;
         sup->valid[k] = cat != WSURF_NONE;
         sup->z[k] = sup->valid[k] ? hit[k].z : wz;
-        if (sup->valid[k]) n++;
-        else if (why == 1) g_ride_rejhigh++;
-        else if (why == 2) g_ride_rejlow++;
+        if (sup->valid[k]) {
+            /* how far outside its OWN window this contact was accepted: must
+               never be positive, or the selector let in something unreachable */
+            float dz = hit[k].z - wz;
+            float over = dz > 0 ? dz - PHYS_RIDE_REACH_UP : -dz - down;
+            if (over > g_ride_maxover) g_ride_maxover = over;
+            float d = dz < 0 ? -dz : dz;
+            if (d > g_ride_maxdelta) g_ride_maxdelta = d;
+            n++;
+        }
+        else if (why == WWS_ABOVE) g_ride_rejhigh++;
+        else if (why == WWS_BELOW) g_ride_rejlow++;
         else g_ride_nocover++;
     }
-    (void)wheel_r;
     return n;
 }
 static PhysVehicle g_vehicle = { 1.0f, 1.0f, 1.0f, 1.0f };   /* M121: this car */
@@ -4283,14 +4297,15 @@ int main(int argc, char **argv) {
         /* M130: the centre query above still classifies the surface and feeds
            the audit, but it no longer sets height. Four wheel footprints ask for
            REACHABLE support; the sprung integrator owns carpos[2], pitch and
-           roll. A layer 12.96 m away is rejected as support instead of being
-           handed to a spring (L4RB frames 940->956). */
-        static WGroundHit ride_hit[4]; static int ride_reason[4];
+           roll. Reach is a CONTACT window in centimetres, not a search band:
+           measured on L4RB at f840 the deck 7.53 m overhead is refused outright
+           and the car keeps falling, where the 10 m reach used to accept it and
+           climb toward it at 0.5 m per frame. */
+        static WGroundHit ride_hit[4], ride_cand[4]; static int ride_reason[4];
         int ride_nsup = 0;
         if (!sstatic && !race_auto) {
-            float wr = carprof.wheel_r*(g_dbg.wheel_scale>0.05f?g_dbg.wheel_scale:1.0f);
-            ride_nsup = ride_gather(&scene, carpos, heading, &g_dbg.wheel, wr,
-                                    &g_sup, ride_hit, ride_reason);
+            ride_nsup = ride_gather(&scene, carpos, heading, &g_dbg.wheel,
+                                    &g_sup, ride_hit, ride_cand, ride_reason);
             if (!g_ride_ready) { phys_ride_init(&g_ride, &g_sup); g_ride_ready = 1; }
             float zprev = g_ride.z;
             phys_ride_step(&g_ride, &g_sup, 1.0f/60.0f);
@@ -4375,8 +4390,23 @@ int main(int argc, char **argv) {
                        ride_hit[0].cat,ride_hit[1].cat,ride_hit[2].cat,ride_hit[3].cat,
                        ride_hit[0].mesh,ride_hit[1].mesh,ride_hit[2].mesh,ride_hit[3].mesh,
                        ride_hit[0].tri,ride_hit[1].tri,ride_hit[2].tri,ride_hit[3].tri);
+                for (int k = 0; k < 4; k++) {
+                    float pz = phys_ride_wheel_z(&g_ride, &g_sup, k);
+                    static const char *WHY[4] = {"contact","above","below","nocover"};
+                    printf("RA WHEEL f%-6ld w%d predicted %9.3f candidate %9.3f "
+                           "delta %+8.3f mesh %5d tri %5d cat %d  %-7s contact %d "
+                           "body_z %9.3f vz %+7.3f lift %+.4f\n",
+                           ra_f, k, pz,
+                           ride_cand[k].mesh >= 0 ? ride_cand[k].z : pz,
+                           ride_cand[k].mesh >= 0 ? ride_cand[k].z - pz : 0.0f,
+                           ride_cand[k].mesh, ride_cand[k].tri, ride_cand[k].cat,
+                           WHY[ride_reason[k] & 3],
+                           (g_ride.contact_mask >> k) & 1,
+                           g_ride.z, g_ride.vz, g_ride.lift);
+                }
                 ra_prev_mask = (int)g_ride.contact_mask;
             }
+            if (g_ride.lift > g_ride_maxlift) g_ride_maxlift = g_ride.lift;
             if (surf_id != surf_prev)
                 printf("RA %-6ld t=%6.2fs SURFACE %s -> %s at (%.3f %.3f %.3f) "
                        "spd %.2f km/h\n", ra_f, ra_f/60.0,
@@ -4404,6 +4434,12 @@ int main(int argc, char **argv) {
                        "max landing impact=%.3f m/s\n", g_ride_maxdz, g_ride_air, g_ride_maximpact);
                 printf("RA SUMMARY ride rejects: too-high layer=%ld too-low(air)=%ld "
                        "no-cover=%ld\n", g_ride_rejhigh, g_ride_rejlow, g_ride_nocover);
+                printf("RA SUMMARY ride: max positional correction=%.4f m "
+                       "(bound %.4f m)  max accepted contact delta=%.4f m "
+                       "(window +%.2f/-%.2f m + swept fall)  worst window "
+                       "overshoot=%+.6f m\n", g_ride_maxlift, PHYS_RIDE_PEN_MAX,
+                       g_ride_maxdelta, PHYS_RIDE_REACH_UP, PHYS_RIDE_REACH_DOWN,
+                       g_ride_maxover);
                 printf("RA SUMMARY max |support delta|=%.4f m  "
                        "max |post-contact residual|=%.4f m\n", ra_maxpre, ra_maxresid);
                 printf("RA SUMMARY first throttle-active <1km/h frame=%d (%.2f s after start) "
