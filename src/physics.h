@@ -191,14 +191,42 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
  * nearest wall face to the pinned car was 5.6 m away and 42 m up). Same
  * near-vertical criterion world_wall_push already uses; no class, name or size
  * is consulted, so every obstacle is treated identically. */
-/* The same narrow-phase contact test collide_walls applies, exposed so a
- * diagnostic can count real responses rather than broad-phase rect overlaps. */
+/* What the narrow phase actually touched (M131). The old code returned a bare
+ * boolean and then resolved against the mesh's expanded AABB, which is why an
+ * X-facing inner wall of a concave building pushed the car 4.300 m along +Y:
+ * the rect's least-penetration axis has nothing to do with the face that was
+ * hit. This record carries the feature itself, so the response is local. */
+typedef struct {
+    int   mesh, tri;      /* source mesh and triangle that owns the feature   */
+    float cx, cy;         /* closest point on that feature, XY                */
+    float nx, ny;         /* unit XY normal, closest point -> car centre      */
+    float dist;           /* XY distance from the car centre to it            */
+    float pen;            /* r - dist, the depth to resolve                   */
+    float span;           /* union vertical span of this mesh's contacting
+                             faces: a 0.10 m seam is not a wall              */
+} PhysWallContact;
+
+/* Minimum vertical span, measured. Census over the shipped collision meshes
+ * (--face-census): near-vertical faces under 0.20 m are 2.03% of L4RA's 255678
+ * and 1.83% of L4RB's 70061, and the cumulative share below 0.30 m is 3.45% /
+ * 3.27%. 0.30 m rejects the proven 0.10 m seam with 3x margin and keeps the
+ * proven 0.9 m barrier with 3x margin, leaving 96.6% of authored faces
+ * untouched. The test is applied to the UNION of the contacting faces of one
+ * mesh, not to a single triangle, so a tessellated wall built from short strips
+ * still spans its true height. No asset name or class is consulted. */
+#define WALL_MIN_FACE_SPAN 0.30f
+
+/* Narrow phase. Returns 1 and fills *out (may be NULL) with the CLOSEST
+ * contacted feature on mesh mi, 0 if that mesh presents no wall here. */
 int cw_probe_contact(const N2Scene *s, int mi, float px, float py,
                      float r, float cz0, float cz1);
+int cw_mesh_feature(const N2Scene *s, int mi, float px, float py,
+                    float r, float cz0, float cz1, PhysWallContact *out);
 
 int collide_walls(float *pos, float *vel, const float obst[][4],
                   const float obz[][2], int nobst, float r, float cz0, float cz1,
-                  const N2Scene *scene, const int *src);
+                  const N2Scene *scene, const int *src,
+                  PhysWallContact *log, int maxlog);
 void collide_walls_selftest(void);
 void phys_selftest(void);   /* asserts the NFSU2 velocity tuning targets */
 

@@ -542,6 +542,7 @@ static long  g_ride_air = 0, g_ride_rejhigh = 0, g_ride_rejlow = 0, g_ride_nocov
 static float g_ride_maxlift = 0.0f;   /* largest penetration correction, audit  */
 static float g_ride_maxdelta = 0.0f;  /* largest ACCEPTED contact delta, audit  */
 static float g_ride_maxover = 0.0f;   /* worst overshoot of the contact window   */
+static float ra_maxwallcorr = 0.0f;   /* largest single wall correction, audit    */
 static float g_ride_maximpact = 0.0f;
 
 /* Fill the four wheel footprints for the current pose and ask the world for
@@ -1162,6 +1163,7 @@ int main(int argc, char **argv) {
     int erefs = 0;     /* --event-refs (M87): event -> bundle reference census */
     const char *daudit = NULL;  /* --drive-audit PREFIX (M88): scripted interactive drive */
     const char *raudit = NULL;  /* --race-audit PREFIX (M89): menu -> Enter -> countdown -> race */
+    int facecensus = 0;  /* --face-census (M131): wall-face vertical span histogram */
     int slaudit = 0;   /* --startline-audit (M91): every route waypoint x every ROAD layer */
     const char *smaudit = NULL; uint32_t smkey = 0;  /* --smear-audit PREFIX TEXKEYHEX (M98) */
     const char *tpkrec = NULL; uint32_t tpkkey = 0;  /* --tpk-record PREFIX KEYHEX (M99) */
@@ -1224,6 +1226,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--event-refs")) erefs = 1;
         else if (!strcmp(argv[i], "--drive-audit") && i+1 < argc) daudit = argv[++i];
         else if (!strcmp(argv[i], "--race-audit")  && i+1 < argc) raudit = argv[++i];
+            else if (!strcmp(argv[i], "--face-census")) facecensus = 1;
         else if (!strcmp(argv[i], "--startline-audit")) slaudit = 1;
         else if (!strcmp(argv[i], "--fallback-census")) { fbcensus = 1; n2_m102 = 1; }
         else if (!strcmp(argv[i], "--rail-census")) world_rail_census = 1;
@@ -1968,6 +1971,47 @@ int main(int argc, char **argv) {
     static float obstz[MAXOBST][2];/* its Z span, measured in that same pass */
     int nobst = phys_collect_walls(&scene, obst, obstsrc, obstz, MAXOBST);
     printf("collision obstacles: %d buildings\n", nobst);
+    if (facecensus) {
+        /* M131 evidence: how tall is a near-vertical face on a collision mesh?
+           The threshold that separates a seam from a barrier has to come out of
+           this distribution, not out of a guess. Counted per triangle, using
+           the same |nz| < 0.30 criterion the narrow phase applies. */
+        static const float B[] = {0.05f,0.10f,0.20f,0.30f,0.50f,0.75f,0.90f,1.20f,
+                                  2.00f,4.00f,8.00f,1e9f};
+        long hist[12]; memset(hist, 0, sizeof hist);
+        long nface = 0, nmesh = 0;
+        for (int o = 0; o < nobst; o++) {
+            int mi = obstsrc[o];
+            if (mi < 0 || mi >= scene.count) continue;
+            const N2Mesh *m = &scene.meshes[mi]; nmesh++;
+            for (int t = 0; t + 2 < m->nidx; t += 3) {
+                const float *A = m->verts + m->idx[t]*5;
+                const float *Bv = m->verts + m->idx[t+1]*5;
+                const float *C = m->verts + m->idx[t+2]*5;
+                float e1[3], e2[3], n[3];
+                for (int a = 0; a < 3; a++) { e1[a]=Bv[a]-A[a]; e2[a]=C[a]-A[a]; }
+                n[0]=e1[1]*e2[2]-e1[2]*e2[1]; n[1]=e1[2]*e2[0]-e1[0]*e2[2];
+                n[2]=e1[0]*e2[1]-e1[1]*e2[0];
+                float L=sqrtf(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]); if (L<1e-9f) continue;
+                if (fabsf(n[2]/L) >= 0.30f) continue;
+                float lo=A[2], hi=A[2];
+                if (Bv[2]<lo) lo=Bv[2]; if (C[2]<lo) lo=C[2];
+                if (Bv[2]>hi) hi=Bv[2]; if (C[2]>hi) hi=C[2];
+                float span = hi-lo; nface++;
+                for (int b = 0; b < 12; b++) if (span < B[b]) { hist[b]++; break; }
+            }
+        }
+        printf("FACE CENSUS %s: %ld collision meshes, %ld near-vertical faces\n",
+               trackname, nmesh, nface);
+        float prev = 0;
+        for (int b = 0; b < 12; b++) {
+            printf("FACE   span %6.2f - %6.2f m : %8ld  (%5.2f%%, cumulative %5.2f%%)\n",
+                   prev, B[b] > 1e8f ? 99.99f : B[b], hist[b],
+                   nface ? 100.0*hist[b]/nface : 0.0,
+                   nface ? 100.0*({ long c=0; for (int q=0;q<=b;q++) c+=hist[q]; c; })/nface : 0.0);
+            prev = B[b];
+        }
+    }
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
 
@@ -4242,6 +4286,8 @@ int main(int argc, char **argv) {
         float car_z1 = carpos[2] + car_body_ride + carbb[5];
         if (car_z1 - car_z0 < 0.5f) car_z1 = car_z0 + 1.5f;   /* no car body loaded */
         m94_prex = carpos[0]; m94_prey = carpos[1]; m94_prez = carpos[2];
+        PhysWallContact wc[8]; int nwc = 0;
+        float vpre[2] = { vel[0], vel[1] };
         if (raudit && race_state == 1 && !race_auto && !sstatic) {
             /* read-only: the same rects collide_walls is about to test, before it
                moves anything. Nothing here writes carpos or vel. */
@@ -4260,9 +4306,22 @@ int main(int argc, char **argv) {
         }
 
         if (race_state == 1 && !race_auto && !sstatic &&
-            collide_walls(carpos, vel, obst, obstz, nobst, 1.3f, car_z0, car_z1,
-                          &scene, obstsrc)) {
-            g_hit = 0.5f; da_walls++; ra_walls++; }
+            (nwc = collide_walls(carpos, vel, obst, obstz, nobst, 1.3f,
+                                 car_z0, car_z1, &scene, obstsrc, wc, 8)) > 0) {
+            g_hit = 0.5f; da_walls++; ra_walls++;
+            if (raudit) {
+                float dx = carpos[0]-m94_prex, dy = carpos[1]-m94_prey;
+                float corr = sqrtf(dx*dx+dy*dy);
+                if (corr > ra_maxwallcorr) ra_maxwallcorr = corr;
+                for (int q = 0; q < nwc && q < 8; q++)
+                    printf("RA WALL f%-6ld mesh %5d tri %5d %-20s normal (%+.3f %+.3f) "
+                           "pen %.4f dist %.4f span %6.2f  vel (%+.4f %+.4f) -> (%+.4f %+.4f)"
+                           "  correction %.4f m\n", ra_f, wc[q].mesh, wc[q].tri,
+                           wc[q].mesh >= 0 && wc[q].mesh < scene.count
+                               ? scene.meshes[wc[q].mesh].sname : "?",
+                           wc[q].nx, wc[q].ny, wc[q].pen, wc[q].dist, wc[q].span,
+                           vpre[0], vpre[1], vel[0], vel[1], corr);
+            } }
         /* guardrail/fence collision: push out of near-vertical road/terrain faces */
         { WRailHit rh; rh.mesh = -1;
           int rpushed = (race_state == 1 && !race_auto && !sstatic) &&
@@ -4430,6 +4489,8 @@ int main(int argc, char **argv) {
                 printf("RA SUMMARY vertical-target delta frames=%d (sum |pre_dz| %.2f m) "
                        "wall=%d rail=%d\n",
                        ra_clamp, ra_clampsum, ra_walls, ra_rails);
+                printf("RA SUMMARY max wall correction=%.4f m (face-local; the AABB "
+                       "least-penetration path is broad phase only)\n", ra_maxwallcorr);
                 printf("RA SUMMARY ride: max body dZ/frame=%.4f m  airborne frames=%ld  "
                        "max landing impact=%.3f m/s\n", g_ride_maxdz, g_ride_air, g_ride_maximpact);
                 printf("RA SUMMARY ride rejects: too-high layer=%ld too-low(air)=%ld "

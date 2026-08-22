@@ -382,15 +382,21 @@ void phys_selftest(void) {
 
 }
 
-/* Does this mesh present an actual wall to the car here? Near-vertical face,
- * height span overlapping the car, XY projection within r. */
-int cw_probe_contact(const N2Scene *s, int mi, float px, float py,
-                     float r, float cz0, float cz1);
-static int cw_mesh_contact(const N2Scene *s, int mi, float px, float py,
-                           float r, float cz0, float cz1) {
-    if (mi < 0 || mi >= s->count) return 1;          /* no source: keep the rect */
+/* Does this mesh present an actual wall to the car here, and WHICH feature?
+ * Near-vertical face, height span overlapping the car, XY projection within r.
+ * Two passes over the same faces: the first finds the closest edge feature and
+ * the union vertical span of every contacting face, the second is not needed --
+ * the span is accumulated as we go. The normal comes from the closest point to
+ * the car centre, never from triangle winding, so a wall pushes the car away
+ * from itself rather than along whatever axis its bounding box prefers. */
+int cw_mesh_feature(const N2Scene *s, int mi, float px, float py,
+                    float r, float cz0, float cz1, PhysWallContact *out) {
+    if (mi < 0 || mi >= s->count) return 0;
     const N2Mesh *m = &s->meshes[mi];
     float r2 = r*r;
+    float bestd2 = 1e30f, bcx = 0, bcy = 0; int btri = -1;
+    float ulo = 1e30f, uhi = -1e30f;                 /* union span of contacts */
+    float fnx = 0, fny = 0;                          /* winding normal, fallback */
     for (int t = 0; t + 2 < m->nidx; t += 3) {
         const float *A = m->verts + m->idx[t]*5;
         const float *B = m->verts + m->idx[t+1]*5;
@@ -406,35 +412,75 @@ static int cw_mesh_contact(const N2Scene *s, int mi, float px, float py,
         if (B[2]>zhi) zhi=B[2]; if (C[2]>zhi) zhi=C[2];
         if (zhi < cz0 || zlo > cz1) continue;                 /* not at car height */
         const float *P[3] = { A, B, C };
+        int touched = 0;
         for (int e = 0; e < 3; e++) {
             const float *p0 = P[e], *p1 = P[(e+1)%3];
             float dx = p1[0]-p0[0], dy = p1[1]-p0[1], l2 = dx*dx+dy*dy;
             float u = l2 > 1e-9f ? ((px-p0[0])*dx + (py-p0[1])*dy) / l2 : 0.0f;
             if (u < 0) u = 0; if (u > 1) u = 1;
-            float qx = px - (p0[0]+dx*u), qy = py - (p0[1]+dy*u);
-            if (qx*qx + qy*qy <= r2) return 1;
+            float sx = p0[0]+dx*u, sy = p0[1]+dy*u;
+            float qx = px - sx, qy = py - sy, d2 = qx*qx + qy*qy;
+            if (d2 > r2) continue;
+            touched = 1;
+            /* closest feature wins; ties go to the lower triangle index, so the
+               choice is the same on every run regardless of float noise */
+            if (d2 < bestd2 || (d2 == bestd2 && btri >= 0 && t/3 < btri)) {
+                bestd2 = d2; bcx = sx; bcy = sy; btri = t/3;
+                float nl = sqrtf(n[0]*n[0]+n[1]*n[1]);
+                if (nl > 1e-9f) { fnx = n[0]/nl; fny = n[1]/nl; }
+            }
         }
+        if (touched) { if (zlo < ulo) ulo = zlo; if (zhi > uhi) uhi = zhi; }
     }
-    return 0;
+    if (btri < 0) return 0;
+    float span = uhi - ulo;
+    if (span < WALL_MIN_FACE_SPAN) return 0;     /* a seam, not a barrier */
+    if (out) {
+        out->mesh = mi; out->tri = btri; out->cx = bcx; out->cy = bcy;
+        out->dist = sqrtf(bestd2); out->pen = r - out->dist; out->span = span;
+        float ox = px - bcx, oy = py - bcy;
+        if (out->dist > 1e-6f) { out->nx = ox / out->dist; out->ny = oy / out->dist; }
+        else { out->nx = fnx; out->ny = fny; }   /* centre exactly on the face:
+                                                    winding normal is all there is */
+    }
+    return 1;
 }
 
 int cw_probe_contact(const N2Scene *s, int mi, float px, float py,
                      float r, float cz0, float cz1) {
-    return cw_mesh_contact(s, mi, px, py, r, cz0, cz1);
+    return cw_mesh_feature(s, mi, px, py, r, cz0, cz1, NULL);
 }
 
+/* Resolution order is the obstacle order phys_collect_walls produced (mesh
+   index order, stable across runs). Each contact is resolved against the
+   position the previous one left behind, so overlapping walls compose instead
+   of fighting; within one mesh the closest feature wins. */
 int collide_walls(float *pos, float *vel, const float obst[][4],
                   const float obz[][2], int nobst, float r, float cz0, float cz1,
-                  const N2Scene *scene, const int *src) {
+                  const N2Scene *scene, const int *src,
+                  PhysWallContact *log, int maxlog) {
     int hits = 0;
     for (int o = 0; o < nobst; o++) {
         float x0=obst[o][0]-r, y0=obst[o][1]-r, x1=obst[o][2]+r, y1=obst[o][3]+r;
         if (pos[0]<=x0 || pos[0]>=x1 || pos[1]<=y0 || pos[1]>=y1) continue;
         /* vertical volumes must actually overlap for this to be a collision */
         if (obz && (obz[o][1] < cz0 || obz[o][0] > cz1)) continue;
-        /* the rect was only broad phase: confirm against the mesh's own faces */
-        if (scene && src && !cw_mesh_contact(scene, src[o], pos[0], pos[1], r, cz0, cz1))
+        if (scene && src) {
+            /* the rect was broad phase only: resolve against the FACE */
+            PhysWallContact c;
+            if (!cw_mesh_feature(scene, src[o], pos[0], pos[1], r, cz0, cz1, &c))
+                continue;
+            float vn = vel[0]*c.nx + vel[1]*c.ny;
+            if (c.pen <= 0.0f && vn >= 0.0f) continue;   /* touching, not colliding:
+                                                            a car resting against a
+                                                            face is not a response */
+            if (c.pen > 0.0f) { pos[0] += c.nx * c.pen; pos[1] += c.ny * c.pen; }
+            if (vn < 0) { vel[0] -= vn*c.nx; vel[1] -= vn*c.ny; }  /* keep tangent */
+            if (log && hits < maxlog) log[hits] = c;
+            hits++;
             continue;
+        }
+        /* legacy AABB-only path, for callers with no scene to resolve against */
         float pl=pos[0]-x0, pr=x1-pos[0], pd=pos[1]-y0, pu=y1-pos[1], m=pl; int ax=0;
         if (pr<m){m=pr;ax=1;} if (pd<m){m=pd;ax=2;} if (pu<m){m=pu;ax=3;}
         if      (ax==0){ pos[0]=x0; if(vel[0]>0)vel[0]=0; }
@@ -448,31 +494,31 @@ int collide_walls(float *pos, float *vel, const float obst[][4],
 void collide_walls_selftest(void) {
     float obst[1][4] = {{0,0,10,10}};
     float p[3]={5,5,0}, v[2]={1,1};
-    assert(collide_walls(p, v, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL) == 1); /* deep inside -> resolved */
+    assert(collide_walls(p, v, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL, NULL, 0) == 1); /* deep inside -> resolved */
     assert(p[0]<=0 || p[0]>=10 || p[1]<=0 || p[1]>=10);    /* ...and now outside the box */
     float p2[3]={0.5f,5,0}, v2[2]={2,0};                   /* near left face, moving +x */
-    collide_walls(p2, v2, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL);
+    collide_walls(p2, v2, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL, NULL, 0);
     assert(p2[0] <= -1.0f + 1e-4f && v2[0] == 0.0f);       /* pushed left, +x vel killed */
     float p3[3]={100,100,0}, v3[2]={1,0};
-    assert(collide_walls(p3, v3, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL) == 0); /* far outside */
+    assert(collide_walls(p3, v3, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL, NULL, 0) == 0); /* far outside */
 
     /* --- Z overlap gate (M95) --- */
     float obz[1][2] = {{204.4f, 210.5f}};                  /* the M94 slab */
     float q[3]={5,5,199.08f}, qv[2]={1,1};                 /* car 5.3 m BELOW it */
-    assert(collide_walls(q, qv, obst, obz, 1, 1.0f, 199.08f, 200.55f, NULL, NULL) == 0);
+    assert(collide_walls(q, qv, obst, obz, 1, 1.0f, 199.08f, 200.55f, NULL, NULL, NULL, 0) == 0);
     assert(q[0]==5.0f && q[1]==5.0f && qv[0]==1.0f && qv[1]==1.0f);  /* untouched */
     float u[3]={5,5,215.0f}, uv[2]={1,1};                  /* car ABOVE it */
-    assert(collide_walls(u, uv, obst, obz, 1, 1.0f, 215.0f, 216.5f, NULL, NULL) == 0);
+    assert(collide_walls(u, uv, obst, obz, 1, 1.0f, 215.0f, 216.5f, NULL, NULL, NULL, 0) == 0);
     /* XY + Z overlap still resolves exactly as the XY-only path does */
     float w1[3]={5,5,206.0f}, wv1[2]={1,1};
     float w2[3]={5,5,206.0f}, wv2[2]={1,1};
-    int h1 = collide_walls(w1, wv1, obst, obz,  1, 1.0f, 206.0f, 207.5f, NULL, NULL);
-    int h2 = collide_walls(w2, wv2, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL);
+    int h1 = collide_walls(w1, wv1, obst, obz, 1, 1.0f, 206.0f, 207.5f, NULL, NULL, NULL, 0);
+    int h2 = collide_walls(w2, wv2, obst, NULL, 1, 1.0f, 0, 0, NULL, NULL, NULL, 0);
     assert(h1 == 1 && h1 == h2);
     assert(w1[0]==w2[0] && w1[1]==w2[1] && wv1[0]==wv2[0] && wv1[1]==wv2[1]);
     /* touching spans count as overlapping (no gap) */
     float t1[3]={5,5,204.4f}, tv1[2]={1,1};
-    assert(collide_walls(t1, tv1, obst, obz, 1, 1.0f, 202.9f, 204.4f, NULL, NULL) == 1);
+    assert(collide_walls(t1, tv1, obst, obz, 1, 1.0f, 202.9f, 204.4f, NULL, NULL, NULL, 0) == 1);
 }
 
 #define WALL_MIN_HEIGHT 2.5f    /* z-extent below this = flat prop, not a wall */
