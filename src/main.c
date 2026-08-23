@@ -547,6 +547,43 @@ static float g_ride_maximpact = 0.0f;
 
 /* Fill the four wheel footprints for the current pose and ask the world for
    REACHABLE support under each. Returns the number of supported wheels. */
+/* Exact squared distance from a point to a triangle in 3D (Ericson, Real-Time
+   Collision Detection). M132-R2 needs this because nearest-VERTEX distance
+   cannot see a giant backdrop triangle whose corners are kilometres away while
+   its interior sweeps through the foreground -- which is precisely the shape a
+   panorama sheet has. */
+static float pt_tri_d2(const float p[3], const float a[3],
+                       const float b[3], const float c[3]) {
+    float ab[3], ac[3], ap[3];
+    for (int i = 0; i < 3; i++) { ab[i]=b[i]-a[i]; ac[i]=c[i]-a[i]; ap[i]=p[i]-a[i]; }
+    float d1 = ab[0]*ap[0]+ab[1]*ap[1]+ab[2]*ap[2];
+    float d2 = ac[0]*ap[0]+ac[1]*ap[1]+ac[2]*ap[2];
+    float q[3];
+    if (d1 <= 0 && d2 <= 0) { for (int i=0;i<3;i++) q[i]=a[i]; goto done; }
+    { float bp[3]; for (int i=0;i<3;i++) bp[i]=p[i]-b[i];
+      float d3 = ab[0]*bp[0]+ab[1]*bp[1]+ab[2]*bp[2];
+      float d4 = ac[0]*bp[0]+ac[1]*bp[1]+ac[2]*bp[2];
+      if (d3 >= 0 && d4 <= d3) { for (int i=0;i<3;i++) q[i]=b[i]; goto done; }
+      float vc = d1*d4 - d3*d2;
+      if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+          float v = d1/(d1-d3); for (int i=0;i<3;i++) q[i]=a[i]+v*ab[i]; goto done; }
+      float cp[3]; for (int i=0;i<3;i++) cp[i]=p[i]-c[i];
+      float d5 = ab[0]*cp[0]+ab[1]*cp[1]+ab[2]*cp[2];
+      float d6 = ac[0]*cp[0]+ac[1]*cp[1]+ac[2]*cp[2];
+      if (d6 >= 0 && d5 <= d6) { for (int i=0;i<3;i++) q[i]=c[i]; goto done; }
+      float vb = d5*d2 - d1*d6;
+      if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+          float w = d2/(d2-d6); for (int i=0;i<3;i++) q[i]=a[i]+w*ac[i]; goto done; }
+      float va = d3*d6 - d5*d4;
+      if (va <= 0 && (d4-d3) >= 0 && (d5-d6) >= 0) {
+          float w = (d4-d3)/((d4-d3)+(d5-d6));
+          for (int i=0;i<3;i++) q[i]=b[i]+w*(c[i]-b[i]); goto done; }
+      float den = 1.0f/(va+vb+vc), v = vb*den, w = vc*den;
+      for (int i=0;i<3;i++) q[i]=a[i]+ab[i]*v+ac[i]*w; }
+done:
+    { float dx=p[0]-q[0], dy=p[1]-q[1], dz=p[2]-q[2]; return dx*dx+dy*dy+dz*dz; }
+}
+
 static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
                        const VehicleWheelConfig *wc, PhysRideSupport *sup,
                        WGroundHit hit[4], WGroundHit cand[4], int verdict[4]) {
@@ -1153,6 +1190,13 @@ int main(int argc, char **argv) {
     const char *dataroot = ".", *shot = NULL, *objdump = NULL, *carinfo = NULL;
     const char *xaudit = NULL;   /* --transform-audit REGION: GL-free placement forensics */
     float shotyaw = 1e9f;        /* --shot-yaw DEG: fixed capture heading (M132) */
+    /* M132-R diagnostics. tier: 0 = baseline (old fixed 700 m, no vista),
+       1 = ordinary (fog-derived range, no vista), 2 = full (range + vista). */
+    int tier = 1;   /* production default: ordinary. full is opt-in (M132-R2) */
+    const char *poseshot = NULL; /* --pose-shot PREFIX: freeze the production
+                                    start pose and capture four yaws there */
+    int citypose = 0;            /* --city-pose: seed the existing safe-road
+                                    selector at the built-up centroid */
     const char *sshot = NULL;    /* --shot-static: deterministic region-local world capture */
     int passmode = 0;            /* --shot-static-pass: 0 full, 1 opaque, 2 glow, 3 sky */
     int passbatch = -1, passbatch2 = -1;   /* opaque:N or opaque:A-B -- sky + that range (M79) */
@@ -1208,6 +1252,20 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--shot-static") && i+1 < argc) sshot = argv[++i];
         else if (!strcmp(argv[i], "--shot-yaw") && i+1 < argc)
             shotyaw = (float)atof(argv[++i]) * 3.14159265f / 180.0f;
+        else if (!strcmp(argv[i], "--tier") && i+1 < argc) {
+            const char *t = argv[++i];
+            if      (!strcmp(t, "baseline")) tier = 0;
+            else if (!strcmp(t, "ordinary")) tier = 1;
+            else if (!strcmp(t, "full"))     tier = 2;
+            else { fprintf(stderr, "unknown --tier '%s' -- expected one of:\n"
+                           "  baseline   fixed 700 m world range, no vistas\n"
+                           "  ordinary   fog-derived world range (default)\n"
+                           "  full       ordinary + backdrop vistas "
+                           "[EXPERIMENTAL: known opaque-sheet artifacts]\n", t);
+                   return 2; }
+        }
+        else if (!strcmp(argv[i], "--pose-shot") && i+1 < argc) poseshot = argv[++i];
+        else if (!strcmp(argv[i], "--city-pose")) citypose = 1;
         else if (!strcmp(argv[i], "--static-spawn-audit") && i+1 < argc) sspawn = trackname = argv[++i];
         else if (!strcmp(argv[i], "--surface-stack") && i+3 < argc) {
             sstack = trackname = argv[++i]; stx = (float)atof(argv[++i]); sty = (float)atof(argv[++i]); }
@@ -1279,6 +1337,7 @@ int main(int argc, char **argv) {
        collision, no physics step. The camera is seeded from the final car
        position (never from a stale `spawn`) and settles for a fixed count, so
        two runs of the same command produce the same pixels. */
+    if (poseshot) raudit = poseshot;   /* reuse the production menu->Enter->start */
     const int sstatic = sshot != NULL;
     if (daudit) {   /* M88: 2 s idle + 10 s forward + 20 s forward/steer + 5 s brake/coast */
         static char dashot[1024];
@@ -2796,7 +2855,7 @@ int main(int argc, char **argv) {
             if (got && bodykey && n2_load_car_tex_by_key(ctdata, ctlen, bodykey, &bt)) {
                 int W = bt.w > vt.w ? bt.w : vt.w, H = bt.h > vt.h ? bt.h : vt.h;
                 N2Tex out = { W, H, (unsigned char *)malloc((long)W*H*3),
-                                    (unsigned char *)malloc((long)W*H), NULL, 0, 0 };
+                                    (unsigned char *)malloc((long)W*H), NULL, 0, 0, 0 };
                 for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
                     long o  = (long)y*W + x;
                     long bo = (long)(y*bt.h/H)*bt.w + x*bt.w/W;   /* nearest */
@@ -2847,6 +2906,28 @@ int main(int argc, char **argv) {
     if (sstatic || sspawn || sstack) {
         const float (*mbb)[4] = (const float (*)[4])world.mbb;
         float oldsp[3] = { spawn[0], spawn[1], spawn[2] };
+        if (citypose) {
+            /* --city-pose: seed the SAME safe-road selector at the built-up
+               centroid instead of the shipped spawn, so the pose it returns is
+               the nearest road candidate to the dense city/airport content that
+               still passes road/patch/wall/headroom. No arbitrary placement:
+               only the seed moves, every acceptance test below is unchanged. */
+            double cx = 0, cy = 0, cz = 0; long cn = 0;
+            for (int i = 0; i < nm; i++) {
+                int sc2 = scene.meshes[i].scen;
+                if (sc2 != N2_SC_BUILDING && sc2 != N2_SC_STRUCT) continue;
+                for (int v = 0; v < scene.meshes[i].nverts; v++) {
+                    const float *p = scene.meshes[i].verts + v*5;
+                    cx += p[0]; cy += p[1]; cz += p[2]; cn++;
+                }
+            }
+            if (cn) {
+                oldsp[0] = (float)(cx/cn); oldsp[1] = (float)(cy/cn); oldsp[2] = (float)(cz/cn);
+                printf("city pose: seeding the safe-road selector at the "
+                       "BUILDING/STRUCT centroid (%.1f, %.1f, %.1f) over %ld vertices\n",
+                       oldsp[0], oldsp[1], oldsp[2], cn);
+            } else printf("city pose: no BUILDING/STRUCT geometry; seed unchanged\n");
+        }
         /* candidates: road-mesh vertices, nearest the dense build-up centre
            first, so the first one that passes every test IS the nearest valid */
         /* Sample road vertices across the WHOLE map: count first, then stride so
@@ -3363,12 +3444,35 @@ int main(int argc, char **argv) {
        away. Menu/showcase only: the Enter branch, sl_first_safe, the race route
        start and the --shot-static selector are all downstream and untouched, and
        if nothing passes, the shipped pose is left exactly as it was. */
-    if (!sstatic && !sspawn && !sstack && !strcmp(trackname, "STREAML4RA")) {
+    if (!sstatic && !sspawn && !sstack &&
+        (citypose || !strcmp(trackname, "STREAML4RA"))) {
         const float (*wmbb)[4] = (const float (*)[4])world.mbb;
         float hl = (carbb[3]-carbb[0]) * 0.5f, hw = (carbb[4]-carbb[1]) * 0.5f;
         if (hl < 0.5f) hl = 2.20f;
         if (hw < 0.5f) hw = 0.90f;
         float oldsp[3] = { spawn[0], spawn[1], spawn[2] };
+        if (citypose) {
+            /* --city-pose: seed the SAME safe-road selector at the built-up
+               centroid instead of the shipped spawn, so the pose it returns is
+               the nearest road candidate to the dense city/airport content that
+               still passes road/patch/wall/headroom. No arbitrary placement:
+               only the seed moves, every acceptance test below is unchanged. */
+            double cx = 0, cy = 0, cz = 0; long cn = 0;
+            for (int i = 0; i < nm; i++) {
+                int sc2 = scene.meshes[i].scen;
+                if (sc2 != N2_SC_BUILDING && sc2 != N2_SC_STRUCT) continue;
+                for (int v = 0; v < scene.meshes[i].nverts; v++) {
+                    const float *p = scene.meshes[i].verts + v*5;
+                    cx += p[0]; cy += p[1]; cz += p[2]; cn++;
+                }
+            }
+            if (cn) {
+                oldsp[0] = (float)(cx/cn); oldsp[1] = (float)(cy/cn); oldsp[2] = (float)(cz/cn);
+                printf("city pose: seeding the safe-road selector at the "
+                       "BUILDING/STRUCT centroid (%.1f, %.1f, %.1f) over %ld vertices\n",
+                       oldsp[0], oldsp[1], oldsp[2], cn);
+            } else printf("city pose: no BUILDING/STRUCT geometry; seed unchanged\n");
+        }
         #define SC_MAXC 65536
         static float sc[SC_MAXC][4]; long trv = 0;
         for (int i = 0; i < nm; i++)
@@ -3801,30 +3905,43 @@ int main(int argc, char **argv) {
     /* M132: authored backdrop impostors, batched into their own list. They come
        from world.vista, which no ground / collision / nav / spawn query can see,
        so this is purely a rendering tier. */
-    N2Batch *vbatch = NULL; int nvista = 0; long vista_tris = 0;
+    N2Batch *vbatch = NULL; int nvista = 0; long vista_tris = 0; int *vmesh = NULL;
     float vista_far = 2000.0f;
-    if (world.vista.count) {
+    /* Ordinary and baseline never touch vista content: no texture resolve, no
+       GPU upload, no per-frame work. The scene itself still exists so the
+       exclusion from ground/collision/nav/spawn stays provable. */
+    if (tier == 2 && world.vista.count) {
+        printf("vista: EXPERIMENTAL tier requested (--tier full); known "
+               "opaque-sheet artifacts remain\n");
         GLuint *vtex = (GLuint *)calloc((size_t)world.vista.count, sizeof *vtex);
         for (int i = 0; i < world.vista.count; i++)
             for (int j = 0; j < ntmap; j++)
                 if (tmapkey[j] == world.vista.meshes[i].texkey) { vtex[i] = tmaptex[j]; break; }
-        /* Texture-merged, exactly like the world tier. The merge is deliberate:
-           the foreground test below runs on a batch AABB, so merging makes it
-           CONSERVATIVE -- a group is drawn only when the whole group is beyond
-           the ordinary cutoff. Per-mesh batching was tried and is worse: it
-           admits individual hill-ridge sheets whose own AABB clears the cutoff
-           but which still read as hard-edged slabs hanging over the camera
-           (captured: 151 of 188 batches admitted, visible artefact). */
-        for (int c = 0; c <= N2_GLOW; c++) {
+        /* ONE batch per vista mesh, and the source mesh index kept alongside.
+           The foreground decision below needs REAL geometry distance, and a
+           merged batch has no per-mesh vertices left to measure. Vista scenes
+           are small (188 and 29 meshes), so the extra draw calls are noise. */
+        /* vmesh grows WITH vbatch: upload_cat_batches is free to emit more
+           than one batch for a mesh (it splits on BATCH_MAXVERTS), so sizing
+           this array by mesh count would under-allocate the moment a backdrop
+           sheet exceeds the vertex limit. */
+        for (int i = 0; i < world.vista.count; i++) {
+            N2Scene one = { &world.vista.meshes[i], 1, 1 };
+            GLuint t1 = vtex[i];
             N2Batch *part = NULL;
-            int np = upload_cat_batches(&world.vista, c, vtex, &part);
+            int np = upload_cat_batches(&one, world.vista.meshes[i].cat, &t1, &part);
             if (np) {
                 vbatch = (N2Batch *)realloc(vbatch, (size_t)(nvista+np) * sizeof *vbatch);
+                vmesh  = (int *)realloc(vmesh,      (size_t)(nvista+np) * sizeof *vmesh);
                 memcpy(vbatch + nvista, part, (size_t)np * sizeof *part);
+                for (int q = 0; q < np; q++) vmesh[nvista+q] = i;
                 nvista += np;
             }
             free(part);
         }
+        /* deterministic proof that every batch has a valid source mesh */
+        for (int k = 0; k < nvista; k++)
+            assert(vmesh[k] >= 0 && vmesh[k] < world.vista.count);
         int textured = 0;
         for (int i = 0; i < world.vista.count; i++) {
             vista_tris += world.vista.meshes[i].nidx/3;
@@ -4183,7 +4300,10 @@ int main(int argc, char **argv) {
             else                  { throttle =  0.0f; steer = 0.0f; }   /* coast */
             handbrake = 0;
         }
-        if (raudit && race_state == 1) {   /* keyboard-equivalent, race only */
+        if (poseshot && race_state == 1) {   /* frozen: the start pose, untouched */
+            throttle = 0.0f; steer = 0.0f; handbrake = 1;
+            vel[0] = 0.0f; vel[1] = 0.0f; speed = 0.0f;   /* capture mode: no drift */
+        } else if (raudit && race_state == 1) {   /* keyboard-equivalent, race only */
             long r = ra_start < 0 ? 0 : ra_f - ra_start;
             if      (r < 600)  { throttle = 1.0f; steer = 0.0f; }
             else if (r < 1800) { throttle = 1.0f; steer = ((r-600)/120) % 2 ? -1.0f : 1.0f; }
@@ -4825,6 +4945,22 @@ int main(int argc, char **argv) {
         { float thud = phys_car_contacts(carpos, vel, speed, ais, nai);
           if (thud > g_hit) g_hit = thud; }
 
+        /* M132-R capture freeze: latch the position production placed at the
+           start line and hold it. Zeroing throttle and velocity is not enough --
+           the ride settles and the wall push nudges over the following frames --
+           and the requirement is a capture AT the placed pose, not near it.
+           Capture mode only; nothing here runs in play. */
+        if (poseshot && race_state != 3) {
+            /* pinned at the PLACEMENT frame -- the frame the start-line snap /
+               grid slot put the car down -- not at the countdown end 180 frames
+               later, by which point it has already drifted (2.27 m on L4RA). */
+            static float posepin[3]; static int pinned = 0;
+            if (!pinned) { posepin[0]=carpos[0]; posepin[1]=carpos[1]; posepin[2]=carpos[2]; pinned=1;
+                           printf("POSE pinned at placement frame %ld -> "
+                                  "(%.3f, %.3f, %.3f)\n",
+                                  ra_f, carpos[0], carpos[1], carpos[2]); }
+            carpos[0]=posepin[0]; carpos[1]=posepin[1]; carpos[2]=posepin[2];
+        }
         /* camera: menu = slow orbit around the parked car; else chase cam */
         float want[3];
         if (race_state == 3) {              /* orbit the parked car, framing the city around it */
@@ -4894,6 +5030,11 @@ int main(int argc, char **argv) {
         glUniform1f(uAmbient, g_dbg.ambient); glUniform1f(uDiffuse, g_dbg.diffuse);
         glUniform3f(uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);   /* track = world space */
 
+        /* M132-R: ONE reset for the whole frame, before any pass. The old reset
+           sat between the vista and world passes and silently discarded every
+           sky and vista draw from the total. */
+        g_dbg.drawn = 0;
+        int skydraws = 0, vistadraws = 0;
         /* skybox: drawn first, camera-locked (view built from a zero eye so
            translation drops out — the classic "at infinity" trick) and with
            depth-write off so every real batch below still overdraws it via
@@ -4919,7 +5060,7 @@ int main(int argc, char **argv) {
             glUniform3f(uColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b);
             for (int k = 0; k < nsky; k++) {
                 draw_batch(&skybatch[k]);
-                g_dbg.drawn++;
+                g_dbg.drawn++; skydraws++;
             }
             glDepthMask(GL_TRUE); glUniform1f(uUnlit, 0.0f);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);   /* restore the real camera */
@@ -4939,8 +5080,15 @@ int main(int argc, char **argv) {
                         ? sqrtf(-logf(VIEW_MINCONTRIB)) / g_dbg.fog_density
                         : zfar;
         if (view_dist > zfar) view_dist = zfar;
+        if (tier == 0) view_dist = 700.0f;      /* --tier baseline: the old gate */
         #define VIEW_DIST view_dist
-        int vistadrawn = 0, vistanear = 0;
+        int vistadrawn = 0, vistanear = 0;      /* batches */
+        int vistamesh = 0, vistanearmesh = 0;   /* their ACTUAL mesh counts */
+        float vistamind = 1e30f, vistakeptmin = 1e30f;  /* measured surface distances */
+        int vistaburied = 0;
+        #define VISTA_BURIED_M 300.0f
+        static int vlist = -1;
+        if (vlist < 0) vlist = getenv("OPENUG2_VISTA_LIST") ? 1 : 0;
         /* M132 vista pass: authored backdrop impostors, drawn after the sky and
            before any ordinary geometry.
              - world space, authored transforms, nothing re-placed;
@@ -4956,7 +5104,7 @@ int main(int argc, char **argv) {
                chosen: the density that leaves the FURTHEST vista vertex at
                VISTA_MINCONTRIB of its own colour, so the backdrop fades into
                the same horizon haze instead of being deleted by it. */
-        if (nvista && g_dbg.show_track && (passmode == 0 || passmode == 1)) {
+        if (nvista && tier == 2 && g_dbg.show_track && (passmode == 0 || passmode == 1)) {
             const float VISTA_MINCONTRIB = 0.35f;
             float Pv[16], MVPv[16];
             mat_persp(0.9f, (float)W/H, znear, vista_far, Pv);
@@ -4965,28 +5113,77 @@ int main(int argc, char **argv) {
             float vd = vista_far > 1.0f
                      ? sqrtf(-logf(VISTA_MINCONTRIB)) / vista_far : 0.0f;
             glUniform1f(rp.uFogDensity, vd);
+            glUniform1f(rp.uVista, 1.0f);
+            glUniform1f(rp.uVColor, 1.0f);   /* source vertex alpha is the fade */
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDepthMask(GL_FALSE);
             GLuint vlast = (GLuint)-1;
             for (int k = 0; k < nvista; k++) {
                 N2Batch *b = &vbatch[k];
-                /* A backdrop is by definition BEHIND the ordinary world. If a
-                   vista batch reaches nearer than the ordinary cutoff, the
-                   camera is standing inside it and it is foreground, not
-                   context -- exactly the giant angled plane the earlier
-                   captures showed. Skip it here, by measurement, rather than
-                   moving it or dropping its family. */
-                float vdx = cam[0] < b->bbox_min[0] ? b->bbox_min[0]-cam[0]
-                          : (cam[0] > b->bbox_max[0] ? cam[0]-b->bbox_max[0] : 0);
-                float vdy = cam[1] < b->bbox_min[1] ? b->bbox_min[1]-cam[1]
-                          : (cam[1] > b->bbox_max[1] ? cam[1]-b->bbox_max[1] : 0);
-                if (vdx*vdx + vdy*vdy < VIEW_DIST*VIEW_DIST) {
-                    vistanear++;
+                /* A backdrop is by definition BEHIND the ordinary world, and
+                   whether it is depends on where its SURFACE is, not where its
+                   bounding box is. A hollow panorama ring legitimately encloses
+                   the camera while every one of its vertices stands kilometres
+                   away, so the old AABB test refused an entire valid family.
+                   Measure the real thing: the closest vertex of this mesh, in
+                   3D, to the camera. Cheap enough to do per frame at this scale
+                   (188 meshes / ~20k vertices), and it discards only geometry
+                   that genuinely comes nearer than the ordinary horizon. */
+                const N2Mesh *vm = &world.vista.meshes[vmesh[k]];
+                /* A second measured rejection: a backdrop buried far below the
+                   ground the player is standing on can only ever be seen from
+                   beneath, and is never a horizon. The drawn set splits cleanly
+                   into a surface cluster (top z +13 .. +1441 m) and a buried
+                   cluster (top z -551 .. -895 m, the retail _Z duplicates); the
+                   564 m gap between them is what this threshold sits in, with
+                   over 250 m of margin on both sides at both audited poses. */
+                /* diagnostic only (M132-R2): the below-world _Z duplicates are
+                   still counted, but height relative to the player no longer
+                   decides anything -- it was never safe for a high viewpoint. */
+                { float vtop = -1e30f;
+                  for (int q = 0; q < vm->nverts; q++)
+                      if (vm->verts[q*5+2] > vtop) vtop = vm->verts[q*5+2];
+                  if (vtop < carpos[2] - VISTA_BURIED_M) vistaburied++; }
+                /* TRUE surface distance: closest point on any triangle of this
+                   mesh to the camera. The vertex-only test this replaces could
+                   not reject a sheet whose corners are far away but whose
+                   middle sweeps the foreground. AABB and vertex distance are
+                   kept only as the cheap pre-pass. */
+                float near2 = 1e30f;
+                { float vdx = cam[0] < b->bbox_min[0] ? b->bbox_min[0]-cam[0]
+                            : (cam[0] > b->bbox_max[0] ? cam[0]-b->bbox_max[0] : 0);
+                  float vdy = cam[1] < b->bbox_min[1] ? b->bbox_min[1]-cam[1]
+                            : (cam[1] > b->bbox_max[1] ? cam[1]-b->bbox_max[1] : 0);
+                  float vdz = cam[2] < b->bbox_min[2] ? b->bbox_min[2]-cam[2]
+                            : (cam[2] > b->bbox_max[2] ? cam[2]-b->bbox_max[2] : 0);
+                  float box2 = vdx*vdx+vdy*vdy+vdz*vdz;
+                  if (box2 >= VIEW_DIST*VIEW_DIST) near2 = box2;   /* whole box is far */
+                  else for (int t = 0; t + 2 < vm->nidx; t += 3) {
+                      const float *A = vm->verts + vm->idx[t]*5;
+                      const float *B = vm->verts + vm->idx[t+1]*5;
+                      const float *C = vm->verts + vm->idx[t+2]*5;
+                      float d2 = pt_tri_d2(cam, A, B, C);
+                      if (d2 < near2) { near2 = d2; if (near2 < 1.0f) break; }
+                  } }
+                if (near2 < VIEW_DIST*VIEW_DIST) {
+                    vistanear++; vistanearmesh += b->nmesh;
+                    if (vistamind > sqrtf(near2)) vistamind = sqrtf(near2);
                     /* diagnostic escape hatch: OPENUG2_VISTA_NOCLIP=1 draws the
                        rejected batches so a family can be photographed and
                        attributed instead of merely counted. Never set in play. */
-                    static int noclip = -1;
+                    static int noclip = -1;   /* only reachable under --tier full */
                     if (noclip < 0) noclip = getenv("OPENUG2_VISTA_NOCLIP") ? 1 : 0;
                     if (!noclip) continue;
+                }
+                if (near2 < vistakeptmin*vistakeptmin) vistakeptmin = sqrtf(near2);
+                if (vlist) {
+                    float hi = -1e30f;
+                    for (int q = 0; q < vm->nverts; q++)
+                        if (vm->verts[q*5+2] > hi) hi = vm->verts[q*5+2];
+                    printf("VDRAW %-28s tris %5d  nearest %8.1f m  top z %8.1f "
+                           "(camera z %.1f)\n", vm->sname[0]?vm->sname:"?",
+                           b->index_count/3, sqrtf(near2), hi, cam[2]);
                 }
                 if (b->tex != vlast) {
                     if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
@@ -4994,10 +5191,13 @@ int main(int argc, char **argv) {
                     vlast = b->tex;
                 }
                 draw_batch(b);
-                g_dbg.drawn++; vistadrawn++;
+                g_dbg.drawn++; vistadraws++; vistadrawn++; vistamesh += b->nmesh;
             }
             /* restore every piece of state the pass touched */
             glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+            glUniform1f(rp.uVista, 0.0f);
+            glUniform1f(rp.uVColor, 0.0f);
             glUniform1f(rp.uFogDensity, g_dbg.fog_density);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
         }
@@ -5009,7 +5209,6 @@ int main(int argc, char **argv) {
            batch's tiny meshes are ~free once merged. ponytail: no frustum
            test — add one if the batch count becomes the bottleneck. */
         int ndrawn = 0;
-        g_dbg.drawn = 0;   /* per-frame draw-call tally (text glyphs excluded) */
         int wbdrawn = 0;   /* world batches only (g_dbg.drawn also counts car/HUD) */
         int vis_scen[8] = {0};
         int far_scen[8] = {0}, far_meshes = 0, far_batches = 0;
@@ -6112,6 +6311,78 @@ int main(int argc, char **argv) {
                                     running = 0; }
                 tag = NULL;   /* suppress the ordinary menu frame */
             }
+            /* M132-R: four yaws from the EXACT frozen production start pose.
+               The car is held by the handbrake with zero throttle from the
+               moment world_race_start placed it, so every capture shares one
+               position; only the camera yaw changes. Pose, support and camera
+               are printed with the first capture so the frame can be verified
+               against the required coordinates rather than assumed. */
+            if (poseshot && ra_start >= 0) {
+                long r = ra_f - ra_start;
+                static const int YAW[4] = {0, 90, 180, 270};
+                /* the yaw must be settled BEFORE the frame is drawn, so it is a
+                   function of r alone and holds for four frames per capture */
+                int idx = r < 6 ? 0 : (int)((r - 6) / 4);
+                if (idx > 3) idx = 3;
+                shotyaw = YAW[idx] * 3.14159265f/180.0f;
+                int slot = (r >= 6 && (r - 6) % 4 == 3) ? idx : -1;
+                if (slot >= 0) {
+                    if (slot == 0) {
+                        WGroundHit ph; int pc = world_ground_hit(&scene, carpos[0],
+                                                                 carpos[1], carpos[2], &ph);
+                        printf("POSE track=%s %s\n", trackname,
+                               world.active_ev >= 0 ? "event" : "circuit");
+                        printf("POSE car   (%.3f, %.3f, %.3f)  heading %+.4f  frozen %ld "
+                               "frames after start\n", carpos[0], carpos[1], carpos[2],
+                               heading, r);
+                        printf("POSE support cat=%s mesh=%d tri=%d z=%.3f name=%s\n",
+                               pc==WSURF_ROAD?"ROAD":pc==WSURF_TERRAIN?"TERRAIN":"NONE",
+                               ph.mesh, ph.tri, ph.z,
+                               pc!=WSURF_NONE && ph.mesh>=0 && ph.mesh<scene.count
+                                   ? scene.meshes[ph.mesh].sname : "-");
+                        if (pc != WSURF_ROAD)
+                            printf("POSE INVALID: support is not real ROAD\n");
+                    }
+                    if (slot == 0) {
+                        printf("TIER %s  cutoff %.1f m  far %.1f m\n",
+                               tier==0?"baseline (700 m, no vista)":
+                               tier==1?"ordinary (fog-derived, no vista)":
+                                       "full (fog-derived + vista) EXPERIMENTAL",
+                               (double)VIEW_DIST, zfar);
+                        printf("COUNT sky      draws %4d\n", skydraws);
+                        printf("COUNT vista    meshes %5d/%-5d batches %4d/%-4d draws %4d "
+                               "(skipped %d meshes in %d batches)\n",
+                               vistamesh, world.vista.count, vistadrawn, nvista, vistadraws,
+                               vistanearmesh, vistanear);
+                        printf("COUNT vista    of the skipped, %d were buried more "
+                               "than %.0f m below the player's ground\n",
+                               vistaburied, (double)VISTA_BURIED_M);
+                        printf("COUNT vista    nearest DRAWN surface %.1f m, nearest "
+                               "REJECTED surface %.1f m (cutoff %.1f m)\n",
+                               vistakeptmin > 1e29f ? -1.0 : (double)vistakeptmin,
+                               vistamind    > 1e29f ? -1.0 : (double)vistamind,
+                               (double)VIEW_DIST);
+                        printf("COUNT ordinary meshes %5d/%-5d batches %4d/%-4d draws %4d\n",
+                               ndrawn, nm, wbdrawn, nbatch, wbdrawn);
+                        printf("COUNT car/glow/HUD draws %4d\n",
+                               g_dbg.drawn - skydraws - vistadraws - wbdrawn);
+                        printf("COUNT total    draws %4d   frame %.2f ms\n",
+                               g_dbg.drawn, (SDL_GetTicks()-t0)/(float)(ra_f?ra_f:1));
+                    }
+                    printf("POSE yaw %3d cam (%.3f, %.3f, %.3f) look (%.3f, %.3f, %.3f)\n",
+                           YAW[slot], cam[0], cam[1], cam[2],
+                           carpos[0], carpos[1], carpos[2]+1.5f);
+                    char sp[1024];
+                    snprintf(sp, sizeof sp, "%s_yaw%d.png", poseshot, YAW[slot]);
+                    unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
+                    glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                    for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
+                    write_png(sp, W, H, fl); free(px); free(fl);
+                    printf("POSE frame written: %s\n", sp);
+                }
+                if (r > 6 + 3*4 + 3) running = 0;
+                tag = NULL;
+            }
             if (tag && shaudit && rshot > 2) tag = NULL;   /* menu frame only */
             if (tag) {
                 char sp[1024]; snprintf(sp, sizeof sp, "%s%s.png", raudit, tag);
@@ -6160,14 +6431,25 @@ int main(int argc, char **argv) {
             free(px); free(fl);
             printf("frame avg: %.1f ms (vsync on), %d/%d world meshes drawn, %d draw calls\n",
                    (SDL_GetTicks()-t0)/(float)shotframe, ndrawn, nm, g_dbg.drawn);
-            printf("tiers: ordinary %d/%d meshes in %d/%d batches (%d world draws), "
-                   "vista %d/%d meshes in %d/%d batches\n",
-                   ndrawn, nm, wbdrawn, nbatch, wbdrawn,
-                   vistadrawn ? world.vista.count : 0, world.vista.count,
-                   vistadrawn, nvista);
-            printf("vista: %d batches drawn, %d skipped as foreground "
-                   "(AABB nearer than the %.0f m ordinary cutoff)\n",
-                   vistadrawn, vistanear, (double)VIEW_DIST);
+            printf("TIER %s  cutoff %.1f m  far %.1f m\n",
+                   tier==0?"baseline (700 m, no vista)":
+                   tier==1?"ordinary (fog-derived, no vista)":
+                           "full (fog-derived + vista) EXPERIMENTAL",
+                   (double)VIEW_DIST, zfar);
+            printf("COUNT sky      draws %4d\n", skydraws);
+            printf("COUNT vista    meshes %5d/%-5d batches %4d/%-4d draws %4d "
+                   "(skipped %d meshes in %d batches)\n",
+                   vistamesh, world.vista.count, vistadrawn, nvista, vistadraws,
+                   vistanearmesh, vistanear);
+            printf("COUNT vista    nearest DRAWN surface %.1f m, nearest REJECTED "
+                   "surface %.1f m (cutoff %.1f m)\n",
+                   vistakeptmin > 1e29f ? -1.0 : (double)vistakeptmin,
+                   vistamind    > 1e29f ? -1.0 : (double)vistamind, (double)VIEW_DIST);
+            printf("COUNT ordinary meshes %5d/%-5d batches %4d/%-4d draws %4d\n",
+                   ndrawn, nm, wbdrawn, nbatch, wbdrawn);
+            printf("COUNT car/glow/HUD draws %4d\n",
+                   g_dbg.drawn - skydraws - vistadraws - wbdrawn);
+            printf("COUNT total    draws %4d\n", g_dbg.drawn);
             printf("visible scenery:");
             for (int sc=1; sc<=N2_SC_OTHER; sc++)
                 if (vis_scen[sc]) printf("  %s=%d", n2_scen_name(sc), vis_scen[sc]);

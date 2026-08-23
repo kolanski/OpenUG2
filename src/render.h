@@ -59,6 +59,7 @@ typedef struct {
           uLight,   /* sun direction in the CURRENT object's model space */
           uVColor,  /* 0..1 strength of per-vertex prelight (world geometry only) */
           uDecal,   /* 1 = texture is an alpha-masked decal over uColor paint */
+          uVista,                   /* >0.5: alpha-blended backdrop pass */
           uFogColor, uFogDensity,   /* exp^2 distance fog (matches the sky) */
           uCamPos,  /* camera in the current object's model space */
           uEnv,     /* environment-reflection amount (cars only) */

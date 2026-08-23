@@ -71,14 +71,27 @@ typedef struct {
     int     count, cap;
 } N2Scene;
 
-/* Decoded RGB texture (3 bytes/pixel, top-left origin). alpha is a separate
- * w*h plane, only non-NULL for DXT3 car textures (decal/badge masks). */
+/* Decoded RGB texture (3 bytes/pixel, top-left origin).
+ *
+ * ALPHA. `alpha` is a separate w*h plane, non-NULL only when the source
+ * actually carries transparency AND that transparency says something -- a plane
+ * that is 255 everywhere is freed, so an opaque asset uploads as GL_RGB and
+ * renders exactly as it did before alpha was decoded at all. Sources, all of
+ * them world as well as car:
+ *   P8    palette entries are RGBA; channel 3 is the alpha.
+ *   DXT1  one-bit transparency, and ONLY in the c0 <= c1 block mode, where
+ *         palette index 3 means transparent. The c0 > c1 mode is fully opaque.
+ *   DXT3  the block's 4-bit explicit alpha plane.
+ *   DXT5  not produced by these assets; no decoder path exists.
+ * `afmt` records which of those produced the plane (0 none, 1 DXT1, 3 DXT3,
+ * 8 P8). Consumers must treat alpha == NULL as fully opaque. */
 typedef struct { int w, h; unsigned char *rgb; unsigned char *alpha;
     /* Optional raw S3TC block copy (base mip only) for a direct GPU upload
        via glCompressedTexImage2D; rgb/alpha stay populated as the portable
        fallback. Set only by n2_load_car_tex_by_key for straight DXT1/DXT3
        slots. dxtfmt: 0 = none (use rgb), 1 = DXT1, 3 = DXT3. */
-    unsigned char *dxt; int dxtlen, dxtfmt; } N2Tex;
+    unsigned char *dxt; int dxtlen, dxtfmt;
+    int afmt;   /* source alpha format: 0 none, 1 DXT1 1-bit, 3 DXT3, 8 P8 */ } N2Tex;
 
 /* ---- file I/O ---- */
 static unsigned char *n2_read_file(const char *path, long *out_len) {
@@ -1703,7 +1716,12 @@ static void n2_rgb565(uint16_t c, unsigned char *o) {
     int r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
     o[0] = (r << 3) | (r >> 2); o[1] = (g << 2) | (g >> 4); o[2] = (b << 3) | (b >> 2);
 }
-static void n2_dxt1(const unsigned char *src, int w, int h, unsigned char *out) {
+/* alf: optional w*h output. DXT1 carries one-bit transparency ONLY in the
+   c0 <= c1 mode, where palette index 3 means "transparent black"; in the
+   c0 > c1 mode every index is opaque. Anything else would be inventing a
+   chroma key out of black pixels. */
+static void n2_dxt1(const unsigned char *src, int w, int h, unsigned char *out,
+                    unsigned char *alf) {
     int bi = 0;
     for (int by = 0; by < h; by += 4)
         for (int bx = 0; bx < w; bx += 4) {
@@ -1720,6 +1738,7 @@ static void n2_dxt1(const unsigned char *src, int w, int h, unsigned char *out) 
                     int x = bx+px, y = by+py; if (x >= w || y >= h) continue;
                     int idx = (bits >> (2*(py*4+px))) & 3;
                     memcpy(out + (y*w+x)*3, pal[idx], 3);
+                    if (alf) alf[y*w+x] = (c0 <= c1 && idx == 3) ? 0 : 255;
                 }
         }
 }
@@ -1942,9 +1961,9 @@ static int n2_mipbytes(int s, int bpb) { return n2_mipbytes2(s, s, bpb); }
  * recover square dims + DXT1/DXT3 by matching the mip-chain size to DecodedSize
  * (car textures are square; format isn't stored, so it's inferred). Returns 1. */
 static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key, N2Tex *t) {
+    memset(t, 0, sizeof *t);   /* all outputs defined on success AND failure */
     uint32_t sz; const unsigned char *p = n2_tpk_slots(d, len, &sz);
     if (!p) return 0;
-    t->dxt = NULL; t->dxtlen = 0; t->dxtfmt = 0;   /* raw-block fast path off by default */
     int absoff = 0, enc = 0, dec = 0; uint32_t hfe = 0;
     for (uint32_t i = 0; i + 0x18 <= sz; i += 0x18)
         if (n2_u32(p + i) == key) {
@@ -1976,7 +1995,7 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
                 if (fmt == 0x31545844 && n/2 + 144 <= dec) {        /* "DXT1" */
                     t->w = w; t->h = h; t->alpha = NULL;
                     t->rgb = (unsigned char *)malloc(n * 3);
-                    n2_dxt1(raw, w, h, t->rgb);
+                    n2_dxt1(raw, w, h, t->rgb, NULL);
                     t->dxtlen = (int)(n/2); t->dxtfmt = 1;          /* base-level blocks */
                     t->dxt = (unsigned char *)malloc(t->dxtlen);
                     memcpy(t->dxt, raw, t->dxtlen);
@@ -2042,7 +2061,7 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
     }
     if (fmt == 0x22) {                    /* DXT1 */
         t->alpha = NULL; t->rgb = (unsigned char *)malloc(n*3);
-        n2_dxt1(raw, tw, th, t->rgb); t->dxtfmt = 1;
+        n2_dxt1(raw, tw, th, t->rgb, NULL); t->dxtfmt = 1;
     } else if (fmt == 0x24) {             /* DXT3 */
         t->rgb = (unsigned char *)malloc(n*3); t->alpha = (unsigned char *)malloc(n);
         n2_dxt3(raw, tw, th, t->rgb, t->alpha); t->dxtfmt = 3;
@@ -2066,6 +2085,7 @@ static int n2_load_car_tex_by_key(const unsigned char *d, long len, uint32_t key
 
 /* Find a named texture in the file's local TPK and decode it. Returns 1 on hit. */
 static int n2_load_texture(const unsigned char *d, long len, const char *name, N2Tex *t) {
+    memset(t, 0, sizeof *t);   /* all outputs defined on success AND failure */
     /* TPK header block marker: magic 0xb3310000 (LE bytes 00 00 31 b3) */
     long hdr = -1;
     for (long i = 0; i + 4 < len; i++)
@@ -2086,7 +2106,7 @@ static int n2_load_texture(const unsigned char *d, long len, const char *name, N
             t->w = w; t->h = hh;
             t->rgb = (unsigned char *)malloc((long)w * hh * 3);
             t->alpha = NULL;
-            n2_dxt1(d + pix + off, w, hh, t->rgb);
+            n2_dxt1(d + pix + off, w, hh, t->rgb, NULL);
             return 1;
         }
     }
@@ -2152,6 +2172,9 @@ static int n2_tpk_keys(const unsigned char *d, N2Tpk t, uint32_t *keys, int maxk
  * +0x28 PaletteOffset +0x2c Size +0x30 PaletteSize +0x38 W(u16) +0x3a H(u16).
  * P8 when PaletteSize >= 1024 (256-entry RGBA); else DXT1/DXT3 by Size. */
 static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t hash, N2Tex *tex) {
+    /* every output field defined on BOTH paths, so a failed decode can never
+       leave a caller reading a stale alpha/dxt pointer from a reused struct */
+    memset(tex, 0, sizeof *tex);
     for (int b = 0; b < t.nblk; b++) {
         long hbeg = t.blk[b].hbeg, hend = hbeg + t.blk[b].hsize, dbase = t.blk[b].dbase;
         for (long i = hbeg; i + 0x40 < hend; i++) {
@@ -2162,18 +2185,38 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
             int w = d[i+0x38] | d[i+0x39]<<8, hh = d[i+0x3a] | d[i+0x3b]<<8;
             if (w<=0 || hh<=0 || w>4096 || hh>4096) continue;
             tex->w = w; tex->h = hh; tex->rgb = (unsigned char *)malloc((long)w*hh*3);
+            tex->dxt = NULL; tex->dxtlen = 0; tex->dxtfmt = 0;
+            /* M132-R2: alpha is DECODED, not discarded. The palettes are RGBA
+               and the DXT blocks carry real alpha; throwing it away was why a
+               panorama sheet rendered as an opaque black-edged slab. It is only
+               RETAINED when it says something -- an all-255 plane is freed, so
+               every opaque road and building keeps the exact RGB upload and the
+               exact rendering it had before. */
+            unsigned char *alf = (unsigned char *)malloc((long)w*hh);
             tex->alpha = NULL;
+            tex->afmt = 0;
             if (palsz >= 1024 && dbase+paloff+1024 <= len && dbase+off+(long)w*hh <= len) {
                 const unsigned char *pal = d + dbase + paloff, *ix = d + dbase + off;
                 for (long p = 0; p < (long)w*hh; p++) {   /* P8: index -> RGBA palette */
                     const unsigned char *c = pal + (long)ix[p]*4;
                     tex->rgb[p*3]=c[0]; tex->rgb[p*3+1]=c[1]; tex->rgb[p*3+2]=c[2];
+                    if (alf) alf[p] = c[3];
                 }
+                tex->afmt = 8;                      /* P8 */
             } else if (dbase + off + (long)w*hh/2 <= len) {
                 int dxt3 = (long)sz > (long)w*hh*9/10;
-                if (dxt3) n2_dxt3(d + dbase + off, w, hh, tex->rgb, NULL);
-                else      n2_dxt1(d + dbase + off, w, hh, tex->rgb);
-            } else { free(tex->rgb); continue; }
+                if (dxt3) { n2_dxt3(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
+                else      { n2_dxt1(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 1; }
+            } else { free(tex->rgb); free(alf); continue; }
+            if (alf) {
+#ifdef N2_NO_WORLD_ALPHA
+                free(alf);        /* A/B control build: pre-M132-R2 behaviour */
+#else
+                int meaningful = 0;
+                for (long p = 0; p < (long)w*hh; p++) if (alf[p] != 255) { meaningful = 1; break; }
+                if (meaningful) tex->alpha = alf; else free(alf);
+#endif
+            }
             return 1;
         }
     }

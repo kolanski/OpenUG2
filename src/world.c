@@ -358,6 +358,52 @@ static void grid_build(World *w) {
                     if (q < mn[c]) mn[c] = q; if (q > mx[c]) mx[c] = q;
                 }
         }
+        if (getenv("OPENUG2_VISTA_ALPHA")) {
+            /* M132-R2 evidence, straight from the raw records: for every
+               texture a vista mesh binds, what alpha does the source actually
+               carry? Nothing here is inferred from pixels being black. */
+            printf("VALPHA name                         key        fmt   w x h    "
+                   "amin amax   a=0%%   0<a<255%%   a=255%%   vcol amin amax\n");
+            uint32_t seen[512]; int nseen = 0;
+            for (int i = 0; i < w->vista.count; i++) {
+                const N2Mesh *m = &w->vista.meshes[i];
+                uint32_t tk = m->texkey;
+                int dup = 0; for (int j = 0; j < nseen; j++) if (seen[j] == tk) dup = 1;
+                if (dup || nseen >= 512) continue;
+                seen[nseen++] = tk;
+                int vamin = 255, vamax = 0;
+                for (int q = 0; q < w->vista.count; q++)
+                    if (w->vista.meshes[q].texkey == tk && w->vista.meshes[q].vcol)
+                        for (int v = 0; v < w->vista.meshes[q].nverts; v++) {
+                            int a = w->vista.meshes[q].vcol[v*4+3];
+                            if (a < vamin) vamin = a; if (a > vamax) vamax = a;
+                        }
+                N2Tex tt = {0};
+                int ok = 0;
+                for (int r2 = 0; r2 < w->nreg && !ok; r2++)
+                    if (w->rgn[r2].data)
+                        ok = n2_tpk_decode(w->rgn[r2].data, w->rgn[r2].len,
+                                           w->rgn[r2].tpk, tk, &tt);
+                if (!ok && w->master)
+                    ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
+                if (!ok) { printf("VALPHA %-28s %08x   UNRESOLVED\n", m->sname, tk); continue; }
+                long n = (long)tt.w*tt.h, z = 0, part = 0, full = 0;
+                int amin = 255, amax = 0;
+                if (tt.alpha) {
+                    for (long q = 0; q < n; q++) {
+                        int a = tt.alpha[q];
+                        if (a < amin) amin = a; if (a > amax) amax = a;
+                        if (a == 0) z++; else if (a == 255) full++; else part++;
+                    }
+                } else { amin = amax = 255; full = n; }
+                static const char *FN[9] = {"none","DXT1","?","DXT3","?","?","?","?","P8"};
+                printf("VALPHA %-28s %08x  %-5s %4dx%-4d %4d %4d  %6.2f  %8.2f  %7.2f   %4d %4d\n",
+                       m->sname, tk, FN[tt.afmt&8?8:tt.afmt], tt.w, tt.h, amin, amax,
+                       100.0*z/n, 100.0*part/n, 100.0*full/n,
+                       vamin > vamax ? -1 : vamin, vamin > vamax ? -1 : vamax);
+                free(tt.rgb); free(tt.alpha); free(tt.dxt);
+            }
+        }
         if (getenv("OPENUG2_VISTA_CENSUS")) {
             printf("VISTA per-mesh census (name, tris, world AABB, planarity proxy):\n");
             for (int i = 0; i < w->vista.count; i++) {

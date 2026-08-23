@@ -37,6 +37,7 @@ static const char *FS =
     "uniform vec3 uCamPos; uniform float uEnv; uniform float uUVCheck;\n"
     "uniform float uGloss; uniform float uFlipN;\n"
     "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
+    "uniform float uVista;\n"     /* >0.5: authored backdrop pass, alpha-blended */
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
     "void main(){\n"
@@ -52,6 +53,22 @@ static const char *FS =
     "    gl_FragColor=vec4(vec3(vUV.x,vUV.y,0.2)*mix(0.35,1.0,grid),1.0); return;\n"
     "  }\n"
     "  float fog = clamp(exp(-pow(vDepth*uFogDensity, 2.0)), 0.0, 1.0);\n"
+    /* M132-R2 vista path. The backdrops are authored as cut-out sheets: their
+       DXT1 blocks carry one-bit transparency (up to 57.7% of texels fully
+       clear) and their DXT3 blocks carry real gradients, all of which the
+       decoder used to throw away -- which is exactly why a panorama rendered
+       as an opaque black-edged slab. Alpha here comes only from those two
+       proven sources, texture alpha and source vertex-colour alpha; nothing is
+       keyed off black pixels. Fully clear texels are discarded so they cannot
+       write depth-adjacent artefacts or fringe. */
+    "  if(uVista>0.5){\n"
+    "    vec4 t = texture2D(uTex, vUV);\n"
+    "    vec3 c = uUseTex>0.5 ? t.rgb : uColor;\n"
+    "    float a = (uUseTex>0.5 ? t.a : 1.0) * vColor.a;\n"
+    "    if(a < 0.02) discard;\n"
+    "    gl_FragColor = vec4(mix(uFogColor, c, fog), a);\n"
+    "    return;\n"
+    "  }\n"
     "  if(uUnlit>0.5){ float a=uAlpha;\n"
     "    if(uSoft>0.5){ float d=length(vUV-vec2(0.5)); a*=clamp(1.0-d*2.0,0.0,1.0); a*=a; }\n"
     "    gl_FragColor=vec4(mix(uFogColor,uColor,fog),a); return; }\n"
@@ -228,6 +245,7 @@ RProg render_program(void) {
     r.uSoft    = glGetUniformLocation(r.prog, "uSoft");
     r.uSpec    = glGetUniformLocation(r.prog, "uSpec");
     r.uDecal   = glGetUniformLocation(r.prog, "uDecal");
+    r.uVista      = glGetUniformLocation(r.prog, "uVista");
     r.uFogColor   = glGetUniformLocation(r.prog, "uFogColor");
     r.uFogDensity = glGetUniformLocation(r.prog, "uFogDensity");
     r.uCamPos = glGetUniformLocation(r.prog, "uCamPos");
@@ -650,7 +668,7 @@ static GLuint make_wheel_tex_var(int spin_blur) {
         unsigned char *o = px + (y*S + x)*3;
         o[0] = v; o[1] = v; o[2] = (unsigned char)(v + v/16);        /* cool metal */
     }
-    N2Tex t = { S, S, px, NULL, NULL, 0, 0 };
+    N2Tex t = { S, S, px, NULL, NULL, 0, 0, 0 };
     GLuint id = upload_tex(&t);
     /* radial, single-sample cap texture (no tiling intended) — clamp so a
        filter footprint near u/v=0 or 1 can't wrap and bleed in colour from
