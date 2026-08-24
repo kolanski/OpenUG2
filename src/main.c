@@ -5976,26 +5976,10 @@ int main(int argc, char **argv) {
         /* headlights: warm soft light-pools cast on the road ahead (it's night),
            three overlapping ground glows that widen + fade with distance to read
            as a headlight cone. Additive blend. Night only. */
-        if (race_state != 3 && g_dbg.night_mode) {
-            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            glDepthMask(GL_FALSE);
-            glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
-            glUniform3f(uColor, 0.60f, 0.56f, 0.42f);
-            float fx=cosf(heading), fy=sinf(heading);
-            for (int s=0;s<3;s++){
-                float dist=3.0f+s*3.5f, size=3.0f+s*2.4f;
-                float px=carpos[0]+fx*dist, py=carpos[1]+fy*dist;
-                float pz=world_ground_z(&scene,px,py,carpos[2])+0.06f;
-                float M[16]={size,0,0,0, 0,size,0,0, 0,0,1,0, px-size*0.5f, py-size*0.5f, pz, 1};
-                float MV[16]; mat_mul(MVP, M, MV);
-                glUniformMatrix4fv(uMVP,1,GL_FALSE,MV);
-                glUniform1f(uAlpha, 0.5f - s*0.13f);
-                draw_gpumesh(&quad);
-                g_dbg.drawn++;
-            }
-            glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f);
-            glDepthMask(GL_TRUE); glDisable(GL_BLEND);
-        }
+        /* Likewise the headlight ground pools: three additive quads laid on
+           the road at fixed distances ahead. Same objection -- the shape came
+           from constants, not from the car or its lamps. */
+
 
         /* tyre skid marks: flat dark quads on the ground, alpha-blended */
         if (skidn > 0) {
@@ -6458,43 +6442,14 @@ int main(int argc, char **argv) {
         glUniform3f(uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
 
         /* tail lights: red camera-facing glows at each car's rear (night) */
-        if (race_state != 3 && ncar) {
-            float lz=sqrtf(look[0]*look[0]+look[1]*look[1]+look[2]*look[2]); if(lz<1e-4f)lz=1;
-            float ld[3]={look[0]/lz,look[1]/lz,look[2]/lz};
-            float rt[3]={ld[1],-ld[0],0}; float rl=sqrtf(rt[0]*rt[0]+rt[1]*rt[1]); if(rl<1e-4f)rl=1;
-            rt[0]/=rl; rt[1]/=rl;
-            float up[3]={rt[1]*ld[2], -rt[0]*ld[2], rt[0]*ld[1]-rt[1]*ld[0]};
-            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            glDepthMask(GL_FALSE); glDisable(GL_DEPTH_TEST);   /* glow overlay on the rear */
-            glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
-            glUniform3f(uColor, 1.0f, 0.12f, 0.06f); glUniform1f(uAlpha, 0.9f);
-            for (int c=0; c<=nai; c++) {
-                float *cp = c==0 ? carpos : ais[c-1].pos;
-                float hd = c==0 ? heading : ais[c-1].head;
-                float fx=cosf(hd), fy=sinf(hd), rx=-fy, ry=fx;
-                for (int side=-1; side<=1; side+=2) {
-                    float bx,by,bz;
-                    /* Placed from the body, not from a "light cluster centroid"
-                       derived from the geometry: that centroid lands in the
-                       middle of the light unit, so the glow sat as a disc over
-                       the glass instead of behind it. The lens lights itself
-                       through its material and the shared lamp texture. */
-                    {
-                        bx=cp[0]-fx*1.9f+rx*0.6f*side;
-                        by=cp[1]-fy*1.9f+ry*0.6f*side;
-                        bz=cp[2]+0.5f;
-                    }
-                    float s=1.1f;
-                    float cxp=bx-(rt[0]+up[0])*s*0.5f, cyp=by-(rt[1]+up[1])*s*0.5f, czp=bz-(rt[2]+up[2])*s*0.5f;
-                    float M[16]={rt[0]*s,rt[1]*s,rt[2]*s,0, up[0]*s,up[1]*s,up[2]*s,0, 0,0,1,0, cxp,cyp,czp,1};
-                    float MV[16]; mat_mul(MVP,M,MV);
-                    glUniformMatrix4fv(uMVP,1,GL_FALSE,MV); draw_gpumesh(&quad);
-                    g_dbg.drawn++;
-                }
-            }
-            glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f);
-            glDepthMask(GL_TRUE); glEnable(GL_DEPTH_TEST); glDisable(GL_BLEND);
-        }
+        /* The painted-on tail-light glows are gone. They were two additive
+           discs placed by fixed offsets from the car's centre -- 1.9 m back,
+           0.6 m out, 0.5 m up -- which lands on a low coupe's lamps and misses
+           on anything taller: on the Hummer they sat under the bumper. The
+           lens lights itself through its material and the shared lamp texture;
+           real light sources for the car belong here later, placed from the
+           data rather than from guessed offsets. */
+
 
         /* drift smoke: camera-facing billboards, light + fading, additive-ish */
         if (smoken > 0) {
