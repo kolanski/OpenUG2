@@ -1712,6 +1712,43 @@ static int n2_car_part_name(const unsigned char *d, long beg, long end,
     return 0;
 }
 
+typedef struct { uint32_t mat; unsigned char r, g, b; } N2Paint;
+
+static int n2_load_paints(const unsigned char *d, long len, N2Paint *out, int cap) {
+    long pairs = -1, np = 0, tbl = -1, ts = 0;
+    for (long i = 0; i + 8 <= len; i++) {
+        uint32_t m = n2_u32(d + i); long sz = (long)n2_u32(d + i + 4);
+        if (sz <= 0 || i + 8 + sz > len) continue;
+        if (m == 0x00034605u && pairs < 0) { pairs = i + 8; np = sz / 8; }
+        else if (m == 0x0003460Cu && tbl < 0) { tbl = i + 8; ts = sz; }
+        if (pairs >= 0 && tbl >= 0) break;
+    }
+    if (pairs < 0 || tbl < 0) return 0;
+    int n = 0;
+    for (long p = tbl; p + 2 <= tbl + ts && n < cap; ) {
+        short ln = (short)(d[p] | (d[p+1] << 8));
+        if (ln < 1 || ln > 40 || p + 2 + ln*2 > tbl + ts) { p += 2; continue; }
+        uint32_t mat = 0; int have = 0; unsigned char rgb[3] = {0,0,0};
+        int ok = 1;
+        for (int k = 0; k < ln; k++) {
+            short ix = (short)(d[p+2+k*2] | (d[p+3+k*2] << 8));
+            if (ix < 0 || ix >= np) { ok = 0; break; }
+            uint32_t key = n2_u32(d + pairs + (long)ix*8);
+            uint32_t val = n2_u32(d + pairs + (long)ix*8 + 4);
+            if (key == 0x6ba02c05u) mat = val;
+            else if (key == 0x0000d99au) { rgb[0] = (unsigned char)val; have |= 1; }
+            else if (key == 0x02ddc8f0u) { rgb[1] = (unsigned char)val; have |= 2; }
+            else if (key == 0x00136707u) { rgb[2] = (unsigned char)val; have |= 4; }
+        }
+        if (ok && mat && have == 7) {
+            out[n].mat = mat; out[n].r = rgb[0]; out[n].g = rgb[1]; out[n].b = rgb[2];
+            n++;
+        }
+        p += ok ? 2 + ln*2 : 2;
+    }
+    return n;
+}
+
 static const N2LightMat *n2_find_lightmat(const N2LightMat *m, int n, uint32_t hash) {
     /* STOCK PAINT PER CAR. Chunk 0x00034601 holds 106 records of 64 bytes:
        +0x00 paint material hash, +0x14 car number, +0x18 variant number,

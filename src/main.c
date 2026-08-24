@@ -1245,6 +1245,9 @@ int main(int argc, char **argv) {
     int fbcensus = 0;   /* --fallback-census (M102): who still takes the old path */
     int camat = 0; float camx = 0, camy = 0;   /* --cam-at X Y: aim a static capture */
     int spawn_set = 0; float spawn_x = 0, spawn_y = 0;   /* --spawn NAME */
+    static N2Paint pal[512]; int npal = 0;        /* body paints, from GLOBALB */
+    float paint_rgb[3] = { 0.70f, 0.70f, 0.75f }; /* until the record is read */
+    const char *paint_name = NULL;                /* --paint NAME */
     int   no_post = 0;                 /* --no-post: skip the tone pass */
     float post_amount = 1.0f;          /* --post N: scale it */
     int   post_on = 0;                 /* the pass is live this frame */
@@ -1375,6 +1378,8 @@ int main(int argc, char **argv) {
            models with their matrix baked in. See world2.c. */
         else if (!strcmp(argv[i], "--world2")) world2_on = 1;
         /* --no-post / --post N: the bloom-and-tone pass, and how much of it. */
+        /* --paint NAME: body paint by material name (METPAINTSILVER, ...). */
+        else if (!strcmp(argv[i], "--paint") && i+1 < argc) paint_name = argv[++i];
         else if (!strcmp(argv[i], "--no-post")) no_post = 1;
         else if (!strcmp(argv[i], "--post") && i+1 < argc)
             post_amount = (float)atof(argv[++i]);
@@ -3038,6 +3043,26 @@ int main(int argc, char **argv) {
         nlmat = n2_load_lightmats(globdata, globlen, lmat, 256);
         if (nlmat) printf("material records: %d\n", nlmat);
 
+        /* BODY COLOUR FROM THE DATA. The paint table pairs a material hash
+           with the actual RGB the game paints that car in. Without it the body
+           keeps a hand-picked near-white, and near-white metallic under a
+           specular highlight is what blows out. */
+        npal = n2_load_paints(globdata, globlen, pal, 512);
+        if (paint_name) n2_carskin_mat = n2_str_hash(paint_name);
+        {   uint32_t want = n2_carskin_mat ? n2_carskin_mat
+                                           : n2_str_hash("METPAINTSILVER");
+            for (int q = 0; q < npal; q++) if (pal[q].mat == want) {
+                paint_rgb[0] = pal[q].r / 255.0f;
+                paint_rgb[1] = pal[q].g / 255.0f;
+                paint_rgb[2] = pal[q].b / 255.0f;
+                printf("paint: %s RGB=(%d,%d,%d)\n",
+                       paint_name ? paint_name : "METPAINTSILVER",
+                       pal[q].r, pal[q].g, pal[q].b);
+                break;
+            }
+            printf("paints in the palette: %d\n", npal);
+        }
+
         {   N2Tpk gt = n2_tpk_open(globdata, globlen);
             struct { uint32_t key; GLuint *dst; const char *nm; } need[] = {
                 { 0x28eefa9cu, &tex_headlights, "HEADLIGHTS"        },
@@ -4361,7 +4386,7 @@ int main(int argc, char **argv) {
     /* Stock showroom paint: metallic silver (the files carry no chosen
        colour; badges/vinyls overlay as decals). The debug pane's paint
        override still allows any colour live. */
-    float paint[3] = { 0.70f, 0.70f, 0.75f };
+    float paint[3] = { paint_rgb[0], paint_rgb[1], paint_rgb[2] };
     /* A named start point has the last word. Several rules ahead of this one
        move the car -- the density spawn, the static-capture picker, the
        showcase pose, an armed race grid -- and each is right for its own mode,
@@ -6327,35 +6352,13 @@ int main(int argc, char **argv) {
                so the halo has a soft edge; plain ONE/ONE would be a hard disc).
                Depth-tested (occluded by nearer body) but no depth write; nudged
                slightly toward the camera so it sits over its own lens. */
-            if (g_dbg.show_lights && g_dbg.night_mode) {   /* lens bloom: night only */
-                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-                glDepthMask(GL_FALSE);
-                glUniform1f(uUnlit,1.0f); glUniform1f(uUseTex,0.0f); glUniform1f(uSoft,1.0f);
-                for (int b=0;b<4;b++){ if (bloomc[b][3]<0.5f) continue;
-                    float lx=bloomc[b][0], ly=bloomc[b][1], lz=bloomc[b][2];
-                    float wx=Model[0]*lx+Model[4]*ly+Model[8]*lz+Model[12];
-                    float wy=Model[1]*lx+Model[5]*ly+Model[9]*lz+Model[13];
-                    float wz=Model[2]*lx+Model[6]*ly+Model[10]*lz+Model[14];
-                    float vd[3]={wx-cam[0],wy-cam[1],wz-cam[2]};
-                    float vl=sqrtf(vd[0]*vd[0]+vd[1]*vd[1]+vd[2]*vd[2]); if (vl<1e-3f) continue;
-                    vd[0]/=vl; vd[1]/=vl; vd[2]/=vl;
-                    wx-=vd[0]*0.08f; wy-=vd[1]*0.08f; wz-=vd[2]*0.08f;   /* over its lens */
-                    float rt[3]={vd[1],-vd[0],0};                        /* = vd x worldUp(0,0,1) */
-                    float rl=sqrtf(rt[0]*rt[0]+rt[1]*rt[1]); if (rl<1e-3f) continue;
-                    rt[0]/=rl; rt[1]/=rl;
-                    float u2[3]={rt[1]*vd[2]-rt[2]*vd[1], rt[2]*vd[0]-rt[0]*vd[2], rt[0]*vd[1]-rt[1]*vd[0]};
-                    float sz=0.5f;
-                    float M[16]={ rt[0]*sz,rt[1]*sz,rt[2]*sz,0,  u2[0]*sz,u2[1]*sz,u2[2]*sz,0,  0,0,1,0,
-                                  wx-(rt[0]+u2[0])*sz*0.5f, wy-(rt[1]+u2[1])*sz*0.5f, wz-(rt[2]+u2[2])*sz*0.5f, 1 };
-                    float MV[16]; mat_mul(MVP,M,MV); glUniformMatrix4fv(uMVP,1,GL_FALSE,MV);
-                    if (b<2) glUniform3f(uColor, 0.90f,0.82f,0.55f);     /* front: warm white */
-                    else     glUniform3f(uColor, 0.90f,0.08f,0.05f);     /* rear: red */
-                    glUniform1f(uAlpha, 0.55f); draw_gpumesh(&quad); g_dbg.drawn++;
-                }
-                glUniform1f(uAlpha,1.0f); glUniform1f(uSoft,0.0f); glUniform1f(uUnlit,0.0f);
-                glUniformMatrix4fv(uMVP,1,GL_FALSE,MVPc);
-                glDepthMask(GL_TRUE); glDisable(GL_BLEND);
-            }
+            /* The lens-bloom discs that used to sit here are gone. They were
+               drawn at cluster centroids derived from the geometry, which put
+               a soft disc in the middle of each light unit -- over the glass
+               rather than in it. The lens now carries its own emissive colour
+               and the shared lamp texture, so it lights up as a shape instead
+               of wearing a sticker. */
+
             /* procedural tyres at the 4 arches (the game rims render as urchins);
                the radial rim texture gives them a hub + spokes instead of a void */
             if (have_wheel && g_dbg.show_tires) {
@@ -6447,6 +6450,12 @@ int main(int argc, char **argv) {
             glUniform1f(rp.uEnv, 0.0f);   /* reflections are cars-only */
             glUniform1f(rp.uEnvCubeOn, 0.0f);
         }
+        /* And once more OUTSIDE that block. The restore above only runs when a
+           car was drawn, and which passes run at all depends on the mode --
+           which is how the world lights ended up visible in one camera mode and
+           missing in the other, twice, in opposite directions. */
+        glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
+        glUniform3f(uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
 
         /* tail lights: red camera-facing glows at each car's rear (night) */
         if (race_state != 3 && ncar) {
@@ -6465,16 +6474,12 @@ int main(int argc, char **argv) {
                 float fx=cosf(hd), fy=sinf(hd), rx=-fy, ry=fx;
                 for (int side=-1; side<=1; side+=2) {
                     float bx,by,bz;
-                    int bi = side < 0 ? 2 : 3;   /* car-local rear light clusters */
-                    if (c==0 && player_body_model_valid && bloomc[bi][3]>0.5f) {
-                        float lx=bloomc[bi][0], ly=bloomc[bi][1], lz2=bloomc[bi][2];
-                        bx=player_body_model[0]*lx+player_body_model[4]*ly+
-                           player_body_model[8]*lz2+player_body_model[12];
-                        by=player_body_model[1]*lx+player_body_model[5]*ly+
-                           player_body_model[9]*lz2+player_body_model[13];
-                        bz=player_body_model[2]*lx+player_body_model[6]*ly+
-                           player_body_model[10]*lz2+player_body_model[14];
-                    } else {
+                    /* Placed from the body, not from a "light cluster centroid"
+                       derived from the geometry: that centroid lands in the
+                       middle of the light unit, so the glow sat as a disc over
+                       the glass instead of behind it. The lens lights itself
+                       through its material and the shared lamp texture. */
+                    {
                         bx=cp[0]-fx*1.9f+rx*0.6f*side;
                         by=cp[1]-fy*1.9f+ry*0.6f*side;
                         bz=cp[2]+0.5f;
