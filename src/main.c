@@ -5499,7 +5499,12 @@ int main(int argc, char **argv) {
         glUniform3f(rp.uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
         glEnable(GL_DEPTH_TEST); glDepthMask(GL_TRUE);
         glDisable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glEnable(GL_CULL_FACE);
+        /* Culling OFF: the car, glass and the glow billboards are all
+           single-sided geometry meant to be seen from either face. It is
+           enabled only for the world pass, and only on request. Turning it on
+           here made the lamp halos vanish as soon as the camera moved behind
+           them -- which is every frame once the chase camera starts. */
+        glDisable(GL_CULL_FACE);
         glUniform3f(rp.uFogColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b);
         glUniform1f(rp.uFogDensity, g_dbg.fog_density);
         glUniform1f(rp.uUVCheck, (float)g_dbg.show_uv_checker);
