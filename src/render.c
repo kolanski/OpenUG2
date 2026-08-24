@@ -36,6 +36,14 @@ static const char *FS =
     "uniform vec3 uFogColor; uniform float uFogDensity;\n"
     "uniform vec3 uCamPos; uniform float uEnv; uniform float uUVCheck;\n"
     "uniform float uGloss; uniform float uFlipN;\n"
+    /* Car material response, driven by the material record in the shipped data
+       rather than by hand-picked shading. For each of diffuse, specular and
+       reflection the material stores a Min/Range pair, and the term evaluates
+       as f = Min + dot(V,N) * Range -- so a panel facing the viewer and a panel
+       edge-on differ by exactly what the material asks for, instead of by a
+       guess. uMatOn > 0.5 selects this model. */
+    "uniform float uMatOn; uniform vec3 uMatDifMin; uniform vec3 uMatDifRange;\n"
+    "uniform vec4 uMatSE;\n"   /* specMin, specRange, envMin, envRange */
     "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
     "uniform float uVista;\n"     /* >0.5: authored backdrop pass, alpha-blended */
     /* exp^2 distance fog: fades far batches into the sky colour (which is
@@ -103,15 +111,20 @@ static const char *FS =
        this fakes the early-2000s baked-AO look by darkening paint where the
        surface turns away from the camera, instead of claiming detail that
        isn't in the asset. */
-    "  if(uSpec>0.001){\n"
-    "    float edge=pow(1.0-clamp(dot(N,V),0.0,1.0), 4.0);\n"
-    "    base *= mix(1.0, 0.6, edge);\n"
+    "  float vn = clamp(dot(N,V), 0.0, 1.0);\n"
+    "  float mspec = 1.0, menv = 1.0;\n"
+    "  if(uMatOn>0.5){\n"
+    "    base *= uMatDifMin + vn*uMatDifRange;\n"
+    "    mspec = max(uMatSE.x + vn*uMatSE.y, 0.0);\n"
+    "    menv  = max(uMatSE.z + vn*uMatSE.w, 0.0);\n"
+    "  } else if(uSpec>0.001){\n"
+    "    base *= mix(1.0, 0.6, pow(1.0-vn, 4.0));\n"
     "  }\n"
     /* Phong: reflect the light about the normal and test it against the VIEW
        vector. The old form used dot(N,L) with no V term at all, so it was a
        sharpened diffuse -- the highlight could not travel across a panel as
        the camera moved, which is what made the paint read flat/matte. */
-    "  float sp = pow(max(dot(reflect(-L,N), V), 0.0), uGloss)*uSpec;\n"
+    "  float sp = pow(max(dot(reflect(-L,N), V), 0.0), uGloss)*uSpec*mspec;\n"
     "  float rim = pow(1.0-abs(N.z), 3.0)*uSpec*0.4;\n"        /* fresnel-ish edge sheen */
     "  vec3 lit = base*d*1.35 + sp + rim;\n"
     /* per-vertex prelight (world geometry): the source stores baked AO/lighting
@@ -256,6 +269,10 @@ RProg render_program(void) {
     r.uLight   = glGetUniformLocation(r.prog, "uLight");
     r.uVColor  = glGetUniformLocation(r.prog, "uVColor");
     r.uGloss   = glGetUniformLocation(r.prog, "uGloss");
+    r.uMatOn       = glGetUniformLocation(r.prog, "uMatOn");
+    r.uMatDifMin   = glGetUniformLocation(r.prog, "uMatDifMin");
+    r.uMatDifRange = glGetUniformLocation(r.prog, "uMatDifRange");
+    r.uMatSE       = glGetUniformLocation(r.prog, "uMatSE");
     r.uFlipN   = glGetUniformLocation(r.prog, "uFlipN");
     r.uRimTint = glGetUniformLocation(r.prog, "uRimTint");
     glUniform1f(r.uAlpha, 1.0f); glUniform1f(r.uSoft, 0.0f); glUniform1f(r.uSpec, 0.0f);
@@ -300,6 +317,7 @@ GpuMesh *upload_scene(N2Scene *s) {
         glGenBuffers(1,&gm[i].ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,gm[i].ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, m->nidx*sizeof(uint16_t), m->idx, GL_STATIC_DRAW);
         gm[i].nidx = m->nidx; gm[i].cat = m->cat; gm[i].texkey = m->texkey;
+        gm[i].matkey = m->matkey;
         gm[i].trim = m->trim;
         free(nor);
     }

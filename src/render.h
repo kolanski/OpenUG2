@@ -24,7 +24,9 @@
 #include "nfsu2.h"
 
 /* per-mesh GPU buffers + computed normals */
-typedef struct { GLuint vbo, nbo, ibo; int nidx, cat, trim; uint32_t texkey; } GpuMesh;
+typedef struct { GLuint vbo, nbo, ibo; int nidx, cat, trim;
+                 uint32_t texkey;
+                 uint32_t matkey; /* material record key, 0 = none */ } GpuMesh;
 
 /* ---- static-world batching: meshes merged per (256m grid cell, texture) ----
  * One interleaved VBO per batch kills the per-mesh bind/attrib overhead;
@@ -69,7 +71,11 @@ typedef struct {
           uFlipN,   /* 1 = negate the vertex normal (inspector diagnostic) */
           uGloss,   /* specular pow() exponent: high = tight metallic-paint
                        highlight, low = broad plastic/trim sheen (cars only) */
-          uRimTint; /* 0 = raw rim texture, 1 = recolor toward uColor (rim paint) */
+          uRimTint, /* 0 = raw rim texture, 1 = recolor toward uColor (rim paint) */
+          /* Material response taken from the shipped material record rather
+             than from per-class constants: each term is a Min/Range pair the
+             shader interpolates by dot(V,N). uMatOn selects it. */
+          uMatOn, uMatDifMin, uMatDifRange, uMatSE;
 } RProg;
 
 /* world-space sun direction (night scene key light) */

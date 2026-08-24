@@ -2871,6 +2871,7 @@ int main(int argc, char **argv) {
                                                     flag: 0 front-L, 1 front-R, 2 rear-L, 3 rear-R */
     float carWheelR = 0.0f;                       /* car's stock wheel radius (rim fit) */
     N2CarProfile carprof; memset(&carprof, 0, sizeof carprof);   /* per-car dimensions */
+    static N2LightMat lmat[256]; int nlmat = 0;   /* material records, from GLOBALB */
     N2CarConfig carcfg = { 0, 0, 0, 0 };         /* active customization profile (K cycles kits) */
     float spawn[3] = { cx, cy, cz }, heading0 = 0.0f;
     if (cdata) {
@@ -2954,6 +2955,14 @@ int main(int argc, char **argv) {
             }
             free(cz);
         }
+        /* MATERIAL RECORDS. Each car submesh names a material, and that record
+           carries the shading it should get -- chrome with no diffuse and a
+           strong reflection, metallic paint with its own specular, rubber with
+           neither. Reading them here means the car is lit by what the data
+           says instead of by per-class constants. */
+        nlmat = n2_load_lightmats(globdata, globlen, lmat, 256);
+        if (nlmat) printf("material records: %d\n", nlmat);
+
         int wheel_from_global = 0;
         g_dbg.wheel = wheel_config_for(carname, &carprof, globdata, globlen, &wheel_from_global);
         free(globdata);
@@ -5307,6 +5316,11 @@ int main(int argc, char **argv) {
            into exactly what the horizon shows */
         glClearColor(g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b, 1);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        /* The material model belongs to the car: leave it on and the world is
+           multiplied by whatever the last panel's record said, which turns the
+           road black. Off at the top of every frame, on only where a submesh
+           names a material. */
+        glUniform1f(rp.uMatOn, 0.0f);
         glUniform3f(rp.uFogColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b);
         glUniform1f(rp.uFogDensity, g_dbg.fog_density);
         glUniform1f(rp.uUVCheck, (float)g_dbg.show_uv_checker);
@@ -5836,16 +5850,49 @@ int main(int argc, char **argv) {
                 float specv = (c==N2_CAR_BODY||c==N2_CAR_MISC)?g_dbg.body_spec
                             : is_light?0.45f : c==N2_CAR_MECH?0.05f : 0.0f;
                 if (cgm[i].trim) specv *= 0.4f;
+                float glossv = cgm[i].trim ? 6.0f : 20.0f;
+                float envv = (c==N2_CAR_BODY||c==N2_CAR_MISC)?0.50f*g_dbg.body_env
+                           : is_light?0.55f : c==N2_CAR_MECH?0.0f : 0.15f;
+
+                /* MATERIAL FROM THE DATA. When a submesh names a material, its
+                   diffuse, specular and reflection come from that record rather
+                   than from per-class constants: chrome has no diffuse and a
+                   1.14 reflection, metallic paint 1.12 specular with 0.372
+                   reflection, rubber 0.248 specular and no reflection at all.
+                   The curves go to the shader unchanged -- it evaluates
+                   Min + dot(V,N)*Range. Averaging them into one number and
+                   adding hand-made edge darkening instead is what makes paint
+                   read flat. The exponent multiplier of 6 is our own scale fit:
+                   the stored exponent belongs to a different lighting model and
+                   used directly gives a highlight the size of a body panel. */
+                const N2LightMat *lm = (nlmat && cgm[i].matkey)
+                                     ? n2_find_lightmat(lmat, nlmat, cgm[i].matkey) : NULL;
+                if (lm) {
+                    float dr[3], se[4];
+                    for (int q = 0; q < 3; q++) dr[q] = lm->dif_max[q] - lm->dif_min[q];
+                    se[0] = (lm->spec_min[0]+lm->spec_min[1]+lm->spec_min[2]) / 3.0f;
+                    se[1] = (lm->spec_max[0]+lm->spec_max[1]+lm->spec_max[2]) / 3.0f - se[0];
+                    se[2] = (lm->env_min[0] +lm->env_min[1] +lm->env_min[2])  / 3.0f;
+                    se[3] = (lm->env_max[0] +lm->env_max[1] +lm->env_max[2])  / 3.0f - se[2];
+                    glUniform1f(rp.uMatOn, 1.0f);
+                    glUniform3fv(rp.uMatDifMin, 1, lm->dif_min);
+                    glUniform3fv(rp.uMatDifRange, 1, dr);
+                    glUniform4fv(rp.uMatSE, 1, se);
+                    specv = c==N2_CAR_BODY ? g_dbg.body_spec * 1.2f : 0.5f;
+                    envv  = c==N2_CAR_BODY ? g_dbg.body_env  * 2.0f : 1.5f;
+                    if (lm->spec_pow > 0.01f) glossv = 6.0f * lm->spec_pow;
+                } else {
+                    glUniform1f(rp.uMatOn, 0.0f);
+                }
                 glUniform1f(uSpec, specv);
-                glUniform1f(uGloss, cgm[i].trim ? 6.0f : 20.0f);
+                glUniform1f(uGloss, glossv);
                 /* no diffuse texture exists for any light part (verified
                    exhaustively against the data, see n2_car_category) — chrome
                    housing + coloured lens read entirely through reflection.
                    Mechanical compartment parts (engine/exhaust) are unpainted
                    metal/plastic when they have no texture of their own — no
                    body-paint gloss or reflection either. */
-                glUniform1f(rp.uEnv, (c==N2_CAR_BODY||c==N2_CAR_MISC)?0.50f*g_dbg.body_env
-                                   : is_light?0.55f : c==N2_CAR_MECH?0.0f : 0.15f);
+                glUniform1f(rp.uEnv, envv);
                 glUniform1f(rp.uDecal, 0.0f);   /* body branch may re-enable */
                 GLuint tex = 0; int hasalpha = 0;
                 for (int j = 0; j < nmap; j++) if (mapkey[j]==cgm[i].texkey) {
