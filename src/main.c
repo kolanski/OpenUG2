@@ -2684,7 +2684,8 @@ int main(int argc, char **argv) {
          HEADLIGHTGLOW          the glow around a lit lamp */
     GLuint tex_headlights = 0, tex_brake = 0, tex_brake_l = 0, tex_hlglow = 0;
     static uint32_t tmapkey[2048]; static GLuint tmaptex[2048];
-    int ntmap = world_bind_textures(&world, tmapkey, tmaptex, 2048);
+    static unsigned char tmapalpha[2048];   /* draw mode per texture */
+    int ntmap = world_bind_textures(&world, tmapkey, tmaptex, tmapalpha, 2048);
     printf("track textures bound: %d distinct\n", ntmap);
 
     /* THE LAMP HALO. Its texture is the flare sheet the game ships; the key is
@@ -2692,7 +2693,7 @@ int main(int argc, char **argv) {
        own glow. */
     for (int q = 0; q < ntmap; q++)
         if (tmapkey[q] == 0x17e5ebd2u) { tex_glow = tmaptex[q];
-            printf("lamp flare: SFX_FLARE_GLOWA bound\n"); break; }
+            printf("lamp flare: SFX_FLARE_GLOWA bound (mode %d)\n", tmapalpha[q]); break; }
 
     /* LIGHT SOURCES drive those halos. Much lamp geometry is a flat quad that
        all but vanishes seen from the side, so at driving height the light
@@ -4920,6 +4921,10 @@ int main(int argc, char **argv) {
             float zprev = g_ride.z;
             phys_ride_step(&g_ride, &g_sup, 1.0f/60.0f);
             carpos[2] = g_ride.z;
+            { static int n=0; if (n<8 && getenv("N2_RIDE_TRACE")) { n++;
+                printf("ride %d: z=%.3f contacts=0x%x sup z=%.3f/%.3f/%.3f/%.3f\n",
+                       n, g_ride.z, g_ride.contact_mask,
+                       g_sup.z[0], g_sup.z[1], g_sup.z[2], g_sup.z[3]); } }
             float dzf = g_ride.z - zprev; if (dzf < 0) dzf = -dzf;
             if (dzf > g_ride_maxdz) g_ride_maxdz = dzf;
             if (!g_ride.contact_mask) g_ride_air++;
@@ -5691,6 +5696,20 @@ int main(int argc, char **argv) {
         if (ra_f == 0) { memset(band_b,0,sizeof band_b); memset(band_m,0,sizeof band_m);
                          memset(band_sc,0,sizeof band_sc); }
         static int viskept[4096]; int nviskept = 0;   /* M78: opaque batches drawn */
+        /* DRAW MODE PER BATCH, taken from its texture's record. Drawing
+           everything opaque is what leaves foliage as solid rectangles and lit
+           windows black: the record already says which is which. */
+        static unsigned char *bmode = NULL; static int bmode_n = -1;
+        if (bmode_n != nbatch) {
+            bmode = (unsigned char *)realloc(bmode, (size_t)(nbatch > 0 ? nbatch : 1));
+            for (int k = 0; k < nbatch; k++) {
+                bmode[k] = 0;
+                for (int q = 0; q < ntmap; q++)
+                    if (tmapkey[q] == wbatch[k].texkey) { bmode[k] = tmapalpha[q]; break; }
+            }
+            bmode_n = nbatch;
+        }
+        static int blendlist[8192]; int nblend = 0;
         if (g_debug_mode == 0 || !dbgprog) {   /* --- default textured world pass --- */
         GLuint lasttex = (GLuint)-1;
         glUniform1f(rp.uVColor, g_dbg.vcolor);   /* apply source prelight to world geom */
@@ -5710,10 +5729,18 @@ int main(int argc, char **argv) {
                 for (int sc=0;sc<8;sc++) far_scen[sc] += b->scen_count[sc];
                 continue;
             }
+            if (bmode[k] >= N2_DRAW_BLEND) {      /* glass and neon: second pass */
+                if (nblend < 8192) blendlist[nblend++] = k;
+                continue;
+            }
             ndrawn += b->nmesh;
             if (b->tex != lasttex) {
                 if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
                 else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
+                /* alpha test only where the record says cutout -- foliage,
+                   railings, frames. Applied to an opaque texture it punches
+                   holes in the road. */
+                glUniform1f(rp.uAlphaTest, bmode[k] == N2_DRAW_CUTOUT ? 1.0f : 0.0f);
                 lasttex = b->tex;
             }
             draw_batch(b);
@@ -5730,6 +5757,30 @@ int main(int argc, char **argv) {
             glDepthMask(GL_TRUE);
             glUniform1f(uUnlit, 0.0f);
         }
+        /* SECOND PASS: translucent geometry. These textures carry a draw order
+           of 5..7 and do not write depth. Additive ones are the neon and the
+           lit building windows -- what makes the night city glow; without this
+           pass the facades stay black. */
+        if (nblend) {
+            glEnable(GL_BLEND); glDepthMask(GL_FALSE);
+            glUniform1f(rp.uAlphaTest, 0.0f); glUniform1f(uUseTex, 1.0f);
+            int lastmode = -1; lasttex = (GLuint)-1;
+            for (int q = 0; q < nblend; q++) {
+                N2Batch *b = &wbatch[blendlist[q]];
+                int md = bmode[blendlist[q]];
+                if (md != lastmode) {
+                    glBlendFunc(GL_SRC_ALPHA, md == N2_DRAW_ADD ? GL_ONE
+                                                                : GL_ONE_MINUS_SRC_ALPHA);
+                    lastmode = md;
+                }
+                if (b->tex != lasttex) { glBindTexture(GL_TEXTURE_2D, b->tex); lasttex = b->tex; }
+                draw_batch(b);
+                ndrawn += b->nmesh; g_dbg.drawn++; wbdrawn++;
+            }
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_TRUE); glDisable(GL_BLEND);
+        }
+        glUniform1f(rp.uAlphaTest, 0.0f);
         glUniform1f(rp.uVColor, 0.0f);   /* off for everything else (cars carry no
                                             prelight; their attrib-3 default is black) */
         } else if (g_dbg.show_track) {   /* --- F3 debug view: prelight/normals/wire --- */

@@ -75,6 +75,9 @@ typedef struct {
           /* Material response taken from the shipped material record rather
              than from per-class constants: each term is a Min/Range pair the
              shader interpolates by dot(V,N). uMatOn selects it. */
+          /* 1 = discard texels below half alpha. Only for textures the record
+             calls cutout: applied to an opaque one it punches holes. */
+          uAlphaTest,
           uMatOn, uMatDifMin, uMatDifRange, uMatSE,
           /* live environment cube: 0 = procedural night sphere, 1 = sample the
              cube, 2 = show the reflection alone (diagnostic) */

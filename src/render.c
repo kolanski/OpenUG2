@@ -328,6 +328,7 @@ RProg render_program(void) {
     r.uEnvCubeOn   = glGetUniformLocation(r.prog, "uEnvCubeOn");
     r.uEnvYaw      = glGetUniformLocation(r.prog, "uEnvYaw");
     r.uEnvCube     = glGetUniformLocation(r.prog, "uEnvCube");
+    r.uAlphaTest   = glGetUniformLocation(r.prog, "uAlphaTest");
     r.uMatOn       = glGetUniformLocation(r.prog, "uMatOn");
     r.uMatDifMin   = glGetUniformLocation(r.prog, "uMatDifMin");
     r.uMatDifRange = glGetUniformLocation(r.prog, "uMatDifRange");
