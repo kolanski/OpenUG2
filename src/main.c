@@ -542,6 +542,7 @@ static long  g_ride_air = 0, g_ride_rejhigh = 0, g_ride_rejlow = 0, g_ride_nocov
 static float g_ride_maxlift = 0.0f;   /* largest penetration correction, audit  */
 static float g_ride_maxdelta = 0.0f;  /* largest ACCEPTED contact delta, audit  */
 static float g_ride_maxover = 0.0f;   /* worst overshoot of the contact window   */
+static unsigned g_pose_t0 = 0; static long g_pose_f0 = 0;   /* pose-shot timing */
 static float ra_maxwallcorr = 0.0f;   /* largest single wall correction, audit    */
 static float g_ride_maximpact = 0.0f;
 
@@ -1195,6 +1196,17 @@ int main(int argc, char **argv) {
     int tier = 1;   /* production default: ordinary. full is opt-in (M132-R2) */
     const char *poseshot = NULL; /* --pose-shot PREFIX: freeze the production
                                     start pose and capture four yaws there */
+    float posefrac = -1.0f;      /* --pose-frac F: seed the SAME first-safe
+                                    start-line search F of the way round the
+                                    authored route, so a sample pose is a real
+                                    route waypoint on supported road (M133) */
+    float poseseed[2] = {0,0};   /* --pose-seed X Y: run the SAME safe-road
+                                    selector from an explicit seed, so two
+                                    builds can be compared at one pose (M133) */
+    int markrepair = 0;          /* --mark-repaired (M133): diagnostic highlight */
+    int lodcensus = 0;           /* --lod-census (M133): structural detail-tier census */
+    int lsaudit = 0;             /* --local-scene-audit (M133): source->screen
+                                    attribution for everything near the car */
     int citypose = 0;            /* --city-pose: seed the existing safe-road
                                     selector at the built-up centroid */
     const char *sshot = NULL;    /* --shot-static: deterministic region-local world capture */
@@ -1266,6 +1278,18 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--pose-shot") && i+1 < argc) poseshot = argv[++i];
         else if (!strcmp(argv[i], "--city-pose")) citypose = 1;
+        else if (!strcmp(argv[i], "--struct-pose")) citypose = 2;
+        else if (!strcmp(argv[i], "--repair-pose")) citypose = 3;
+        else if (!strcmp(argv[i], "--pose-seed") && i+2 < argc) {
+            citypose = 4; poseseed[0] = (float)atof(argv[++i]);
+            poseseed[1] = (float)atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--mark-repaired")) markrepair = 1;
+        else if (!strcmp(argv[i], "--pose-frac") && i+1 < argc)
+            posefrac = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--local-scene-audit")) lsaudit = 1;
+        else if (!strcmp(argv[i], "--tex-audit")) g_world_texaudit = 1;
+        else if (!strcmp(argv[i], "--lod-census")) lodcensus = 1;
+        else if (!strcmp(argv[i], "--local-scene-objects")) lsaudit = 2;
         else if (!strcmp(argv[i], "--static-spawn-audit") && i+1 < argc) sspawn = trackname = argv[++i];
         else if (!strcmp(argv[i], "--surface-stack") && i+3 < argc) {
             sstack = trackname = argv[++i]; stx = (float)atof(argv[++i]); sty = (float)atof(argv[++i]); }
@@ -2650,6 +2674,82 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nm; i++)
         for (int j = 0; j < ntmap; j++)
             if (tmapkey[j] == scene.meshes[i].texkey) { mtex[i] = tmaptex[j]; break; }
+    if (lodcensus) {
+        /* M133 STRUCTURAL detail-tier census. No names are consulted: meshes
+           are grouped purely by identical rounded XY footprint, and within a
+           group we look at triangle counts and vertical offsets. If the shipped
+           world really carries several detail tiers of the same object, they
+           show up here as same-footprint groups with strictly decreasing
+           triangle counts. */
+        typedef struct { float x0,y0,x1,y1; int n, tri[8], idx[8]; } LodGrp;
+        static LodGrp g[24576]; int ng = 0;
+        long grouped = 0, decreasing = 0, zoff = 0, samez = 0;
+        for (int i = 0; i < nm; i++) {
+            const float *bb = world.mbb[i];
+            float q[4] = { roundf(bb[0]*100)/100, roundf(bb[1]*100)/100,
+                           roundf(bb[2]*100)/100, roundf(bb[3]*100)/100 };
+            int f = -1;
+            for (int k = 0; k < ng; k++)
+                if (g[k].x0==q[0] && g[k].y0==q[1] && g[k].x1==q[2] && g[k].y1==q[3]) { f = k; break; }
+            if (f < 0) { if (ng >= 24576) continue; f = ng++;
+                         g[f].x0=q[0]; g[f].y0=q[1]; g[f].x1=q[2]; g[f].y1=q[3]; g[f].n=0; }
+            if (g[f].n < 8) { g[f].tri[g[f].n] = scene.meshes[i].nidx/3;
+                              g[f].idx[g[f].n] = i; g[f].n++; }
+        }
+        int shown = 0;
+        for (int k = 0; k < ng; k++) {
+            if (g[k].n < 2) continue;
+            grouped += g[k].n;
+            int dec = 1;
+            for (int q = 1; q < g[k].n; q++) if (g[k].tri[q] >= g[k].tri[q-1]) dec = 0;
+            float zlo[8], zhi[8];
+            for (int q = 0; q < g[k].n; q++) {
+                const N2Mesh *me = &scene.meshes[g[k].idx[q]];
+                zlo[q]=1e30f; zhi[q]=-1e30f;
+                for (int v = 0; v < me->nverts; v++) {
+                    float z = me->verts[v*5+2];
+                    if (z<zlo[q]) zlo[q]=z; if (z>zhi[q]) zhi[q]=z;
+                }
+            }
+            int off = 0;
+            for (int q = 1; q < g[k].n; q++) if (fabsf(zlo[q]-zlo[0]) > 0.5f) off = 1;
+            if (dec) decreasing += g[k].n;
+            if (off) zoff += g[k].n; else samez += g[k].n;
+            if (dec && shown < 12) {
+                printf("LOD group xy[%9.2f %9.2f %9.2f %9.2f] n=%d  tris", 
+                       g[k].x0,g[k].y0,g[k].x1,g[k].y1,g[k].n);
+                for (int q = 0; q < g[k].n; q++) printf(" %d", g[k].tri[q]);
+                printf("  zlo");
+                for (int q = 0; q < g[k].n; q++) printf(" %.2f", zlo[q]);
+                printf("  names");
+                for (int q = 0; q < g[k].n; q++)
+                    printf(" %s", scene.meshes[g[k].idx[q]].sname);
+                printf("\n");
+                shown++;
+            }
+        }
+        printf("LOD census %s: %d meshes, %d distinct XY footprints, %ld meshes in "
+               "multi-member groups, %ld of those in strictly-decreasing-triangle "
+               "groups, %ld vertically offset, %ld coincident in Z\n",
+               trackname, nm, ng, grouped, decreasing, zoff, samez);
+    }
+    if (g_world_texaudit) {
+        long nokey2 = 0, inmap = 0, notinmap = 0;
+        for (int i = 0; i < nm; i++) {
+            uint32_t tk = scene.meshes[i].texkey;
+            if (!tk) { nokey2++; continue; }
+            if (mtex[i]) continue;
+            int found = 0;
+            for (int j = 0; j < ntmap; j++) if (tmapkey[j] == tk) { found = 1; break; }
+            if (found) inmap++; else notinmap++;
+            if (notinmap <= 6 && !found)
+                printf("TEXMISS mesh %-30s cat %d key %08x  not in the bound map\n",
+                       scene.meshes[i].sname, scene.meshes[i].cat, tk);
+        }
+        printf("TEXMISS summary: %ld meshes carry no key at all, %ld unresolved "
+               "but key IS bound (lookup bug), %ld unresolved and key never bound\n",
+               nokey2, inmap, notinmap);
+    }
     if (mapaudit) {
         int keyed[8]={0}, unresolved[8]={0}, nokey[8]={0};
         for (int i=0;i<nm;i++) {
@@ -2913,9 +3013,17 @@ int main(int argc, char **argv) {
                still passes road/patch/wall/headroom. No arbitrary placement:
                only the seed moves, every acceptance test below is unchanged. */
             double cx = 0, cy = 0, cz = 0; long cn = 0;
+            if (citypose == 4) {
+                oldsp[0] = poseseed[0]; oldsp[1] = poseseed[1];
+                densx = oldsp[0]; densy = oldsp[1];
+                printf("city pose: seeding the safe-road selector at the given "
+                       "seed (%.1f, %.1f)\n", oldsp[0], oldsp[1]);
+            } else
             for (int i = 0; i < nm; i++) {
                 int sc2 = scene.meshes[i].scen;
-                if (sc2 != N2_SC_BUILDING && sc2 != N2_SC_STRUCT) continue;
+                if (citypose == 3) { if (!scene.meshes[i].vrepair) continue; }
+                else if (citypose == 2) { if (sc2 != N2_SC_STRUCT) continue; }
+                else if (sc2 != N2_SC_BUILDING && sc2 != N2_SC_STRUCT) continue;
                 for (int v = 0; v < scene.meshes[i].nverts; v++) {
                     const float *p = scene.meshes[i].verts + v*5;
                     cx += p[0]; cy += p[1]; cz += p[2]; cn++;
@@ -2924,8 +3032,11 @@ int main(int argc, char **argv) {
             if (cn) {
                 oldsp[0] = (float)(cx/cn); oldsp[1] = (float)(cy/cn); oldsp[2] = (float)(cz/cn);
                 printf("city pose: seeding the safe-road selector at the "
-                       "BUILDING/STRUCT centroid (%.1f, %.1f, %.1f) over %ld vertices\n",
+                       "%s centroid (%.1f, %.1f, %.1f) over %ld vertices\n",
+                       citypose == 3 ? "vertex-repaired-object" :
+                       citypose == 2 ? "STRUCT" : "BUILDING/STRUCT",
                        oldsp[0], oldsp[1], oldsp[2], cn);
+                densx = oldsp[0]; densy = oldsp[1];   /* the selector orders by THIS */
             } else printf("city pose: no BUILDING/STRUCT geometry; seed unchanged\n");
         }
         /* candidates: road-mesh vertices, nearest the dense build-up centre
@@ -3458,9 +3569,17 @@ int main(int argc, char **argv) {
                still passes road/patch/wall/headroom. No arbitrary placement:
                only the seed moves, every acceptance test below is unchanged. */
             double cx = 0, cy = 0, cz = 0; long cn = 0;
+            if (citypose == 4) {
+                oldsp[0] = poseseed[0]; oldsp[1] = poseseed[1];
+                densx = oldsp[0]; densy = oldsp[1];
+                printf("city pose: seeding the safe-road selector at the given "
+                       "seed (%.1f, %.1f)\n", oldsp[0], oldsp[1]);
+            } else
             for (int i = 0; i < nm; i++) {
                 int sc2 = scene.meshes[i].scen;
-                if (sc2 != N2_SC_BUILDING && sc2 != N2_SC_STRUCT) continue;
+                if (citypose == 3) { if (!scene.meshes[i].vrepair) continue; }
+                else if (citypose == 2) { if (sc2 != N2_SC_STRUCT) continue; }
+                else if (sc2 != N2_SC_BUILDING && sc2 != N2_SC_STRUCT) continue;
                 for (int v = 0; v < scene.meshes[i].nverts; v++) {
                     const float *p = scene.meshes[i].verts + v*5;
                     cx += p[0]; cy += p[1]; cz += p[2]; cn++;
@@ -3469,8 +3588,11 @@ int main(int argc, char **argv) {
             if (cn) {
                 oldsp[0] = (float)(cx/cn); oldsp[1] = (float)(cy/cn); oldsp[2] = (float)(cz/cn);
                 printf("city pose: seeding the safe-road selector at the "
-                       "BUILDING/STRUCT centroid (%.1f, %.1f, %.1f) over %ld vertices\n",
+                       "%s centroid (%.1f, %.1f, %.1f) over %ld vertices\n",
+                       citypose == 3 ? "vertex-repaired-object" :
+                       citypose == 2 ? "STRUCT" : "BUILDING/STRUCT",
                        oldsp[0], oldsp[1], oldsp[2], cn);
+                densx = oldsp[0]; densy = oldsp[1];   /* the selector orders by THIS */
             } else printf("city pose: no BUILDING/STRUCT geometry; seed unchanged\n");
         }
         #define SC_MAXC 65536
@@ -3961,10 +4083,54 @@ int main(int argc, char **argv) {
         free(vtex);
     }
 
+    /* --mark-repaired: the vertex-repaired meshes batched on their own, drawn
+       after the world in flat magenta. Diagnostic image only; never enabled in
+       a production capture. */
+    N2Batch *rbatch = NULL; int nrep = 0;
+    if (markrepair) {
+        static N2Mesh rm[4096]; int nrm = 0;
+        for (int i = 0; i < nm && nrm < 4096; i++)
+            if (scene.meshes[i].vrepair) rm[nrm++] = scene.meshes[i];
+        static GLuint rtx[4096]; memset(rtx, 0, sizeof rtx);
+        for (int c = 0; c <= N2_GLOW; c++) {
+            N2Scene rs = { rm, nrm, 4096 };
+            N2Batch *part = NULL;
+            int np = upload_cat_batches(&rs, c, rtx, &part);
+            if (np) {
+                rbatch = (N2Batch *)realloc(rbatch, (size_t)(nrep+np) * sizeof *rbatch);
+                memcpy(rbatch + nrep, part, (size_t)np * sizeof *part);
+                nrep += np;
+            }
+            free(part);
+        }
+        printf("mark-repaired: %d repaired meshes -> %d batches\n", nrm, nrep);
+        for (int i = 0, shown = 0; i < nm && shown < 61; i++) {
+            if (!scene.meshes[i].vrepair) continue;
+            const float *bb = world.mbb[i];
+            float best = 1e30f;
+            for (int j = 0; j < nm; j++) {
+                if (scene.meshes[j].cat != N2_ROAD) continue;
+                const float *rb = world.mbb[j];
+                float dx = (bb[0]+bb[2])*0.5f, dy = (bb[1]+bb[3])*0.5f;
+                float qx = dx < rb[0] ? rb[0]-dx : (dx > rb[2] ? dx-rb[2] : 0);
+                float qy = dy < rb[1] ? rb[1]-dy : (dy > rb[3] ? dy-rb[3] : 0);
+                float d = qx*qx+qy*qy; if (d < best) best = d;
+            }
+            printf("REPAIRMESH %-30s xy(%.1f %.1f) tris %d  nearest road %.1f m\n",
+                   scene.meshes[i].sname, (bb[0]+bb[2])*0.5f, (bb[1]+bb[3])*0.5f,
+                   scene.meshes[i].nidx/3, sqrtf(best));
+            shown++;
+        }
+    }
+
     N2Batch *wbatch = NULL;
+    static int *meshbatch = NULL;
+    meshbatch = (int *)malloc((size_t)(nm ? nm : 1) * sizeof *meshbatch);
     int nbatch = upload_world_batches(&scene, (const float (*)[4])world.mbb,
-                                      mtex, texTerr, &wbatch, bmesh);
-    free(mtex);
+                                      mtex, texTerr, &wbatch, bmesh, meshbatch);
+    /* the local-scene audit reads per-mesh texture resolution every frame, so
+       the table has to outlive batching when it is enabled */
+    if (!lsaudit) { free(mtex); mtex = NULL; }
     printf("world batched: %d meshes -> %d batches\n", nm, nbatch);
     if (baudit) return 0;   /* --batch-audit: report printed above, nothing to draw */
 
@@ -4218,8 +4384,11 @@ int main(int argc, char **argv) {
                             if (hl < 0.5f) hl = 2.20f;
                             if (hw < 0.5f) hw = 0.90f;
                             float sz = 0, sh = 0;
+                            int seed = start_idx + 1;
+                            if (posefrac >= 0.0f)
+                                seed = start_idx + 1 + (int)(posefrac * aipath.n);
                             int si = sl_first_safe(&scene, (const float (*)[4])world.mbb,
-                                                   aipath.xy, aipath.n, start_idx + 1,
+                                                   aipath.xy, aipath.n, seed,
                                                    obst, nobst, hl, hw, &sz, &sh);
                             if (si >= 0) {
                                 start_idx = si;              /* lap logic uses the real start */
@@ -4956,6 +5125,7 @@ int main(int argc, char **argv) {
                later, by which point it has already drifted (2.27 m on L4RA). */
             static float posepin[3]; static int pinned = 0;
             if (!pinned) { posepin[0]=carpos[0]; posepin[1]=carpos[1]; posepin[2]=carpos[2]; pinned=1;
+                           g_pose_t0 = SDL_GetTicks(); g_pose_f0 = ra_f;
                            printf("POSE pinned at placement frame %ld -> "
                                   "(%.3f, %.3f, %.3f)\n",
                                   ra_f, carpos[0], carpos[1], carpos[2]); }
@@ -5248,6 +5418,15 @@ int main(int argc, char **argv) {
             for (int sc=0; sc<8; sc++) vis_scen[sc] += b->scen_count[sc];
             g_dbg.drawn++; wbdrawn++;
             if (nviskept < 4096) viskept[nviskept++] = k;
+        }
+        if (nrep) {   /* diagnostic overlay: where the restored geometry is */
+            glUniform1f(uUseTex, 0.0f);
+            glUniform1f(uUnlit, 1.0f);
+            glUniform3f(uColor, 1.0f, 0.15f, 0.85f);
+            glDepthMask(GL_FALSE);
+            for (int k = 0; k < nrep; k++) { draw_batch(&rbatch[k]); g_dbg.drawn++; }
+            glDepthMask(GL_TRUE);
+            glUniform1f(uUnlit, 0.0f);
         }
         glUniform1f(rp.uVColor, 0.0f);   /* off for everything else (cars carry no
                                             prelight; their attrib-3 default is black) */
@@ -6366,8 +6545,129 @@ int main(int argc, char **argv) {
                                ndrawn, nm, wbdrawn, nbatch, wbdrawn);
                         printf("COUNT car/glow/HUD draws %4d\n",
                                g_dbg.drawn - skydraws - vistadraws - wbdrawn);
-                        printf("COUNT total    draws %4d   frame %.2f ms\n",
-                               g_dbg.drawn, (SDL_GetTicks()-t0)/(float)(ra_f?ra_f:1));
+                        /* render cost since the pose was pinned -- the old
+                           figure divided total elapsed (including the scene
+                           upload) by every frame and read ~17 ms for a scene
+                           that renders in under 2 */
+                        long pf = ra_f - g_pose_f0;
+                        printf("COUNT total    draws %4d   frame %.2f ms "
+                               "(wall clock, vsync-bound; see --shot for render cost)\n",
+                               g_dbg.drawn,
+                               pf > 0 ? (SDL_GetTicks()-g_pose_t0)/(float)pf : 0.0f);
+                    }
+                    if (slot == 0 && lsaudit) {
+                        /* M133 source-to-screen attribution. Every source mesh
+                           whose real triangle surface reaches within the radius
+                           gets exactly one outcome; the outcomes are summed and
+                           checked against the population so the census closes.
+                           Read-only: nothing here influences a draw. */
+                        static const float RAD[2] = {150.0f, 300.0f};
+                        for (int rr = 0; rr < 2; rr++) {
+                            float R = RAD[rr];
+                            /* outcome: 0 drawn, 1 far-cull, 2 no batch (sky/glow),
+                               3 unresolved texture (still drawn, grey), 4 below
+                               the supporting layer */
+                            long cls[8][5]; memset(cls, 0, sizeof cls);
+                            long clsobj[8]; memset(clsobj, 0, sizeof clsobj);
+                            long clsbat[8]; memset(clsbat, 0, sizeof clsbat);
+                            static unsigned char batseen[65536];
+                            memset(batseen, 0, sizeof batseen);
+                            long pop = 0, acct = 0;
+                            for (int i = 0; i < nm; i++) {
+                                const N2Mesh *me = &scene.meshes[i];
+                                const float *bb = world.mbb[i];
+                                float bx = carpos[0] < bb[0] ? bb[0]-carpos[0]
+                                         : (carpos[0] > bb[2] ? carpos[0]-bb[2] : 0);
+                                float by = carpos[1] < bb[1] ? bb[1]-carpos[1]
+                                         : (carpos[1] > bb[3] ? carpos[1]-bb[3] : 0);
+                                if (bx*bx + by*by > R*R) continue;   /* AABB pre-pass */
+                                float near2 = 1e30f;
+                                for (int t = 0; t + 2 < me->nidx && near2 > 1.0f; t += 3) {
+                                    const float *A = me->verts + me->idx[t]*5;
+                                    const float *B = me->verts + me->idx[t+1]*5;
+                                    const float *C = me->verts + me->idx[t+2]*5;
+                                    float d2 = pt_tri_d2(carpos, A, B, C);
+                                    if (d2 < near2) near2 = d2;
+                                }
+                                if (near2 > R*R) continue;
+                                int sc2 = me->scen; if (sc2 < 0 || sc2 > 7) sc2 = 0;
+                                pop++; clsobj[sc2]++;
+                                int b = meshbatch[i];
+                                int outcome;
+                                if (b < 0) outcome = 2;
+                                else {
+                                    if (b < 65536 && !batseen[b]) { batseen[b]=1; clsbat[sc2]++; }
+                                    const N2Batch *bt = &wbatch[b];
+                                    float dx2 = cam[0] < bt->bbox_min[0] ? bt->bbox_min[0]-cam[0]
+                                              : (cam[0] > bt->bbox_max[0] ? cam[0]-bt->bbox_max[0] : 0);
+                                    float dy2 = cam[1] < bt->bbox_min[1] ? bt->bbox_min[1]-cam[1]
+                                              : (cam[1] > bt->bbox_max[1] ? cam[1]-bt->bbox_max[1] : 0);
+                                    if (dx2*dx2 + dy2*dy2 > VIEW_DIST*VIEW_DIST) outcome = 1;
+                                    else if (!mtex[i] && me->cat != N2_TERRAIN) outcome = 3;
+                                    else outcome = 0;
+                                }
+                                if (outcome == 0) {
+                                    /* is it under the road the car stands on? */
+                                    float top = -1e30f;
+                                    for (int v = 0; v < me->nverts; v++)
+                                        if (me->verts[v*5+2] > top) top = me->verts[v*5+2];
+                                    if (top < carpos[2] - 3.0f && me->cat != N2_ROAD
+                                        && me->cat != N2_TERRAIN) outcome = 4;
+                                }
+                                cls[sc2][outcome]++; acct++;
+                                if (rr == 1 && lsaudit > 1 &&
+                                    (sc2 != N2_SC_TERRAIN || !mtex[i] || outcome != 0)) {
+                                    /* per-object detail: where does this thing sit
+                                       relative to the road under its OWN extent,
+                                       sampled at the AABB corners and centre, not
+                                       at its centre alone (long walls span layers) */
+                                    static const char *OUT[5] =
+                                        {"drawn","far-cull","no-batch","no-texture","below-layer"};
+                                    float lo = 1e30f, hi = -1e30f;
+                                    for (int v = 0; v < me->nverts; v++) {
+                                        float z = me->verts[v*5+2];
+                                        if (z < lo) lo = z; if (z > hi) hi = z;
+                                    }
+                                    float px2[5] = {bb[0],bb[2],bb[0],bb[2],(bb[0]+bb[2])*0.5f};
+                                    float py2[5] = {bb[1],bb[1],bb[3],bb[3],(bb[1]+bb[3])*0.5f};
+                                    float gmin = 1e30f, gmax = -1e30f; int ghit = 0;
+                                    for (int q = 0; q < 5; q++) {
+                                        float gz2 = lo;
+                                        if (world_ground_at(&scene, px2[q], py2[q], hi, &gz2) != WSURF_NONE) {
+                                            ghit++;
+                                            if (gz2 < gmin) gmin = gz2;
+                                            if (gz2 > gmax) gmax = gz2;
+                                        }
+                                    }
+                                    printf("LSAOBJ %-9s %-30s tris %5d dist %6.1f  "
+                                           "xy[%9.2f %9.2f %9.2f %9.2f] "
+                                           "z[%8.2f %8.2f]  ground %d/5 [%8.2f %8.2f]  "
+                                           "base-vs-ground %+8.2f  tex %s  %s\n",
+                                           n2_scen_name(sc2), me->sname[0]?me->sname:"?",
+                                           me->nidx/3, sqrtf(near2),
+                                           bb[0], bb[1], bb[2], bb[3], lo, hi,
+                                           ghit, ghit?gmin:0.0f, ghit?gmax:0.0f,
+                                           ghit ? lo - gmin : 0.0f,
+                                           mtex[i] ? "ok" : "MISSING", OUT[outcome]);
+                                    if (!mtex[i])
+                                        printf("LSAKEY %-30s texkey %08x cat %d "
+                                               "verts %d tris %d\n", me->sname, me->texkey,
+                                               me->cat, me->nverts, me->nidx/3);
+                                }
+                            }
+                            printf("LSA r=%.0f m  pose %s\n", R, trackname);
+                            printf("LSA %-9s %6s %6s %6s | %6s %6s %6s %6s %6s\n",
+                                   "class","objs","meshes","batch",
+                                   "drawn","farcul","nobatc","notex","below");
+                            for (int c = 0; c <= N2_SC_OTHER; c++) {
+                                if (!clsobj[c]) continue;
+                                printf("LSA %-9s %6ld %6ld %6ld | %6ld %6ld %6ld %6ld %6ld\n",
+                                       n2_scen_name(c), clsobj[c], clsobj[c], clsbat[c],
+                                       cls[c][0], cls[c][1], cls[c][2], cls[c][3], cls[c][4]);
+                            }
+                            printf("LSA TOTAL population %ld accounted %ld %s\n",
+                                   pop, acct, pop==acct ? "(closed)" : "(LEAK)");
+                        }
                     }
                     printf("POSE yaw %3d cam (%.3f, %.3f, %.3f) look (%.3f, %.3f, %.3f)\n",
                            YAW[slot], cam[0], cam[1], cam[2],

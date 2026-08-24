@@ -41,6 +41,8 @@ typedef struct {
     unsigned char scen; /* track meshes: N2_SC_* semantic class from the asset
                            name in this object's own 0x134011 chunk */
     char sname[32];     /* track meshes: that asset name (e.g. XO_StreetLightC_1a_00) */
+    unsigned char vrepair; /* 1 = this mesh kept its good geometry after corrupt
+                              source vertices were excluded (M133) */
 } N2Mesh;
 
 /* Active customization profile.
@@ -241,6 +243,10 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
 
 /* Extract one (vertex,index) leaf pair. stride = 24 (scenery, uv@16) or 36
  * (car, normal@12 uv@24). cull_skybox drops huge shells (tracks only). */
+/* Widest authored coordinate in the shipped bundles is ~13 km; the corrupt
+   values retail leaves behind measure ~1e38. 60000 separates them by 33 orders
+   of magnitude and matches the existing absurd-span guard below. */
+#define N2_VERT_SANE 60000.0f
 static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
                         int cat, N2Scene *scene,
                         int stride, int uvoff, int cull_skybox, uint32_t texkey,
@@ -253,23 +259,52 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
     int n = body / stride;
     const unsigned char *rec = vb + pad;
 
+    /* Per-vertex sanity (M133). Retail leaves a few vertices uninitialised --
+       NaN, or a ~1e38 coordinate -- inside otherwise perfectly good objects.
+       The old guard measured the bbox over ALL vertices and threw the WHOLE
+       object away when any one of them was corrupt, which silently deleted 150
+       shipped L4RA objects and 14 on L4RB: every XS_WARN* road sign, every
+       XS_MEDIANPOLE* median pole, the XS_SPEED* speed signs and the
+       XO_AIRPORT_*SIGN set. They are real geometry at real authored transforms
+       and only a handful of their vertices are broken.
+       Mark the broken vertices instead. Triangles that reference one are
+       dropped below; the rest of the object is emitted normally, so the sign
+       survives and the garbage spike never reaches the GPU. */
+    unsigned char vbad_small[512];
+    unsigned char *vbad = n <= (int)sizeof vbad_small
+                        ? vbad_small : (unsigned char *)malloc((size_t)n);
+    if (!vbad) return;
+    memset(vbad, 0, (size_t)n);
+    int nbad = 0;
     if (cull_skybox) {
         float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
-        int bad = 0;
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n; i++) {
+            int corrupt = 0;
             for (int c = 0; c < 3; c++) {
                 float v; memcpy(&v, rec + i*stride + c*4, 4);
-                if (v != v) bad = 1;                 /* NaN: comparisons stay false */
+                /* NaN fails every comparison; VERT_SANE is far outside anything
+                   the shipped world authors (its widest asset spans ~13 km) and
+                   far below the ~1e38 uninitialised values actually observed. */
+                if (v != v || v > N2_VERT_SANE || v < -N2_VERT_SANE) corrupt = 1;
+            }
+            if (corrupt) { vbad[i] = 1; nbad++; continue; }
+            for (int c = 0; c < 3; c++) {
+                float v; memcpy(&v, rec + i*stride + c*4, 4);
                 if (v < mn[c]) mn[c] = v; if (v > mx[c]) mx[c] = v;
             }
+        }
+#ifdef N2_NO_VERTEX_REPAIR
+        /* A/B control build: the pre-M133 rule -- one corrupt vertex discards
+           the whole object. Used only to produce same-pose before captures. */
+        if (nbad) { if (vbad != vbad_small) free(vbad); return; }
+#endif
+        if (nbad == n) { if (vbad != vbad_small) free(vbad); return; }
         float span = 0;
         for (int c = 0; c < 3; c++) if (mx[c]-mn[c] > span) span = mx[c]-mn[c];
         /* the skybox is dropped by material name now; keep only an absurd-span
-           safety so big city ground/buildings (thousands of units) still draw.
-           Also drop meshes with a corrupt/uninitialised vertex — retail leaves a
-           few (e.g. XS_MEDIANPOLE, XS_WARN* road signs) with one NaN/1e38 coord,
-           which would otherwise spike across the map or render as GPU garbage. */
-        if (bad || span >= 60000.0f) return;
+           safety, measured over the SANE vertices, so big city ground and
+           buildings (thousands of units across) still draw. */
+        if (span >= 60000.0f) { if (vbad != vbad_small) free(vbad); return; }
     }
 
     N2Mesh m; memset(&m, 0, sizeof(m));
@@ -316,11 +351,33 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
         uint16_t a = (uint16_t)(ib[i*2]     | ib[i*2+1]     << 8);
         uint16_t b = (uint16_t)(ib[(i+1)*2] | ib[(i+1)*2+1] << 8);
         uint16_t c = (uint16_t)(ib[(i+2)*2] | ib[(i+2)*2+1] << 8);
-        if (a < n && b < n && c < n) {
+        if (a < n && b < n && c < n && !vbad[a] && !vbad[b] && !vbad[c]) {
             m.idx[m.nidx++] = a; m.idx[m.nidx++] = b; m.idx[m.nidx++] = c;
         }
     }
+    if (vbad != vbad_small) free(vbad);
     if (m.nidx == 0) { free(m.verts); free(m.idx); free(m.vcol); return; }
+    /* a corrupt vertex is left in the array (indices reference it) but no
+       triangle uses it; park it on the first good vertex so the bbox, the
+       ground grid and the batch AABB never see the spike */
+    m.vrepair = nbad ? 1 : 0;
+    if (nbad) {
+        static const char *pr2 = (const char *)1;
+        if (pr2 == (const char *)1) pr2 = getenv("OPENUG2_REPAIR_PROBE");
+        if (pr2) fprintf(stderr, "REPAIRED verts %d bad %d tris %d at (%.1f %.1f %.1f)\n",
+                         n, nbad, m.nidx/3, mtx?mtx[12]:0.0f, mtx?mtx[13]:0.0f,
+                         mtx?mtx[14]:0.0f);
+        int good = -1;
+        for (int i = 0; i < n && good < 0; i++)
+            if (m.verts[i*5] == m.verts[i*5] &&
+                m.verts[i*5] < N2_VERT_SANE && m.verts[i*5] > -N2_VERT_SANE) good = i;
+        if (good >= 0)
+            for (int i = 0; i < n; i++) {
+                float v = m.verts[i*5];
+                if (v == v && v < N2_VERT_SANE && v > -N2_VERT_SANE) continue;
+                memcpy(m.verts + i*5, m.verts + good*5, 3*sizeof(float));
+            }
+    }
     n2_push_mesh(scene, m);
 }
 
@@ -609,6 +666,10 @@ static uint32_t n2_resolve_key(uint32_t v, const uint32_t *keys, int nkeys);
  * all query the world scene. NULL restores the old discard exactly. */
 static N2Scene *n2_vista_out = NULL;
 static long n2_vista_objs = 0, n2_vista_pan = 0, n2_vista_fam = 0;
+/* M133 object-level accounting: every 0x80134010 the walk sees ends in exactly
+   one bucket, so "source object" -> "scene mesh" can be reconciled. */
+static long n2_obj_seen = 0, n2_obj_vista = 0, n2_obj_emit = 0, n2_obj_nomesh = 0,
+            n2_obj_nopair = 0;
 
 static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *scene0,
                            const uint32_t *keys, int nkeys) {
@@ -618,6 +679,8 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
         long ds = o + 8;
         if (magic == 0x80134010u) {
             N2Scene *scene = scene0;   /* redirected below for vista impostors */
+            n2_obj_seen++;
+            int obj_before = scene0->count;
             int cat = n2_mesh_category(d, ds, ds + size);
             char anm[40]; n2_mesh_name(d, ds, ds + size, anm, sizeof anm);
             int sc = n2_scen_class(anm);
@@ -631,11 +694,40 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                cull only the impostors. ponytail: cull, not a backdrop-ring pass --
                re-add far-plane billboards if the empty horizon ever matters. */
             if (!strncmp(anm, "PAN", 3)) {
-                if (!n2_vista_out) { o = ds + size; continue; }
+                if (!n2_vista_out) { n2_obj_vista++; o = ds + size; continue; }  /* dropped */
                 scene = n2_vista_out; n2_vista_objs++; n2_vista_pan++;
             }
             uint32_t tk = n2_mesh_texkey_cat(d, ds, ds + size, cat, keys, nkeys);
             float objm[16]; n2_obj_matrix(d, ds, ds + size, objm);   /* world placement */
+            { /* M133 diagnostic: how many 0x134011 headers does this object
+                 carry, and what translation does each one hold? Name matching
+                 is diagnostic only and never reaches production behaviour. */
+              static const char *probe = (const char *)1;
+              if (probe == (const char *)1) probe = getenv("OPENUG2_OBJ_PROBE");
+              if (probe && anm[0] && strstr(anm, probe)) {
+                  N2Leaf hh[8]; int nhh = 0;
+                  n2_find_leaves(d, ds, ds + size, 0x00134011u, hh, &nhh, 8);
+                  fprintf(stderr, "OBJPROBE %-30s headers=%d  used T=(%.3f %.3f %.3f)\n",
+                          anm, nhh, objm[12], objm[13], objm[14]);
+                  N2Leaf sl[4]; int nsl = 0;
+                  n2_find_leaves(d, ds, ds + size, 0x00134012u, sl, &nsl, 4);
+                  for (int q = 0; q < nsl; q++) {
+                      const unsigned char *pp = d + sl[q].off; long ls = sl[q].size;
+                      fprintf(stderr, "OBJPROBE   slot-leaf %d size %ld words:", q, ls);
+                      for (long b = 0; b + 4 <= ls && b < 64; b += 4)
+                          fprintf(stderr, " %08x", n2_u32(pp + b));
+                      fprintf(stderr, "\n");
+                  }
+                  for (int q = 0; q < nhh; q++) {
+                      const unsigned char *pp = d + hh[q].off; int ss = (int)hh[q].size;
+                      int pd = n2_skip_filler(pp, ss);
+                      if (pd + 0x40 + 64 > ss) { fprintf(stderr, "OBJPROBE   leaf %d size %d: too small\n", q, ss); continue; }
+                      float t[4];
+                      for (int c = 0; c < 4; c++) memcpy(&t[c], pp + pd + 0x40 + (12+c)*4, 4);
+                      fprintf(stderr, "OBJPROBE   leaf %d size %5d T=(%.3f %.3f %.3f) w=%.3f\n",
+                              q, ss, t[0], t[1], t[2], t[3]);
+                  }
+              } }
             /* Backdrop impostors the PAN_ prefix above does not catch: retail
                names the same job TRN_PANARAMA* / *_WORLD_LOD in some bundles, so
                they were reaching the world as ordinary opaque TERRAIN and walling
@@ -645,7 +737,7 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                 N2Geom vg;
                 if (n2_obj_geom(d, ds, ds + size, objm, &vg) &&
                     n2_is_vista_impostor(anm, &vg)) {
-                    if (!n2_vista_out) { o = ds + size; continue; }
+                    if (!n2_vista_out) { n2_obj_vista++; o = ds + size; continue; }  /* dropped */
                     scene = n2_vista_out; n2_vista_objs++; n2_vista_fam++;
                 }
             }
@@ -763,6 +855,18 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                     snprintf(scene->meshes[m2].sname, sizeof scene->meshes[m2].sname,
                              "%.31s", anm);
                 }
+            }
+            if (scene != scene0) n2_obj_vista++;          /* routed to the vista scene */
+            else if (scene0->count > obj_before) n2_obj_emit++;
+            else {
+                n2_obj_nomesh++;
+                if (!pairs) n2_obj_nopair++;
+                static const char *pr = (const char *)1;
+                if (pr == (const char *)1) pr = getenv("OPENUG2_EMPTY_PROBE");
+                if (pr)
+                    fprintf(stderr, "EMPTYOBJ %-30s cat %d scen %s leafpairs %d "
+                            "T=(%.1f %.1f %.1f)\n", anm[0]?anm:"?", cat,
+                            n2_scen_name(sc), pairs, objm[12], objm[13], objm[14]);
             }
         } else if (magic != 0 && (magic >> 28) == 8) {
             n2_walk_meshes(d, ds, ds + size, scene0, keys, nkeys);

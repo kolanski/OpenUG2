@@ -250,6 +250,9 @@ void world_ground_selftest(void);
  * the push itself is unchanged. */
 typedef struct { int mesh, tri; float nz, zlo, zhi, edged; } WRailHit;
 int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit);
+/* M133 texture-binding census: set before world_bind_textures to report every
+ * key that produced no GPU texture, split by cause. Diagnostic only. */
+extern int g_world_texaudit, g_world_texnoise, g_world_texmiss;
 /* M113 rail-candidate census (diagnostic; see world.c). */
 extern int  world_rail_census;
 extern long world_rc_cand[2][8], world_rc_push[2][8];

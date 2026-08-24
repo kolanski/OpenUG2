@@ -102,9 +102,13 @@ void     draw_gpumesh(GpuMesh *g);
  * mesh of that sname is additionally verified vertex-by-vertex and reported on
  * stdout. Purely additive — the GL upload is identical either way, so the audit
  * observes the production path rather than a parallel reimplementation. */
+/* meshbatch (optional, NULL to skip): caller-sized s->count array receiving the
+ * FINAL batch index each source mesh ended in, or -1 if it never entered the
+ * world partition (sky/glow go to their own passes). Written after the texture
+ * re-sort, so the indices are the ones the renderer uses (M133). */
 int  upload_world_batches(const N2Scene *s, const float (*mbb)[4],
                           const GLuint *mtex, GLuint texTerr, N2Batch **out,
-                          const char *audit);
+                          const char *audit, int *meshbatch);
 /* Same merge, but for one category (N2_SKY / N2_GLOW) pulled out of the main
  * batching pass above — grouped by texture only, no spatial cell/cull grid,
  * since there are only ever a handful of skybox/neon meshes per city. */

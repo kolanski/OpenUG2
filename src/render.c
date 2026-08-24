@@ -502,8 +502,9 @@ static void batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
 
 int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
                          const GLuint *mtex, GLuint texTerr, N2Batch **out,
-                         const char *audit) {
+                         const char *audit, int *meshbatch) {
     int n = s->count;
+    if (meshbatch) for (int i = 0; i < n; i++) meshbatch[i] = -1;
     /* world extent -> grid coords */
     float x0 = 1e30f, y0 = 1e30f;
     for (int i = 0; i < n; i++) {
@@ -549,6 +550,13 @@ int upload_world_batches(const N2Scene *s, const float (*mbb)[4],
         if (i < m) verts += s->meshes[ent[i].idx].nverts;
     }
     qsort(bat, (size_t)nb, sizeof *bat, btex_cmp);   /* minimise texture binds */
+    /* mesh -> final batch, replayed from each batch's own emission run so it is
+       the production partition rather than a second derivation (M133) */
+    if (meshbatch)
+        for (int b = 0; b < nb; b++) {
+            int e = bat[b].emit_idx;
+            for (int k = run0[e]; k < run1[e]; k++) meshbatch[ent[k].idx] = b;
+        }
     /* "#N" audits the batch the RENDERER calls N, i.e. wbatch[N] after this
        sort. Membership is replayed from that batch's own recorded emission run,
        so it is the production partition, not a second derivation. */

@@ -204,6 +204,11 @@ int world_load(World *w, const char *troot, const char *trackname) {
             w->have_grass = n2_load_texture(g->data, g->len, "TRN_GRASSC", &w->grass);
         printf("region %-12s: %3ld MB, %5d meshes, %d tex keys\n",
                regs[r], g->len >> 20, g->mesh1 - g->mesh0, ntk);
+        printf("objects: %ld seen = %ld emitted + %ld routed to vista + %ld emitted "
+               "nothing (%ld of them had no 0x134B01/B03 leaf pair)  %s\n",
+               n2_obj_seen, n2_obj_emit, n2_obj_vista, n2_obj_nomesh, n2_obj_nopair,
+               n2_obj_seen == n2_obj_emit + n2_obj_vista + n2_obj_nomesh
+                   ? "(closed)" : "(LEAK)");
     }
 
     /* strip coplanar duplicates before anything downstream sees the scene.
@@ -261,6 +266,7 @@ int world_load(World *w, const char *troot, const char *trackname) {
     return nm;
 }
 
+int g_world_texaudit = 0, g_world_texnoise = 0, g_world_texmiss = 0;
 int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
     int n = 0;
     for (int r = 0; r < w->nreg; r++) {
@@ -277,7 +283,16 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
             if (!ok && w->master)
                 ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
             if (ok && !n2_tex_noise(&tt)) { keys[n] = tk; texs[n] = upload_tex(&tt); n++; }
-            if (ok) { free(tt.rgb); free(tt.dxt); }
+            else if (g_world_texaudit) {
+                /* M133: separate "the archive has no such record" from "we
+                   decoded it and then threw it away" -- they need different
+                   fixes and the old counters merged them. */
+                printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
+                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" : "not in any TPK",
+                       w->scene.meshes[i].sname, w->scene.meshes[i].cat);
+                if (ok) g_world_texnoise++; else g_world_texmiss++;
+            }
+            if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
         }
         /* M132: vista impostors carry their own authored texture keys and are
            decoded from the same TPK, in the same pass, before the region bytes
@@ -292,7 +307,16 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
             if (!ok && w->loc4) ok = n2_load_car_tex_by_key(w->loc4, w->loc4len, tk, &tt);
             if (!ok && w->master) ok = n2_tpk_decode(w->master, w->masterlen, w->mastertpk, tk, &tt);
             if (ok && !n2_tex_noise(&tt)) { keys[n] = tk; texs[n] = upload_tex(&tt); n++; }
-            if (ok) { free(tt.rgb); free(tt.dxt); }
+            else if (g_world_texaudit) {
+                /* M133: separate "the archive has no such record" from "we
+                   decoded it and then threw it away" -- they need different
+                   fixes and the old counters merged them. */
+                printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
+                       ok ? "DECODED-BUT-REJECTED-AS-NOISE" : "not in any TPK",
+                       w->scene.meshes[i].sname, w->scene.meshes[i].cat);
+                if (ok) g_world_texnoise++; else g_world_texmiss++;
+            }
+            if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
         }
         free(g->data); g->data = NULL;   /* meshes + textures live on the GPU now */
     }
