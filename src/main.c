@@ -27,6 +27,7 @@
 #include "nfsu2.h"
 #include "render.h"
 #include "sfx/post.h"
+#include "sfx/envcube.h"
 #include "physics.h"
 #include "ai.h"
 #include "audio.h"
@@ -4279,6 +4280,17 @@ int main(int argc, char **argv) {
 
     /* unit-quad for the 2D HUD (drawn in NDC via uMVP) */
     GpuMesh quad = make_quad();
+    /* Live reflection cube. 128 px a face is enough for a clear coat: it is
+       reflected, blurred by the mip chain and never seen directly. */
+    int g_envcube_ready = env_cube_init(128);
+    if (g_envcube_ready) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, env_cube_tex());
+        glActiveTexture(GL_TEXTURE0);
+        glUseProgram(rp.prog);
+        glUniform1i(rp.uEnvCube, 1);       /* the cube lives on unit 1 */
+        printf("reflections: 128x128 cube map ready\n");
+    }
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);   /* coplanar re-draws (last write wins) pass cleanly */
@@ -5335,9 +5347,80 @@ int main(int argc, char **argv) {
 
         int W, H; SDL_GL_GetDrawableSize(win, &W, &H);
         glViewport(0, 0, W, H);
+        /* LIVE REFLECTION. There is no environment texture in the data -- the
+           slot exists and nothing fills it, which is why the game's options
+           expose a reflection rate at all. Six faces are rendered around the
+           car instead, low resolution, one face per frame. */
+        {   static int envtick = 0;
+            /* ONE FACE PER FRAME. Refreshing all six at once costs the same
+               overall but visibly jumps: the map holds for five frames and
+               then changes completely. One face per frame takes the same six
+               frames and spreads the change out. */
+            if (g_envcube_ready && ncar) {
+                /* Unbind the map from unit 1 while rendering into it: it
+                   cannot be a shader source and a framebuffer target at the
+                   same time -- the driver marks such a texture unloadable and
+                   substitutes a null one. */
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+                glActiveTexture(GL_TEXTURE0);
+                float eye[3] = { carpos[0], carpos[1], carpos[2] + 1.0f };
+                {   int f = envtick++ % 6;
+                    float fwd[3], upv[3];
+                    env_cube_face_dirs(f, fwd, upv);
+                    float Vf[16], Pf[16], MVPf[16];
+                    mat_lookat_up(eye, fwd, upv, Vf);
+                    mat_persp(1.5708f, 1.0f, 1.0f, 30000.0f, Pf);
+                    mat_mul(Pf, Vf, MVPf);
+                    env_cube_begin(f);
+                    glClearColor(g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b, 1);
+                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                    glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPf);
+                    glUniform1f(rp.uEnv, 0.0f); glUniform1f(rp.uMatOn, 0.0f);
+                    glUniform1f(uSpec, 0.0f);
+                    /* sky: no fog, no depth writes */
+                    glUniform1f(uUnlit, 1.0f); glUniform1f(rp.uFogDensity, 0.0f);
+                    glUniform3f(uColor, 1.0f, 1.0f, 1.0f); glUniform1f(uAlpha, 1.0f);
+                    glDepthMask(GL_FALSE);
+                    for (int k = 0; k < nsky; k++) {
+                        if (!skybatch[k].tex) continue;
+                        glUniform1f(uUseTex, 1.0f);
+                        glBindTexture(GL_TEXTURE_2D, skybatch[k].tex);
+                        draw_batch(&skybatch[k]);
+                    }
+                    glDepthMask(GL_TRUE); glUniform1f(uUnlit, 0.0f);
+                    /* the world around the car: what actually reflects */
+                    glUniform1f(rp.uFogDensity, g_dbg.fog_density);
+                    glUniform1f(rp.uVColor, g_dbg.vcolor);
+                    for (int k = 0; k < nbatch; k++) {
+                        N2Batch *b = &wbatch[k];
+                        float dx = eye[0] < b->bbox_min[0] ? b->bbox_min[0]-eye[0]
+                                 : (eye[0] > b->bbox_max[0] ? eye[0]-b->bbox_max[0] : 0);
+                        float dy = eye[1] < b->bbox_min[1] ? b->bbox_min[1]-eye[1]
+                                 : (eye[1] > b->bbox_max[1] ? eye[1]-b->bbox_max[1] : 0);
+                        if (dx*dx + dy*dy > 250.0f*250.0f) continue;
+                        if (b->tex) { glUniform1f(uUseTex, 1.0f);
+                                      glBindTexture(GL_TEXTURE_2D, b->tex); }
+                        else { glUniform1f(uUseTex, 0.0f);
+                               glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
+                        draw_batch(b);
+                    }
+                    glUniform1f(rp.uVColor, 0.0f);
+                }
+                env_cube_end(W, H);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, env_cube_tex());
+                glGenerateMipmap(GL_TEXTURE_CUBE_MAP);   /* smooths the sampling */
+                glActiveTexture(GL_TEXTURE0);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, env_cube_tex());
+                glActiveTexture(GL_TEXTURE0);
+            }
+        }
+
         /* The frame is drawn into a texture so it can be toned afterwards;
-           see the post-processing block in render.c. Without it the picture is
-           the raw scene, which reads cold and flat. */
+           see src/sfx/post.c. Without it the picture is the raw scene, which
+           reads cold and flat. */
         if (!no_post && pp_init(W, H)) { post_on = 1; pp_begin(); }
         else post_on = 0;
         /* the sky is cleared to the fog colour: distant geometry dissolves
@@ -5845,6 +5928,14 @@ int main(int argc, char **argv) {
                       memcpy(M, m2, sizeof M);
                   }
                   memcpy(wheelT[k],M,sizeof(M)); } }
+            /* Car reflections come from the cube rendered around the car
+               itself. uEnvYaw turns the reflected ray from car axes into world
+               axes: normals and positions here are model-space, the map is
+               world-space. */
+            if (g_envcube_ready) {
+                glUniform1f(rp.uEnvCubeOn, 1.0f);
+                glUniform1f(rp.uEnvYaw, heading);
+            }
             float *pnt = g_dbg.paint_override ? g_dbg.paint : paint;
             /* uUnlit/uSoft were left ON (1.0) by the shadow/headlight-glow/
                skid-mark billboards drawn just above (all three intentionally
@@ -6171,6 +6262,7 @@ int main(int argc, char **argv) {
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
             glUniform3f(uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);   /* back to world */
             glUniform1f(rp.uEnv, 0.0f);   /* reflections are cars-only */
+            glUniform1f(rp.uEnvCubeOn, 0.0f);
         }
 
         /* tail lights: red camera-facing glows at each car's rear (night) */

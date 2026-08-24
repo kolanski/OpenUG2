@@ -42,6 +42,12 @@ static const char *FS =
        as f = Min + dot(V,N) * Range -- so a panel facing the viewer and a panel
        edge-on differ by exactly what the material asks for, instead of by a
        guess. uMatOn > 0.5 selects this model. */
+    /* Environment cube map. There is no such texture in the shipped data -- the
+       slot is meant to be filled at runtime, which is also why the graphics
+       options expose a reflection update RATE. It is rendered live; uEnvYaw
+       turns the sampled direction back into world space. Without it the branch
+       falls back to the procedural night sphere above. */
+    "uniform samplerCube uEnvCube; uniform float uEnvCubeOn; uniform float uEnvYaw;\n"
     "uniform float uMatOn; uniform vec3 uMatDifMin; uniform vec3 uMatDifRange;\n"
     "uniform vec4 uMatSE;\n"   /* specMin, specRange, envMin, envRange */
     "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
@@ -147,8 +153,14 @@ static const char *FS =
        actually mirror. */
     "    vec3 env = mix(vec3(0.03,0.03,0.05), vec3(0.10,0.14,0.24), up)\n"
     "             + vec3(0.85,0.66,0.42)*pow(1.0-abs(R.z), 4.0);\n"
+    "    if(uEnvCubeOn>0.5){\n"
+    "      float cy=cos(uEnvYaw), sy=sin(uEnvYaw);\n"
+    "      vec3 Rw = vec3(R.x*cy - R.y*sy, R.x*sy + R.y*cy, R.z);\n"
+    "      env = textureCube(uEnvCube, Rw).rgb;\n"
+    "    }\n"
     "    float fres = 0.35 + 0.65*pow(1.0-clamp(dot(N,V),0.0,1.0), 3.0);\n"
-    "    lit += env * (uEnv * fres);\n"
+    "    lit += env * (uEnv * menv * fres);\n"
+    "    if(uEnvCubeOn>1.5) lit = env;\n"
     "  }\n"
     /* lit alpha = uAlpha (1 everywhere but the blended glass pass), so
        translucent glass keeps its specular highlight */
@@ -186,6 +198,21 @@ void mat_car(const float *pos, float heading, const float *up, float rideh, floa
     memcpy(m,r,sizeof r);
 }
 /* right-handed lookAt, column-major, up = world +Z */
+void mat_lookat_up(const float *eye, const float *fwd, const float *up, float *m) {
+    float f[3]={fwd[0],fwd[1],fwd[2]}; vnorm(f);
+    float r[3]={ f[1]*up[2]-f[2]*up[1], f[2]*up[0]-f[0]*up[2], f[0]*up[1]-f[1]*up[0] };
+    vnorm(r);
+    float u[3]={ r[1]*f[2]-r[2]*f[1], r[2]*f[0]-r[0]*f[2], r[0]*f[1]-r[1]*f[0] };
+    m[0]=r[0]; m[4]=r[1]; m[8]=r[2];
+    m[1]=u[0]; m[5]=u[1]; m[9]=u[2];
+    m[2]=-f[0]; m[6]=-f[1]; m[10]=-f[2];
+    m[3]=m[7]=m[11]=0;
+    m[12]=-(r[0]*eye[0]+r[1]*eye[1]+r[2]*eye[2]);
+    m[13]=-(u[0]*eye[0]+u[1]*eye[1]+u[2]*eye[2]);
+    m[14]=  f[0]*eye[0]+f[1]*eye[1]+f[2]*eye[2];
+    m[15]=1;
+}
+
 void mat_lookat(const float *eye, const float *fwd, float *m) {
     float f[3]={fwd[0],fwd[1],fwd[2]}; vnorm(f);
     float up[3]={0,0,1};
@@ -269,6 +296,9 @@ RProg render_program(void) {
     r.uLight   = glGetUniformLocation(r.prog, "uLight");
     r.uVColor  = glGetUniformLocation(r.prog, "uVColor");
     r.uGloss   = glGetUniformLocation(r.prog, "uGloss");
+    r.uEnvCubeOn   = glGetUniformLocation(r.prog, "uEnvCubeOn");
+    r.uEnvYaw      = glGetUniformLocation(r.prog, "uEnvYaw");
+    r.uEnvCube     = glGetUniformLocation(r.prog, "uEnvCube");
     r.uMatOn       = glGetUniformLocation(r.prog, "uMatOn");
     r.uMatDifMin   = glGetUniformLocation(r.prog, "uMatDifMin");
     r.uMatDifRange = glGetUniformLocation(r.prog, "uMatDifRange");
