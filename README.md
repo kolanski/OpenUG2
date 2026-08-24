@@ -1,5 +1,12 @@
 # OpenUG2
 
+> **Help wanted across the whole project.** OpenUG2 has grown beyond what one
+> maintainer can reasonably research, implement and test alone. Contributors
+> and future maintainers are welcome across asset formats, rendering, physics,
+> racing, AI, tooling, documentation and platform support. See
+> **[Help Wanted — issue #1](https://github.com/whoismept/OpenUG2/issues/1)**
+> and the [contribution areas below](#help-wanted).
+
 An open, from-scratch reimplementation of the **Need for Speed: Underground 2**
 engine. It reads the *original* game's data files directly — no Wine, no box64,
 no x86 emulation — parses the geometry, textures and racing lines, and runs a
@@ -15,26 +22,53 @@ source; you bring your own copy of the game.**
 > directory. Not affiliated with, authorized, or endorsed by Electronic Arts —
 > see [Legal Notice & Disclaimer](#legal-notice--disclaimer).
 
-## Status
+## Project status
 
-Early but real — the full asset→render→drive pipeline works end to end:
+OpenUG2 is an **early clean-room engine prototype**, not yet a finished or
+drop-in replacement for the original game. The asset → render → drive → race
+pipeline works, but only selected content has been verified end to end.
 
-- **Track** — parses `STREAM*.BUN` scenery (chunk `0x134xxx`), assembles the
-  world-space road/terrain, and **per-mesh textures** it: each mesh's `0x134012`
-  key resolves to a texture in the region's own STREAM TPK or the shared
-  `LOC4DYNTEX.BIN` (works across regions; textures that don't decode fall back).
-- **Car** — loads a car model (`GEOMETRY.BIN`, 36-byte vertices with normals)
-  with **per-mesh textures**: each part's `0x134012` slot list is matched
-  against the car's TPK (`TEXTURES.BIN`: JDLZ-decompressed + DXT1/DXT3) so the
-  body, wheels and details each wear their own decoded texture via real UVs.
-- **Driving** — arcade car physics with grip/drift (tyre skid marks that fade
-  over time + drift smoke when you slide), ground-height follow, chase camera, a speedometer,
-  and a procedural engine sound (no audio assets — synthesised, pitch
-  follows speed).
-- **Racing** — a pre-race menu (orbiting-car preview; pick track + circuit),
-  AI opponents that follow the game's own racing line (`ROUTES*/Paths*.bin`), a
-  3-2-1 countdown start, lap counting on a closed circuit, finish + placing,
-  and a font-free race-position HUD.
+### Working today
+
+- **Track assets** — parses `STREAM*.BUN` scenery and object transforms, emits
+  road/terrain material ranges per submesh, resolves regional and shared TPK
+  textures, and batches the result for OpenGL. L4RA and L4RB are the current
+  single-region reference maps.
+- **Scene recovery** — corrupt source vertices no longer delete an otherwise
+  valid object wholesale. This restores shipped traffic, warning, median and
+  airport signs at their authored transforms.
+- **Car rendering** — loads `GEOMETRY.BIN` and `TEXTURES.BIN`, selects real
+  per-part material slots and UVs, and renders body paint, glass, lights,
+  badges and other parts without the old forced-black roof treatment.
+- **Vehicle contact** — four wheel locations probe the world independently and
+  feed a sprung body-height/orientation model. Walls use a mesh narrow phase
+  and resolve along the contacted face instead of an enclosing AABB axis.
+- **Driving** — keyboard-controlled arcade acceleration, braking, steering,
+  handbrake, surface-dependent grip and geometry-derived per-car differences.
+- **Racing** — closed-circuit loading and AI racing-line opponents work on the
+  verified L4RA route. L4RB sprint event 4201 starts on its shipped supported
+  grid and its three checkpoints can complete end to end under the route
+  driver.
+- **World visibility** — production uses the `ordinary` tier, whose view range
+  follows the active fog (about 933 m with the current settings). Developer UI
+  and provisional HUD elements are hidden by default and toggled with `F1`.
+
+### Major gaps
+
+- Vehicle handling is still an arcade approximation, not NFSU2-equivalent:
+  there is no decoded drivetrain, torque curve, gearing, tyre load, weight
+  transfer or independent per-wheel suspension simulation.
+- Only selected L4RA/L4RB content is gameplay-tested. Other region bundles and
+  eight remaining L4RB sprint events still need systematic coverage.
+- Sprint AI opponents, complete sprint HUD semantics and a production-quality
+  front end are missing.
+- Some race-specific `ZCV_`/`ZCS_` set-dressing definitions are decoded without
+  a proven world-placement or mesh-linkage rule.
+- The experimental `--tier full` panorama pass still exposes opaque authored
+  backdrop sheets as hard-edged bands at some headings. It is not the default.
+- `--track ALL` currently unions incompatible city/event bundles that overlap
+  in the same coordinates. It is useful for research, but is **not a valid
+  playable open-world composition**.
 
 See [`docs/FORMATS.md`](docs/FORMATS.md) for the reverse-engineered file formats.
 
@@ -69,16 +103,28 @@ Point it at your NFS: Underground 2 data directory (the folder containing
 make run DATA=/path/to/nfsu2/data
 ```
 
-Pick the car, track and circuit (defaults shown):
+Run one of the currently verified single-region paths explicitly:
+
+> The executable still selects `ALL` when no track is supplied for legacy
+> diagnostic compatibility. Choose an individual region for supported gameplay.
 
 ```sh
-./nfsu2 DATA --car HUMMER --track ALL --circuit ROUTESL4RF/Paths4602.bin
+# Closed circuit reference
+./nfsu2 DATA --car HUMMER --track STREAML4RA \
+  --circuit ROUTESL4RA/Paths4175.bin
+
+# Sprint reference
+./nfsu2 DATA --car HUMMER --track STREAML4RB --event 4201
 ```
 
 - `--car NAME` — a folder under `CARS/` (needs a `GEOMETRY.BIN`).
-- `--track NAME` — `ALL` (the default: every STREAM region stitched into one
-  city) or a single `STREAM*.BUN` under `TRACKS/` (e.g. `STREAML4RR`).
+- `--track NAME` — a single `STREAM*.BUN` under `TRACKS/`, such as
+  `STREAML4RA` or `STREAML4RB`. `ALL` still exists for diagnostics but is not a
+  supported gameplay composition.
 - `--circuit PATH` — a closed-loop `Paths*.bin` under `TRACKS/`.
+- `--event ID` — start a shipped race event such as L4RB sprint `4201`.
+- `--tier ordinary` — production renderer and the default. `--tier full` is an
+  experimental panorama path with known visual defects.
 
 It opens on a **pre-race menu**: the car orbits amid the city while you pick a
 **car** (Left/Right — every drivable folder under `CARS/`), a **track** (Up/Down
@@ -87,13 +133,13 @@ found on that track). `Enter` starts the 3-2-1. `--car`/`--track`/`--circuit`
 above just preselect the menu. (Car and track changes re-launch the engine to
 load fresh; circuit is an in-place reload.)
 
-**Controls:** menu — `←`/`→` car, `↑`/`↓` track, `[`/`]` circuit, `Enter` race;
+**Controls:** menu — `←`/`→` car, `↑`/`↓` track, `[`/`]` circuit or sprint,
+`Enter` race;
 driving — `W`/`S` throttle/brake, `A`/`D` steer, `Space` handbrake (breaks rear
 grip for drifts), `F` freecam (WASD move · hold right-mouse or arrows to look ·
-`E`/`Q` up/down · `Shift` faster), `Esc` quit. Cars collide (they shove each
-other) and you can't
-drive through buildings — the car slides along wall footprints. `--shot out.png`
-renders one frame to a PNG and exits.
+`E`/`Q` up/down · `Shift` faster), `F1` developer overlay, `Esc` quit. Cars
+collide and building contact is confirmed against source mesh faces before the
+car is pushed. `--shot out.png` renders one frame to a PNG and exits.
 
 ## Layout
 
@@ -115,29 +161,62 @@ tools/   Python utilities used to reverse-engineer & inspect the data formats
 docs/    format documentation (FORMATS.md)
 ```
 
-## Contributing
+## Project direction
 
-Reverse-engineering notes live in `docs/FORMATS.md`; the `tools/` scripts are
-handy for poking at the data. Please keep new format facts documented there.
+To keep the project from expanding into disconnected experiments, work is
+ordered around a small number of outcomes:
 
-The whole city loads by default (`--track ALL` stitches all 8 STREAM regions,
-deduped to ~13.9k meshes), batched into per-texture VBOs and fogged at the cull
-edge — about 6.8 ms/frame. Good next steps:
+1. Make individual source regions visually coherent and safely driveable.
+2. Complete one circuit and one sprint path with stable player, collision, AI
+   and race-state behaviour.
+3. Replace measured physics stand-ins only when the original data field or a
+   clear behavioural requirement is understood.
+4. Decode missing race-specific placement and set dressing.
+5. Revisit open-world bundle composition only after the individual bundles are
+   correct. `ALL` is not the reference map.
 
-- **A proper front-end menu** — the pre-race selector is still minimal
-  key-based navigation; a real menu flow on the built-in procedural bitmap
-  font, with an in-process reload instead of the current re-exec on car/track
-  change.
-- **Deeper race modes** — sprints are parsed alongside circuits (42 and 63 of
-  them) but only circuits are raceable; opponent difficulty and better start
-  grids are open too.
-- **Animated props** — the `ANM_*` chunks are identified but undecoded.
-- **Sound design** beyond the procedural engine drone.
+Changes outside this order should begin with a focused issue explaining the
+evidence, scope and acceptance test.
 
-When you send a change: build clean (`-Wall -Wextra`, zero warnings), keep
-`make gles` compiling (every shader exists in both GLSL 120 and 100), keep the
-boot self-tests passing, and prove any rendering change with a `--shot`
-before/after PNG pair.
+## Help wanted
+
+OpenUG2 needs contributors and maintainers across the **entire project**. Its
+reverse engineering, engine work, validation and platform coverage are too
+broad for one person to sustain alone. Start with
+**[Help Wanted — issue #1](https://github.com/whoismept/OpenUG2/issues/1)**,
+or open a focused issue before beginning a large change.
+
+High-value contribution areas:
+
+- **Formats and asset pipeline** — document unknown chunks, animated `ANM_*`
+  data, race set-dressing placement, texture/material records and safe parser
+  fixtures.
+- **World and rendering** — verify individual bundles, restore missing authored
+  scenery, improve visibility/culling, and identify the structural rule behind
+  panorama and detail-tier selection.
+- **Vehicle dynamics** — tyre/contact behaviour, weight transfer, drivetrain
+  and powertrain data, suspension presentation and NFSU2-style camera feedback.
+- **Racing and AI** — sprint opponents, route following, event coverage,
+  respawn/recovery, race HUD semantics and start/finish flow.
+- **Front end, audio and usability** — a real menu flow, settings, controls,
+  sound design and accessible diagnostics.
+- **Portability and quality** — OpenGL ES, Windows/Linux/ARM coverage,
+  deterministic parser/physics tests, profiling, documentation and reproducible
+  bug reports.
+
+### Contribution rules
+
+- This is a **clean-room reimplementation**. Never commit or paste EA assets,
+  executables, decompiled/disassembled output, copyrighted game code or data
+  extracted from a retail installation.
+- Keep changes small and evidence-driven. Measure the production path before
+  changing it; audit-only work must not silently alter behaviour.
+- Document newly proven format facts in [`docs/FORMATS.md`](docs/FORMATS.md).
+- Build with zero warnings, keep the boot self-tests passing and keep
+  `make gles` compiling.
+- Include deterministic evidence: parser/test output for data changes and
+  same-pose before/after PNGs for rendering changes.
+- Do not treat `--track ALL` as proof of valid placement or gameplay.
 
 ## Credits
 
@@ -148,7 +227,7 @@ Format reverse-engineering builds on prior community work, used as references
   NFSU2 reverse-engineering project; the chunk-container format was confirmed
   against its [documentation](https://yugecin.github.io/nfsu2-re/docs.html).
   Big thanks for the great work.
-- **[Nikki](https://github.com/MaxHwoy/Nikki)** — TPK / texture header reference.
+- **[Nikki](https://github.com/SpeedReflect/Nikki)** — TPK / texture header reference.
 - **[OpenNFSTools](https://github.com/MWisBest/OpenNFSTools)** — JDLZ algorithm reference.
 - **[vgmstream](https://github.com/vgmstream/vgmstream)** — Gnsu20 / EA-XAS v0 format reference.
 
