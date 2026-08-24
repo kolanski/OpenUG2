@@ -6525,6 +6525,15 @@ int main(int argc, char **argv) {
            be occluded); only the write is off, so overlapping glows blend
            into each other instead of fighting on depth. */
         if (nglow && g_dbg.show_track && (passmode == 0 || passmode == 2)) {   /* M78 */
+            /* BACK TO WORLD SPACE FIRST. Everything between the car and this
+               pass draws billboards -- tail lights, headlight pools, tyre
+               smoke, skid marks -- and each sets its own matrix; the last one
+               does not put the world matrix back. Without this the whole glow
+               pass is drawn in the coordinates of a quad stuck to the car,
+               i.e. off screen. And since those billboards only run while
+               DRIVING, the lights are there in the menu orbit and gone the
+               moment the chase camera starts. */
+            glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
             glDepthMask(GL_FALSE);
             glUniform1f(uUnlit, 1.0f);
