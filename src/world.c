@@ -199,7 +199,8 @@ int world_load(World *w, const char *troot, const char *trackname) {
             }
         }
         n2_vista_out = &w->vista;      /* backdrop impostors go here, not away */
-        n2_walk_meshes(g->data, 0, g->len, &w->scene, tkeys, ntk);
+        if (!world2_on)
+            n2_walk_meshes(g->data, 0, g->len, &w->scene, tkeys, ntk);
         n2_vista_out = NULL;
         g->mesh1 = w->scene.count;
         if (!w->have_grass)
@@ -217,6 +218,22 @@ int world_load(World *w, const char *troot, const char *trackname) {
        This handles the overlapping-superset bundles under --track ALL: the 8
        bundles re-ship the same tiles byte-identically, so the exact key
        (texkey,bbox,tri,vert) fuses them to one clean layer (residual == 0). */
+    /* Instance-driven builder: the scene is assembled from the instance
+       records, with the models taken in local coordinates. Runs instead of the
+       prototype walk above, and before dedup, bounds, the ground grid and
+       batching -- all of which read the finished scene. */
+    if (world2_on) {
+        static const char *bl[WORLD_MAXREG];
+        for (int r = 0; r < w->nreg; r++) bl[r] = w->rgn[r].name;
+        world2_build(&w->scene, troot, bl, w->nreg,
+                     world_inst_x, world_inst_y,
+                     world_inst_r > 0 ? world_inst_r : 600.0f,
+                     w->loc4, w->loc4len);
+        for (int r = 0; r < w->nreg; r++) {
+            w->rgn[r].mesh0 = 0; w->rgn[r].mesh1 = w->scene.count;
+        }
+    }
+
     world_dedup(w);
 
     /* Terrain/road de-fighting (Phase 73.5). The paved ROAD strips and the

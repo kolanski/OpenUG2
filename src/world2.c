@@ -56,6 +56,14 @@
 #include "nfsu2.h"
 #include "world.h"
 
+/* Centre and radius for instance placement. Set from main before world_load,
+   which knows nothing about the spawn point itself. Radius 0 disables it. */
+float world_inst_x = 0, world_inst_y = 0, world_inst_r = 0;
+
+/* --world2: assemble the scene with the instance-driven builder instead of
+   walking the prototypes. The older path stays for comparison. */
+int world2_on = 0;
+
 char world2_bundle[64] = "";   /* selected district; the light sources need it */
 
 /* ---------------- chunk tree walking ---------------- */
