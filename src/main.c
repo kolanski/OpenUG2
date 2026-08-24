@@ -2672,9 +2672,37 @@ int main(int argc, char **argv) {
         }
         printf("\n");
     }
+    static N2LightSrc lsrc[16384]; int nlsrc = 0; /* district light sources */
+    GLuint tex_glow = 0;                          /* SFX_FLARE_GLOWA: the halo */
     static uint32_t tmapkey[2048]; static GLuint tmaptex[2048];
     int ntmap = world_bind_textures(&world, tmapkey, tmaptex, 2048);
     printf("track textures bound: %d distinct\n", ntmap);
+
+    /* THE LAMP HALO. Its texture is the flare sheet the game ships; the key is
+       looked up rather than the texture built, so what is drawn is the game's
+       own glow. */
+    for (int q = 0; q < ntmap; q++)
+        if (tmapkey[q] == 0x17e5ebd2u) { tex_glow = tmaptex[q];
+            printf("lamp flare: SFX_FLARE_GLOWA bound\n"); break; }
+
+    /* LIGHT SOURCES drive those halos. Much lamp geometry is a flat quad that
+       all but vanishes seen from the side, so at driving height the light
+       seemed to switch off while it was still visible from above; the halo is
+       drawn from the source record instead, and stays visible from any angle.
+       The whole district is kept -- a couple of thousand records is tens of
+       kilobytes, and the distance cull runs from the CAMERA every frame, so
+       culling once around the spawn point would make halos run out as soon as
+       you drove away. */
+    if (world2_on && world2_bundle[0]) {
+        char lp[1024];
+        snprintf(lp, sizeof lp, "%s/TRACKS/%s.BUN", dataroot, world2_bundle);
+        long ll = 0; unsigned char *ld = n2_read_file(lp, &ll);
+        if (ld) {
+            nlsrc = n2_load_lights(ld, ll, lsrc, 16384);
+            printf("district light sources: %d\n", nlsrc);
+            free(ld);
+        }
+    }
     if (smaudit) { int slot = -1;
         for (int j = 0; j < ntmap; j++) if (tmapkey[j] == smkey) { slot = j; break; }
         printf("M98 target %08x -> bound slot %d, GL id %u\n\n", smkey, slot,
@@ -6237,6 +6265,57 @@ int main(int argc, char **argv) {
                 g_dbg.drawn++;
             }
             glUniform1f(uUnlit, 0.0f); glDepthMask(GL_TRUE); glDisable(GL_BLEND);
+        }
+
+        /* LAMP HALOS, drawn from the district's LIGHT SOURCES rather than from
+           lamp geometry: many lamp meshes are flat quads that all but vanish
+           seen from the side, so at driving height the light seemed to switch
+           off while it was still visible from above. Additive, billboarded to
+           the camera. The halo RADIUS is not in the data -- the record carries
+           falloff radii only -- so the 0.35 factor on the inner radius is ours;
+           what is in the data is the difference between a street lamp and a car
+           park floodlight, and that comes through. */
+        if (nlsrc && tex_glow && g_dbg.night_mode && g_dbg.show_track) {
+            float vx = camtgt[0]-cam[0], vy = camtgt[1]-cam[1], vz = camtgt[2]-cam[2];
+            float vl = sqrtf(vx*vx+vy*vy+vz*vz); if (vl < 1e-4f) vl = 1.0f;
+            vx/=vl; vy/=vl; vz/=vl;
+            float rx = vy, ry = -vx, rz = 0.0f;                  /* screen right */
+            float rl = sqrtf(rx*rx+ry*ry); if (rl < 1e-4f) { rx=1; ry=0; rl=1; }
+            rx/=rl; ry/=rl;
+            float ux = ry*vz - rz*vy, uy = rz*vx - rx*vz, uz = rx*vy - ry*vx;
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glDepthMask(GL_FALSE);
+            /* The halo is a soft round pool, produced by the shader's own
+               radial falloff rather than by the flare sheet: this tree's
+               texture decoder frees an alpha plane that is uniform, so the
+               sheet arrives fully opaque and draws as a hard square. */
+            glUniform1f(uUnlit, 1.0f); glUniform1f(uUseTex, 0.0f);
+            glUniform1f(rp.uSoft, 1.0f);
+            for (int q = 0; q < nlsrc; q++) {
+                const N2LightSrc *L = &lsrc[q];
+                float dx = L->x-cam[0], dy = L->y-cam[1], dz = L->z-cam[2];
+                float d2 = dx*dx+dy*dy+dz*dz;
+                if (d2 > VIEW_DIST*VIEW_DIST) continue;   /* same range as the world */
+                float HALO = L->r_in * 0.35f; if (HALO < 1.0f) HALO = 1.0f;
+                float M[16] = {
+                    rx*HALO, ry*HALO, rz*HALO, 0,
+                    ux*HALO, uy*HALO, uz*HALO, 0,
+                    0,0,1,0,
+                    L->x - (rx+ux)*HALO*0.5f,
+                    L->y - (ry+uy)*HALO*0.5f,
+                    L->z - (rz+uz)*HALO*0.5f, 1 };
+                float MV[16]; mat_mul(MVP, M, MV);
+                glUniformMatrix4fv(uMVP, 1, GL_FALSE, MV);
+                glUniform3f(uColor, L->cr/255.0f, L->cg/255.0f, L->cb/255.0f);
+                float fade = 1.0f - sqrtf(d2)/VIEW_DIST; if (fade < 0) fade = 0;
+                glUniform1f(rp.uAlpha, fade*fade + 0.25f*fade);
+                draw_gpumesh(&quad);
+                g_dbg.drawn++;
+            }
+            glUniform1f(rp.uAlpha, 1.0f); glUniform1f(uUnlit, 0.0f);
+            glUniform1f(rp.uSoft, 0.0f);
+            glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
+            glDepthMask(GL_TRUE); glDisable(GL_BLEND);
         }
 
         /* HUD: race-position leaderboard — one colour bar per car, ordered by
