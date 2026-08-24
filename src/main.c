@@ -26,6 +26,7 @@
 
 #include "nfsu2.h"
 #include "render.h"
+#include "sfx/post.h"
 #include "physics.h"
 #include "ai.h"
 #include "audio.h"
@@ -1243,6 +1244,17 @@ int main(int argc, char **argv) {
     int fbcensus = 0;   /* --fallback-census (M102): who still takes the old path */
     int camat = 0; float camx = 0, camy = 0;   /* --cam-at X Y: aim a static capture */
     int spawn_set = 0; float spawn_x = 0, spawn_y = 0;   /* --spawn NAME */
+    int   no_post = 0;                 /* --no-post: skip the tone pass */
+    float post_amount = 1.0f;          /* --post N: scale it */
+    int   post_on = 0;                 /* the pass is live this frame */
+/* Resolving has to happen after everything is drawn and before anything reads
+   the pixels, and there are several places that read them. A macro keeps the
+   three lines identical at every one of them rather than trusting a single
+   spot in a 7000-line frame to be on the live path -- an earlier attempt put
+   it in what looked like the right place and it never ran. */
+#define POST_RESOLVE() do { if (post_on) { \
+        pp_end_and_draw(&quad, post_amount); glUseProgram(rp.prog); post_on = 0; } \
+    } while (0)
     int head_set = 0;  float head_deg = 0;               /* --heading DEG */
     const char *b02probe = NULL;   /* --b02-probe NAME (M104): stride/field search */
     const char *shaudit = NULL;    /* --showcase-audit PREFIX [X Y] (M106) */
@@ -1361,6 +1373,10 @@ int main(int argc, char **argv) {
         /* --world2: assemble the scene from instance records instead of from
            models with their matrix baked in. See world2.c. */
         else if (!strcmp(argv[i], "--world2")) world2_on = 1;
+        /* --no-post / --post N: the bloom-and-tone pass, and how much of it. */
+        else if (!strcmp(argv[i], "--no-post")) no_post = 1;
+        else if (!strcmp(argv[i], "--post") && i+1 < argc)
+            post_amount = (float)atof(argv[++i]);
         /* --spawn NAME: start at a named place; --spawn list prints them. */
         else if (!strcmp(argv[i], "--spawn") && i+1 < argc) {
             const char *nm = argv[++i];
@@ -5282,6 +5298,11 @@ int main(int argc, char **argv) {
 
         int W, H; SDL_GL_GetDrawableSize(win, &W, &H);
         glViewport(0, 0, W, H);
+        /* The frame is drawn into a texture so it can be toned afterwards;
+           see the post-processing block in render.c. Without it the picture is
+           the raw scene, which reads cold and flat. */
+        if (!no_post && pp_init(W, H)) { post_on = 1; pp_begin(); }
+        else post_on = 0;
         /* the sky is cleared to the fog colour: distant geometry dissolves
            into exactly what the horizon shows */
         glClearColor(g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b, 1);
@@ -6558,7 +6579,9 @@ int main(int argc, char **argv) {
             if (cap >= 0) {
                 char sp[1024]; snprintf(sp, sizeof sp, "%s_%s.png", smaudit, vn[cap]);
                 unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                POST_RESOLVE();
+                POST_RESOLVE();
+            glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                 for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                 write_png(sp, W, H, fl); free(px); free(fl);
                 printf("SM captured %s (frame %ld, car stationary during countdown)\n", sp, f);
@@ -6594,7 +6617,9 @@ int main(int argc, char **argv) {
                                                  "C_tangent_reversed" };
                     char sp[1024]; snprintf(sp, sizeof sp, "%s_%s.png", shaudit, hn[shot107]);
                     unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                    glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                    POST_RESOLVE();
+                POST_RESOLVE();
+            glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                     for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                     write_png(sp, W, H, fl); free(px); free(fl);
                     printf("M107 capture %s  heading %+.4f  car(%.3f %.3f %.3f) "
@@ -6791,7 +6816,9 @@ int main(int argc, char **argv) {
                     char sp[1024];
                     snprintf(sp, sizeof sp, "%s_yaw%d.png", poseshot, YAW[slot]);
                     unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                    glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                    POST_RESOLVE();
+                POST_RESOLVE();
+            glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                     for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                     write_png(sp, W, H, fl); free(px); free(fl);
                     printf("POSE frame written: %s\n", sp);
@@ -6803,7 +6830,9 @@ int main(int argc, char **argv) {
             if (tag) {
                 char sp[1024]; snprintf(sp, sizeof sp, "%s%s.png", raudit, tag);
                 unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+                POST_RESOLVE();
+                POST_RESOLVE();
+            glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                 for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                 write_png(sp, W, H, fl); free(px); free(fl);
                 printf("RA frame written: %s\n", sp);
@@ -6834,6 +6863,7 @@ int main(int argc, char **argv) {
         if (daudit && shotframe == 2) {   /* one normal rendered frame at spawn */
             char sp[1024]; snprintf(sp, sizeof sp, "%s_spawn.png", daudit);
             unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
+            POST_RESOLVE();
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
             for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
             write_png(sp, W, H, fl); free(px); free(fl);
@@ -6841,6 +6871,7 @@ int main(int argc, char **argv) {
         }
         if (shot && ++shotframe >= shotframes) {
             unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
+            POST_RESOLVE();
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
             for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
             write_png(shot, W, H, fl);
@@ -6966,6 +6997,7 @@ int main(int argc, char **argv) {
             printf("wrote %s (%dx%d) after driving to (%.0f,%.0f)\n", shot, W, H, carpos[0], carpos[1]);
             running = 0;
         }
+        POST_RESOLVE();
         SDL_GL_SwapWindow(win);
     }
 
