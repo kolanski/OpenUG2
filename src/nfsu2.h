@@ -108,7 +108,31 @@ typedef struct { int w, h; unsigned char *rgb; unsigned char *alpha;
        fallback. Set only by n2_load_car_tex_by_key for straight DXT1/DXT3
        slots. dxtfmt: 0 = none (use rgb), 1 = DXT1, 3 = DXT3. */
     unsigned char *dxt; int dxtlen, dxtfmt;
-    int afmt;   /* source alpha format: 0 none, 1 DXT1 1-bit, 3 DXT3, 8 P8 */ } N2Tex;
+    int afmt;   /* source alpha format: 0 none, 1 DXT1 1-bit, 3 DXT3, 8 P8 */
+    /* HOW THE TEXTURE IS MEANT TO BE DRAWN, straight from its record. These
+       four bytes are what decide whether alpha means anything -- see the note
+       where the alpha plane is kept or freed.
+         order   draw order: 0 opaque layer, 5..7 transparent
+         usage   0 none, 1 cutout (alpha test), 2 blending
+         blend   0 none, 1 ordinary src/1-src, 2 additive (neon, glow)
+         wz      1 write depth (opaque), 0 do not
+       Measured over one district's 1595 unique textures, the combinations are
+       exactly:
+         (0,0,0,1) x1236  opaque
+         (0,1,0,1) x 158  cutout: barriers, frames, foliage
+         (5,2,2,0) x  87  additive: neon and lit windows
+         (5,2,1,0) x  46  blended: shop windows, clock faces, glass
+         (0,2,0,1) x  53  has alpha but draws opaque (water) */
+    unsigned char order, usage, blend, wz; } N2Tex;
+
+/* Draw mode derived from the fields above. */
+enum { N2_DRAW_OPAQUE = 0, N2_DRAW_CUTOUT = 1, N2_DRAW_BLEND = 2, N2_DRAW_ADD = 3 };
+static int n2_tex_mode(const N2Tex *t) {
+    if (t->usage == 1) return N2_DRAW_CUTOUT;
+    if (t->usage == 2 && t->blend == 1) return N2_DRAW_BLEND;
+    if (t->blend == 2) return N2_DRAW_ADD;
+    return N2_DRAW_OPAQUE;
+}
 
 /* ---- file I/O ---- */
 static unsigned char *n2_read_file(const char *path, long *out_len) {
@@ -2531,6 +2555,8 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
             int w = d[i+0x38] | d[i+0x39]<<8, hh = d[i+0x3a] | d[i+0x3b]<<8;
             if (w<=0 || hh<=0 || w>4096 || hh>4096) continue;
             tex->w = w; tex->h = hh; tex->rgb = (unsigned char *)malloc((long)w*hh*3);
+            tex->order = d[i+0x45]; tex->usage = d[i+0x49];
+            tex->blend = d[i+0x4a]; tex->wz = d[i+0x4b];
             tex->dxt = NULL; tex->dxtlen = 0; tex->dxtfmt = 0;
             /* M132-R2: alpha is DECODED, not discarded. The palettes are RGBA
                and the DXT blocks carry real alpha; throwing it away was why a
@@ -2558,9 +2584,30 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
 #ifdef N2_NO_WORLD_ALPHA
                 free(alf);        /* A/B control build: pre-M132-R2 behaviour */
 #else
-                int meaningful = 0;
-                for (long p = 0; p < (long)w*hh; p++) if (alf[p] != 255) { meaningful = 1; break; }
-                if (meaningful) tex->alpha = alf; else free(alf);
+                /* WHETHER ALPHA MEANS ANYTHING IS IN THE RECORD, not in the
+                   image. In an opaque texture the fourth byte is not
+                   transparency but leftover data, and cutting on it punches
+                   holes in the road; scanning the plane instead is guesswork
+                   that gets it wrong both ways -- an opaque asset whose spare
+                   byte happens to vary keeps a plane it should not have, and a
+                   flare sheet that is genuinely uniform loses the one it
+                   needs. usage and blend say outright which it is. */
+                if (n2_tex_mode(tex) == N2_DRAW_OPAQUE) {
+                    free(alf);
+                } else {
+                    tex->alpha = alf;
+                    /* Normalise to 0..255: some palettes never reach full
+                       alpha -- measured peaks of 79, 190, 191 and 217 -- and
+                       left as they are, a sheet that should be solid draws
+                       washed out. */
+                    long tot = (long)w * hh, amax = 0;
+                    for (long p = 0; p < tot; p++) if (alf[p] > amax) amax = alf[p];
+                    if (amax > 0 && amax < 255)
+                        for (long p = 0; p < tot; p++) {
+                            long v = (long)alf[p] * 255 / amax;
+                            alf[p] = (unsigned char)(v > 255 ? 255 : v);
+                        }
+                }
 #endif
             }
             return 1;

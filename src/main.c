@@ -6285,12 +6285,13 @@ int main(int argc, char **argv) {
             float ux = ry*vz - rz*vy, uy = rz*vx - rx*vz, uz = rx*vy - ry*vx;
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
             glDepthMask(GL_FALSE);
-            /* The halo is a soft round pool, produced by the shader's own
-               radial falloff rather than by the flare sheet: this tree's
-               texture decoder frees an alpha plane that is uniform, so the
-               sheet arrives fully opaque and draws as a hard square. */
-            glUniform1f(uUnlit, 1.0f); glUniform1f(uUseTex, 0.0f);
-            glUniform1f(rp.uSoft, 1.0f);
+            /* The halo is the game's own flare sheet. Its alpha survives now
+               that the decoder keeps a plane whenever the texture record says
+               the texture is not opaque -- the flare is additive, so it is
+               kept even though its alpha is close to uniform. */
+            glUniform1f(uUnlit, 1.0f); glUniform1f(uUseTex, 1.0f);
+            glUniform1f(rp.uSoft, 0.0f);
+            glBindTexture(GL_TEXTURE_2D, tex_glow);
             for (int q = 0; q < nlsrc; q++) {
                 const N2LightSrc *L = &lsrc[q];
                 float dx = L->x-cam[0], dy = L->y-cam[1], dz = L->z-cam[2];
