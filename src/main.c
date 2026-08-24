@@ -35,6 +35,8 @@
 #include "world.h"
 #include "world_mesh.h"   /* F3 prelight/normal/wireframe debug pipeline */
 #include "debug.h"
+#include "car_setup.h"      /* per-car parameters out of the shipped table */
+#include "vehicle_model.h"  /* single-track dynamics driven by those parameters */
 
 /* debug tunables — defaults match the previously hard-coded constants, so a
  * normal build behaves exactly as before; `make debug` adds an ImGui panel. */
@@ -643,6 +645,29 @@ static int ride_gather(const N2Scene *sc, const float pos[3], float heading,
     return n;
 }
 static PhysVehicle g_vehicle = { 1.0f, 1.0f, 1.0f, 1.0f };   /* M121: this car */
+/* The dynamics model that runs off the car's own shipped parameters. It sits
+   alongside the older kinematic one rather than replacing it: --oldphys puts
+   the previous behaviour back, so the two can be driven one after the other
+   on the same road. Falls back on its own if the car is not in the table. */
+static N2CarSetup g_carsetup;
+/* ---- the new chase camera (NFSU2-flavoured) ----
+   It follows the direction the car TRAVELS, not the way the nose points.
+   Those are the same thing on a straight, slightly apart in a corner -- so
+   the body yaws in frame and you see some flank -- and completely different
+   mid-doughnut, where the nose sweeps but the travel direction crawls: the
+   camera hangs off to the side and you watch the car rotate. Distance
+   breathes with speed, tucks in under braking; the FOV opens a touch as the
+   speed rises. --oldcam puts the previous rigid follower back. */
+static int   g_newcam = 1;
+static float g_cam_az, g_cam_dist = 6.0f, g_fov = 0.90f;
+static int   g_cam_init = 0;
+static VehModel   g_vehmodel;
+static int        g_newphys = 1;      /* --oldphys clears it */
+static int        g_newphys_ok = 0;   /* parameters actually loaded */
+/* --telemetry FILE: one CSV row per frame of the player's car. Driving feel
+   is hard to argue about from memory -- this makes it arguable from data. */
+static FILE      *g_tel = NULL;
+static float      g_tel_t = 0.0f;
 static int   g_m107 = 0;          /* M107: three-heading menu capture, audit only */
 static float g_m107_h[3];
 
@@ -1246,8 +1271,14 @@ int main(int argc, char **argv) {
     int camat = 0; float camx = 0, camy = 0;   /* --cam-at X Y: aim a static capture */
     int spawn_set = 0; float spawn_x = 0, spawn_y = 0;   /* --spawn NAME */
     static N2Paint pal[512]; int npal = 0;        /* body paints, from GLOBALB */
+    /* (350Z default wired below once carname is final) */
     float paint_rgb[3] = { 0.70f, 0.70f, 0.75f }; /* until the record is read */
     const char *paint_name = NULL;                /* --paint NAME */
+    /* Showroom default for the default car: the attribute DB pairs the 350Z's
+       stock record with MATERIAL REGPAINTORANGE (145,35,17). Until the per-car
+       default-paint chain is parsed end to end, pin the one car we boot into;
+       --paint still overrides. */
+    const char *paint_default_350z = "REGPAINTORANGE";
     const char *g_sky_name = NULL;     /* --sky NAME */
     int   no_post = 0;                 /* --no-post: skip the tone pass */
     float post_amount = 1.0f;          /* --post N: scale it */
@@ -1276,7 +1307,7 @@ int main(int argc, char **argv) {
     int mapaudit = 0;  /* --map-audit: texture resolution + production distance-cull census */
     float vthresh = 3000.0f;   /* --vista-census [METRES]: candidate XY-span floor */
     int rendermode = 0, daylight = 0;   /* --rendermode 0..3 / --daylight: headless F3 matrix */
-    const char *carname = "HUMMER", *trackname = "ALL";
+    const char *carname = "350Z", *trackname = "ALL";
     const char *circuit = "ROUTESL4RF/Paths4602.bin"; int explicit_circuit = 0;
     int want_event_id = 0;   /* --event <id>: boot straight into a race event */
     int shotframes = 40;     /* --frames N: how long --shot drives before the grab */
@@ -1284,6 +1315,14 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--shot")    && i+1 < argc) shot      = argv[++i];
         else if (!strcmp(argv[i], "--car")     && i+1 < argc) carname   = argv[++i];
+        else if (!strcmp(argv[i], "--oldphys")) g_newphys = 0;   /* previous kinematic model */
+        else if (!strcmp(argv[i], "--oldcam"))  g_newcam = 0;    /* previous chase camera */
+        else if (!strcmp(argv[i], "--telemetry") && i+1 < argc) {
+            g_tel = fopen(argv[++i], "w");
+            if (g_tel) fprintf(g_tel, "t,x,y,z,speed_kmh,heading_deg,yaw_rate_degs,"
+                                      "slip_deg,wheel_slip,throttle,steer,handbrake,gear,rpm,"
+                                      "pitch_deg,roll_deg\n");
+        }
         else if (!strcmp(argv[i], "--event")   && i+1 < argc) want_event_id = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames")  && i+1 < argc) shotframes = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--laps")    && i+1 < argc) want_laps = atoi(argv[++i]);
@@ -3051,6 +3090,7 @@ int main(int argc, char **argv) {
            keeps a hand-picked near-white, and near-white metallic under a
            specular highlight is what blows out. */
         npal = n2_load_paints(globdata, globlen, pal, 512);
+        if (!paint_name && !strcmp(carname, "350Z")) paint_name = paint_default_350z;
         if (paint_name) n2_carskin_mat = n2_str_hash(paint_name);
         {   uint32_t want = n2_carskin_mat ? n2_carskin_mat
                                            : n2_str_hash("METPAINTSILVER");
@@ -3086,6 +3126,55 @@ int main(int argc, char **argv) {
 
         int wheel_from_global = 0;
         g_dbg.wheel = wheel_config_for(carname, &carprof, globdata, globlen, &wheel_from_global);
+        /* The new dynamics run entirely off this car's own shipped record. */
+        if (n2_car_setup_load(&g_carsetup, globdata, globlen, carname)) {
+            veh_model_init(&g_vehmodel, &g_carsetup);
+            g_newphys_ok = 1;
+            printf("car setup %-12s %.0f kg  %s  %d-speed  peak %.0f N*m  "
+                   "tyre mu %.2f->%.2f at %.0f deg\n", carname,
+                   g_carsetup.mass * 1000.0f,
+                   g_carsetup.drive.split_rear > 0.9f ? "RWD" :
+                   g_carsetup.drive.split_rear < 0.1f ? "FWD" : "AWD",
+                   g_carsetup.drive.num_gears,
+                   g_carsetup.motor.torque[4] * 1000.0f,
+                   g_carsetup.tyre[1].mu_static, g_carsetup.tyre[1].mu_slide,
+                   g_carsetup.tyre[1].slip_angle_deg);
+            printf("physics: %s (--oldphys for the previous one)\n",
+                   g_newphys ? "new single-track model" : "old kinematic model");
+
+            /* WHEEL GEOMETRY COMES FROM THE RECORD TOO. wheel_config_for()
+               took the axle lines and track from the car table but left the
+               hub HEIGHT, the radius and the width to whatever could be
+               measured off the tyre mesh -- and the mesh is the rim plus a
+               tyre of unknown section, so the car ends up standing on stilts
+               with wheels too wide for their arches. The record carries all
+               four hub positions, each wheel's radius and its width outright,
+               so use them: the 350Z's hubs sit at 0.171 with 0.328 front and
+               0.334 rear wheels, and nothing about that needs measuring.
+               A tighter, correctly-seated wheel also lets the springs show:
+               with the body sitting where it should, pitch and roll have room
+               to be visible instead of looking bolted solid. */
+            {   VehicleWheelConfig *w = &g_dbg.wheel;
+                printf("wheels: mesh gave hub %.3f r %.3f w %.3f  ->  "
+                       "record gives hub %.3f r %.3f/%.3f w %.3f/%.3f\n",
+                       w->ride_y, carprof.wheel_r, carprof.wheel_w,
+                       g_carsetup.wheel[0].pos[2],
+                       g_carsetup.wheel[0].radius, g_carsetup.wheel[2].radius,
+                       g_carsetup.wheel[0].width,  g_carsetup.wheel[2].width);
+                w->front_axle  = g_carsetup.wheel[0].pos[0];
+                w->rear_axle   = g_carsetup.wheel[2].pos[0];
+                w->front_track = fabsf(g_carsetup.wheel[0].pos[1]
+                                     - g_carsetup.wheel[1].pos[1]);
+                w->rear_track  = fabsf(g_carsetup.wheel[2].pos[1]
+                                     - g_carsetup.wheel[3].pos[1]);
+                w->ride_y      = g_carsetup.wheel[0].pos[2];
+                carprof.wheel_r = 0.5f * (g_carsetup.wheel[0].radius
+                                        + g_carsetup.wheel[2].radius);
+                carprof.wheel_w = g_carsetup.wheel[0].width;
+            }
+        } else {
+            printf("car setup: %s is not in the table -- staying on the old model\n", carname);
+        }
         free(globdata);
         wR = carprof.wheel_r; wHW = 0.5f * carprof.wheel_w;
         if (wHW < 0.04f) wHW = 0.04f;
@@ -4506,7 +4595,11 @@ int main(int argc, char **argv) {
     /* tyre skid marks: a ring buffer of oriented ground SEGMENTS (ax,ay,az,
        bx,by,bz, life) — life starts at 1 and decays so marks fade over time.
        bx,by,bz) forming continuous ribbons; plus drift smoke particles. */
-    #define MAXSKID 700
+    /* A minute of rubber. Two segments a frame at 60 Hz is 7200 for sixty
+       seconds; at 28 bytes each that is 200 kB, which is nothing, and it
+       means a doughnut leaves a full circle you can still see when you drive
+       back past it rather than a few metres that vanish while you watch. */
+    #define MAXSKID 7200
     static float skid[MAXSKID][7]; int skidn = 0, skidhead = 0;
     float prevL[3] = {0,0,0}, prevR[3] = {0,0,0}; int skidpen = 0;  /* pen-down state */
     #define MAXSMOKE 512
@@ -4791,7 +4884,15 @@ int main(int argc, char **argv) {
             else               { throttle =  0.0f; steer = 0.0f; }
             handbrake = 0;
         }
-        steer_filtered=phys_steer_response(steer_filtered,steer);
+        /* ONE steering filter, not two. The old model had no rack of its own,
+           so this exponential smoother stood in for one. The new model has a
+           real rate-limited rack (140 deg/s at the road wheels, quicker back
+           to centre), and running both in series just makes the wheel vague:
+           full lock arrived a third of a second late, which is a long time
+           when you are trying to break the back loose. Pass the input
+           straight through and let the rack shape it. */
+        steer_filtered = (g_newphys && g_newphys_ok)
+                       ? steer : phys_steer_response(steer_filtered, steer);
         /* Surface-aware handling (M114): query the selected centre contact layer,
            then EASE the active profile toward that surface's
            profile over ~0.15 s. Blending the profile (not the velocity) means
@@ -4912,13 +5013,46 @@ int main(int argc, char **argv) {
         }
         float dmag = sstatic ? 0.0f
                    : race_auto ? speed/60.0f
+                   : (g_newphys && g_newphys_ok)
+                   ? veh_bridge_step(carpos, vel, &heading, &speed,
+                                     throttle, steer_filtered, handbrake ? 1 : 0, &g_vehmodel)
                    : phys_car_step(carpos, vel, &heading, &speed,
-                                   throttle, steer_filtered, handbrake, &surf_now, &g_vehicle);
+                                   throttle, steer_filtered, handbrake ? 1 : 0, &surf_now, &g_vehicle);
+        if (g_tel && !sstatic) {
+            g_tel_t += 1.0f/60.0f;
+            fprintf(g_tel, "%.3f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.3f,"
+                           "%.2f,%.2f,%d,%d,%.0f,%.2f,%.2f\n",
+                    g_tel_t, carpos[0], carpos[1], carpos[2],
+                    speed * 60.0f * 3.6f, heading * 57.29578f,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_yaw_rate()*57.29578f : 0.0f,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_slip_deg() : 0.0f,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_slip_ratio() : 0.0f,
+                    throttle, steer_filtered, handbrake ? 1 : 0,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_gear() : gear,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_rpm() : 0.0f,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_pitch()*57.29578f : 0.0f,
+                    (g_newphys && g_newphys_ok) ? veh_bridge_roll()*57.29578f : 0.0f);
+        }
         float nf[2] = { cosf(heading), sinf(heading) }, nr[2] = { nf[1], -nf[0] };
         /* engine note: 6-speed virtual gearbox drives RPM + load; shifts cut
            the throttle for 150ms and let the revs sag (idles during the
            countdown, since throttle is locked out until GO). */
         { float sp = (speed < 0 ? -speed : speed) / PHYS_MAXSPD;
+          /* THE ENGINE NOTE HAS TO COME FROM THE ENGINE. eng_gearbox_step
+             runs a virtual six-speed off road speed alone, which was fine
+             when the physics had no engine at all -- but now there is a real
+             one, with the car's own ratios and its own rev counter, and the
+             two disagreed audibly: the model would hold a gear through a
+             slide while the sound shifted up and down anyway. Worse, in a
+             doughnut you could HEAR the revs climb and fall while the car
+             was in fact sitting on one gear the whole time. Drive the note
+             from the model and the ear matches the car. */
+          if (g_newphys && g_newphys_ok) {
+              g_engine.target_rpm = veh_bridge_rpm();
+              g_engine.load = throttle > 0.0f ? throttle : 0.0f;
+              gear = veh_bridge_gear() - 1;      /* model counts neutral as 1 */
+              if (gear < 1) gear = 1;
+          } else
           eng_gearbox_step(sp, throttle, 1.0f/60.0f, &gear, &shift_t);
           g_engine.master_volume = (race_state==0 ? 0.16f : 0.16f + sp*0.5f);
           g_road_vol = sp*sp*0.35f; }   /* tyre/wind roar rises with speed */
@@ -4958,6 +5092,7 @@ int main(int argc, char **argv) {
             (nwc = collide_walls(carpos, vel, obst, obstz, nobst, 1.3f,
                                  car_z0, car_z1, &scene, obstsrc, wc, 8)) > 0) {
             g_hit = 0.5f; da_walls++; ra_walls++;
+            veh_bridge_adopt();      /* the resolved velocity is the truth now */
             if (raudit) {
                 float dx = carpos[0]-m94_prex, dy = carpos[1]-m94_prey;
                 float corr = sqrtf(dx*dx+dy*dy);
@@ -4975,6 +5110,7 @@ int main(int argc, char **argv) {
         { WRailHit rh; rh.mesh = -1;
           int rpushed = (race_state == 1 && !race_auto && !sstatic) &&
                         world_wall_push(&scene, carpos, 1.3f, raudit ? &rh : NULL);
+          if (rpushed) veh_bridge_adopt();
           if (raudit && rpushed && rh.mesh >= 0)
               m94_rail(&rh, &scene, m94_prex, m94_prey, m94_prez, &aipath, ra_f);
           if (rpushed) {
@@ -4983,6 +5119,44 @@ int main(int argc, char **argv) {
           }
         }
         /* race blockades: only solid while a race event is active (Phase 71) */
+        /* KERB STOP. The wall probes look for tall near-vertical faces and
+           deliberately skip short seams -- which is what a kerb face is, so
+           the car drove straight into kerbs, half-sank, and sat there tilted.
+           A kerb is not a wall, it is a STEP in the ground: measured on this
+           map, the steepest drivable ramp gains 0.09 m per 0.25 m sample and
+           the lowest kerb jumps 0.16, so a rise above 0.12 per quarter-metre
+           step is a kerb face. Probe just past the bumper along the travel
+           direction; hitting one removes the into-step velocity and nudges
+           the car back, like a wheel striking the stone does. */
+        if (race_state == 1 && !race_auto && !sstatic && fabsf(speed) > 0.02f) {
+            /* A kerb is a JUMP inside one quarter-metre step; a ramp is a
+               SLOPE spread over all of them. The first cut of this also
+               compared the ground 2.2 m ahead against the ground under the
+               car -- and over 2.2 m even a drivable ramp legitimately gains
+               most of a metre, so the car nosed at every on-ramp convinced
+               it was a wall. Walk a ladder of quarter-metre samples and
+               judge only the per-step jumps; the total climb proves nothing. */
+            float sgn = (speed >= 0.0f) ? 1.0f : -1.0f;
+            float dirx = cosf(heading) * sgn, diry = sinf(heading) * sgn;
+            float step = 0.0f, gprev = 0.0f;
+            for (int q = 0; q < 4; q++) {
+                float d = 1.6f + 0.25f * (float)q;
+                float g = world_ground_z(&scene, carpos[0] + dirx * d,
+                                         carpos[1] + diry * d, carpos[2]);
+                if (q && g - gprev > step) step = g - gprev;
+                gprev = g;
+            }
+            if (step > 0.12f && step < 1.4f) {
+                float into = vel[0] * dirx + vel[1] * diry;
+                if (into > 0.0f) {
+                    vel[0] -= dirx * into * 0.9f;
+                    vel[1] -= diry * into * 0.9f;
+                    carpos[0] -= dirx * 0.06f; carpos[1] -= diry * 0.06f;
+                    g_hit = 0.3f;
+                    veh_bridge_adopt();
+                }
+            }
+        }
         if (race_state == 1 && !race_auto && !sstatic && world_barrier_push(&world, carpos, 1.3f)) {
             vel[0]*=0.2f; vel[1]*=0.2f; g_hit = 0.5f;
         }
@@ -5014,9 +5188,32 @@ int main(int argc, char **argv) {
         if (!sstatic && !race_auto) {
             ride_nsup = ride_gather(&scene, carpos, heading, &g_dbg.wheel,
                                     &g_sup, ride_hit, ride_cand, ride_reason);
+            /* A CAR SPANS A HOLE (Nik's hardcode, and a sound one: the car
+               only ever jumps vertically and never rolls over, so nothing is
+               lost by refusing crazy supports). If some wheels stand on road
+               and another's query fell into a gap in the mesh -- or onto a
+               surface a storey below -- the body would tip nose-first into
+               the hole and stick there. A real car bridges it on the wheels
+               that DO touch: any support more than 0.7 m below the highest
+               contacted one is not the ground this car is standing on. */
+            {   float zhi = -1e9f; int any = 0;
+                for (int w = 0; w < 4; w++)
+                    if (g_sup.valid[w] && g_sup.z[w] > zhi) { zhi = g_sup.z[w]; any = 1; }
+                if (any)
+                    for (int w = 0; w < 4; w++)
+                        if (g_sup.valid[w] && g_sup.z[w] < zhi - 0.7f)
+                            g_sup.z[w] = zhi - 0.7f;
+            }
             if (!g_ride_ready) { phys_ride_init(&g_ride, &g_sup); g_ride_ready = 1; }
             float zprev = g_ride.z;
             phys_ride_step(&g_ride, &g_sup, 1.0f/60.0f);
+            /* Upright, always: vertical travel is free, the BODY never tips
+               past what suspension geometry could give. Anything beyond a
+               ~7 degree ride tilt is a glitch state, not a stance. */
+            if (g_ride.pitch >  0.12f) { g_ride.pitch =  0.12f; g_ride.pitch_rate = 0.0f; }
+            if (g_ride.pitch < -0.12f) { g_ride.pitch = -0.12f; g_ride.pitch_rate = 0.0f; }
+            if (g_ride.roll  >  0.14f) { g_ride.roll  =  0.14f; g_ride.roll_rate  = 0.0f; }
+            if (g_ride.roll  < -0.14f) { g_ride.roll  = -0.14f; g_ride.roll_rate  = 0.0f; }
             carpos[2] = g_ride.z;
             { static int n=0; if (n<8 && getenv("N2_RIDE_TRACE")) { n++;
                 printf("ride %d: z=%.3f contacts=0x%x sup z=%.3f/%.3f/%.3f/%.3f\n",
@@ -5309,7 +5506,18 @@ int main(int argc, char **argv) {
             /* Body tilt IS the ride pitch/roll -- no second smoothing filter.
                up = world Z tilted back by pitch and toward the low side by roll. */
             float fx=cosf(heading), fy=sinf(heading), lx=-fy, ly=fx;
-            float sp=sinf(g_ride.pitch), sr=sinf(g_ride.roll);
+            /* The ride model answers to the GROUND -- bumps, kerbs, a wheel
+               dropping off a deck. It knows nothing about acceleration, so
+               the car never squatted, never dived under braking and never
+               leaned in a corner: the springs looked welded solid. The
+               dynamics model carries exactly that missing part, so the two
+               add: terrain from below, weight transfer from the driving. */
+            float body_pitch = g_ride.pitch, body_roll = g_ride.roll;
+            if (g_newphys && g_newphys_ok) {
+                body_pitch += veh_bridge_pitch();
+                body_roll  += veh_bridge_roll();
+            }
+            float sp=sinf(body_pitch), sr=sinf(body_roll);
             float u[3] = { -fx*sp - lx*sr, -fy*sp - ly*sr, 1.0f };
             float ul=sqrtf(u[0]*u[0]+u[1]*u[1]+u[2]*u[2]);
             if (ul>1e-6f){ car_up[0]=u[0]/ul; car_up[1]=u[1]/ul; car_up[2]=u[2]/ul; }
@@ -5364,15 +5572,36 @@ int main(int argc, char **argv) {
         }
 
         /* drifting? extend the tyre ribbons + puff smoke at the rear wheels */
-        int drifting = (dmag > PHYS_MAXSPD*0.2f && speed > PHYS_MAXSPD*0.22f);
+        /* Sliding sideways OR spinning the wheels both lay rubber -- a
+           standing burnout leaves the blackest marks of all, and until now
+           only sideways motion counted, so a doughnut drew nothing. */
+        int drifting = (dmag > PHYS_MAXSPD*0.2f && speed > PHYS_MAXSPD*0.22f)
+                     || ((g_newphys && g_newphys_ok)
+                         && fabsf(veh_bridge_slip_ratio()) > 0.35f);
         /* tyre screech scales with how hard the back is sliding */
         g_skid = (race_state==1 && drifting)
                ? (0.12f + 0.45f*(dmag - PHYS_MAXSPD*0.2f)/PHYS_MAXSPD) : 0.0f;
         if (g_skid > 0.35f) g_skid = 0.35f;
         if (drifting) {
-            float rx = carpos[0]-nf[0]*1.6f, ry = carpos[1]-nf[1]*1.6f;
+            /* The marks come off the ACTUAL rear wheels. They were drawn at a
+               hard-coded 1.6 m behind the origin and a full metre out each
+               side -- outside the 350Z's real track, so the rubber floated
+               beside the tyres. The wheel config now carries the record's own
+               axle line and track; use them. */
+            float rax = -g_dbg.wheel.rear_axle;          /* record X is negative */
+            float rht = 0.5f * g_dbg.wheel.rear_track;
+            if (rax < 0.5f || rax > 3.0f) rax = 1.6f;    /* sane fallback */
+            if (rht < 0.4f || rht > 1.2f) rht = 0.8f;
+            float rx = carpos[0]-nf[0]*rax, ry = carpos[1]-nf[1]*rax;
             float rz = carpos[2]+0.05f;
-            float curL[3]={rx+nr[0], ry+nr[1], rz}, curR[3]={rx-nr[0], ry-nr[1], rz};
+            float curL[3]={rx+nr[0]*rht, ry+nr[1]*rht, rz},
+                  curR[3]={rx-nr[0]*rht, ry-nr[1]*rht, rz};
+            /* A segment is only a segment if the wheel actually rolled there:
+               after a respawn or a teleport the previous point is somewhere
+               else entirely, and connecting it drew a single black band tens
+               of metres long across the car park. Lift the pen instead. */
+            if (skidpen && (fabsf(curL[0]-prevL[0]) + fabsf(curL[1]-prevL[1]) > 2.0f))
+                skidpen = 0;
             if (skidpen) {   /* connect last frame's wheel points into ribbon segments */
                 float *seg;
                 seg=skid[skidhead]; seg[0]=prevL[0];seg[1]=prevL[1];seg[2]=prevL[2];
@@ -5457,6 +5686,34 @@ int main(int argc, char **argv) {
             want[0] = carpos[0]-cosf(shotyaw)*g_dbg.chase_distance;
             want[1] = carpos[1]-sinf(shotyaw)*g_dbg.chase_distance;
             want[2] = carpos[2]+g_dbg.chase_height;
+        } else if (g_newcam) {              /* chase, NFSU2-flavoured */
+            /* Which way is the car actually going? Below walking pace the
+               velocity is noise, so ease back onto the nose; in reverse stay
+               behind the nose too (a backing car is watched over its boot). */
+            float vwx = vel[0]*60.0f, vwy = vel[1]*60.0f;
+            float vg = sqrtf(vwx*vwx + vwy*vwy);
+            float along = vwx*fwd[0] + vwy*fwd[1];
+            float az_want = (vg > 2.5f && along > 0.0f)
+                          ? atan2f(vwy, vwx) : heading;
+            if (!g_cam_init) { g_cam_az = heading; g_cam_init = 1; }
+            /* ease the azimuth with wrap; the lag IS the side view */
+            float d_az = az_want - g_cam_az;
+            while (d_az >  3.14159f) d_az -= 6.28318f;
+            while (d_az < -3.14159f) d_az += 6.28318f;
+            g_cam_az += d_az * 0.085f;
+
+            /* distance breathes: further with speed, tucked in on the brakes */
+            float dwant = 5.8f * (1.0f + 0.38f * fminf(vg / 50.0f, 1.0f));
+            if (throttle < -0.05f) dwant = 5.2f;
+            g_cam_dist += (dwant - g_cam_dist) * 0.06f;
+
+            /* FOV opens with speed -- the cheap way to make speed feel fast */
+            float fov_want = 0.88f + 0.24f * fminf(vg / 50.0f, 1.0f);
+            g_fov += (fov_want - g_fov) * 0.05f;
+
+            want[0] = carpos[0] - cosf(g_cam_az) * g_cam_dist;
+            want[1] = carpos[1] - sinf(g_cam_az) * g_cam_dist;
+            want[2] = carpos[2] + 2.35f + 0.35f * fminf(vg / 50.0f, 1.0f);
         } else {                            /* chase: behind + above, tunable */
             want[0] = carpos[0]-fwd[0]*g_dbg.chase_distance;
             want[1] = carpos[1]-fwd[1]*g_dbg.chase_distance;
@@ -5469,7 +5726,8 @@ int main(int argc, char **argv) {
         if (shotyaw < 1e8f) k = 1.0f;   /* capture pose must be exact, not eased */
         for (int c=0;c<3;c++) cam[c] += (want[c]-cam[c])*k;
         static float camtgt[3]; static int camtgt_init = 0;
-        float idealtgt[3] = { carpos[0], carpos[1], carpos[2]+1.5f };  /* car centre, slightly up */
+        float idealtgt[3] = { carpos[0], carpos[1],
+                              carpos[2] + (g_newcam ? 1.15f : 1.5f) };  /* car centre, slightly up */
         if (!camtgt_init) { camtgt[0]=idealtgt[0]; camtgt[1]=idealtgt[1]; camtgt[2]=idealtgt[2]; camtgt_init=1; }
         for (int c=0;c<3;c++) camtgt[c] += (idealtgt[c]-camtgt[c])*k;
         float look[3] = { camtgt[0]-cam[0], camtgt[1]-cam[1], camtgt[2]-cam[2] };
@@ -5624,7 +5882,7 @@ int main(int argc, char **argv) {
         float zfar = g_dbg.fog_density > 1e-5f
                    ? 1.2f * sqrtf(-logf(0.01f)) / g_dbg.fog_density : 2000.0f;
         if (zfar < 500.0f) zfar = 500.0f;
-        mat_persp(0.9f, (float)W/H, znear, zfar, P);
+        mat_persp(g_fov, (float)W/H, znear, zfar, P);
         mat_lookat(cam, look, V);
         mat_mul(P, V, MVP);
         glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
@@ -5657,7 +5915,7 @@ int main(int argc, char **argv) {
                off. */
             float Vsky[16], MVPsky[16], Psky[16];
             mat_lookat(cam, look, Vsky);
-            mat_persp(0.9f, (float)W/H, znear, 30000.0f, Psky);
+            mat_persp(g_fov, (float)W/H, znear, 30000.0f, Psky);
             mat_mul(Psky, Vsky, MVPsky);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPsky);
             glUniform1f(uUnlit, 1.0f);
@@ -5731,7 +5989,7 @@ int main(int argc, char **argv) {
         if (nvista && tier == 2 && g_dbg.show_track && (passmode == 0 || passmode == 1)) {
             const float VISTA_MINCONTRIB = 0.35f;
             float Pv[16], MVPv[16];
-            mat_persp(0.9f, (float)W/H, znear, vista_far, Pv);
+            mat_persp(g_fov, (float)W/H, znear, vista_far, Pv);
             mat_mul(Pv, V, MVPv);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPv);
             float vd = vista_far > 1.0f
@@ -6046,7 +6304,7 @@ int main(int argc, char **argv) {
             glUniform3f(uColor, 0.04f, 0.04f, 0.05f);
             for (int i = 0; i < skidn; i++) {
                 float *s = skid[i];                          /* ax,ay,az, bx,by,bz, life */
-                if (race_state != 3) s[6] -= 0.0018f;        /* ~9s to fade (frozen on menu) */
+                if (race_state != 3) s[6] -= 0.00028f;       /* ~60 s to fade (frozen on menu) */
                 if (s[6] <= 0.0f) continue;
                 float dx=s[3]-s[0], dy=s[4]-s[1];            /* segment direction */
                 float len2=sqrtf(dx*dx+dy*dy); if(len2<1e-4f) continue;
@@ -6300,22 +6558,35 @@ int main(int argc, char **argv) {
                             glBindTexture(GL_TEXTURE_2D, tex);
                         } else glUniform1f(uUseTex, 0.0f);
                     }
-                } else if (tex) {
-                    glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, tex);  /* wheel/brake */
                 } else {
-                    glUniform1f(uUseTex, 0.0f);
-                    if      (c == N2_CAR_LIGHT)      glUniform3f(uColor, 1.0f, 0.94f, 0.78f);  /* headlight ON: warm emissive lens */
+                    /* Emissive colour FIRST, texture second: the shared lamp
+                       textures are greyscale masks (BRAKE_GLOBAL averages
+                       60/60/59), carrying the shape of the lens, not its
+                       colour. The old order bound the mask and left uColor at
+                       whatever the previous mesh set -- a red tail lamp came
+                       out grey. And a mask averaging a quarter of full scale
+                       dims the lens four-fold, so a textured lens gets the
+                       colour scaled back up to read at the same brightness as
+                       a plain one. */
+                    int braking = (throttle < -0.1f && speed > 0.01f) || handbrake;
+                    if      (c == N2_CAR_LIGHT)      glUniform3f(uColor, 1.0f, 0.94f, 0.78f);
                     else if (c == N2_CAR_BRAKELIGHT) {
-                        /* lens glows hot while braking (S, rolling forward) or the
-                           handbrake (SPACE) is pulled; otherwise a dim red running
-                           light (still emissive, so it reads as "on" at night). */
-                        int braking = (throttle < -0.1f && speed > 0.01f) || handbrake;
                         if (braking) glUniform3f(uColor, 1.0f, 0.16f, 0.10f);
                         else         glUniform3f(uColor, 0.62f, 0.05f, 0.04f);
                     }
                     else if (c == N2_CAR_TIRE)       glUniform3f(uColor, 0.05f, 0.05f, 0.06f);
                     else if (c == N2_CAR_MECH)       glUniform3f(uColor, 0.05f, 0.05f, 0.05f);  /* unpainted metal/plastic */
-                    else                              glUniform3f(uColor, pnt[0], pnt[1], pnt[2]);
+                    else if (!tex)                   glUniform3f(uColor, pnt[0], pnt[1], pnt[2]);
+
+                    if (tex) {
+                        if (is_light) {
+                            float bo = 3.5f;
+                            if (c == N2_CAR_LIGHT)  glUniform3f(uColor, 1.0f*bo, 0.94f*bo, 0.78f*bo);
+                            else if (braking)       glUniform3f(uColor, 1.0f*bo, 0.16f*bo, 0.10f*bo);
+                            else                    glUniform3f(uColor, 0.62f*bo, 0.05f*bo, 0.04f*bo);
+                        }
+                        glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, tex);
+                    } else glUniform1f(uUseTex, 0.0f);
                 }
 #ifdef DEBUG_UI
                 /* Mesh Inspector overlay: purely a draw-state override on the

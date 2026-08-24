@@ -8,6 +8,7 @@
  *   +0x110  start of the parameters; the offsets below are from there. */
 #define CAR_RECORD       0x890
 #define CAR_TABLE_MAGIC  0x00034600u
+#define P_COM            0x000   /* centre of mass X (fwd), Y, Z (height) */
 #define P_WHEEL          0x010   /* 4 x 0x30: pos[3], radius, width */
 #define P_TYRE           0x0D0   /* 2 x 0x20: one per axle          */
 #define P_MASS           0x110   /* mass, then length/width/height  */
@@ -70,6 +71,8 @@ int n2_car_setup_load(N2CarSetup *I, const unsigned char *d, long len,
         const unsigned char *P = rec + 0x110;
         N2CarSetup s;
         memset(&s, 0, sizeof s);
+
+        for (int k = 0; k < 3; k++) s.com[k] = rd_f(P + P_COM + k * 4);
 
         for (int i = 0; i < 4; i++) {
             const unsigned char *w = P + P_WHEEL + i * 0x30;

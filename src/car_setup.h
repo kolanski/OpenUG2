@@ -27,8 +27,14 @@ typedef struct {                 /* one per wheel */
 
 typedef struct {                 /* one per axle */
     float slip_angle_deg;        /*   slip angle at which grip breaks away */
-    float ref_load;
-    float lateral_scale;
+    float ref_load;              /*   fixed reference load, kN per wheel: the
+                                      load the quoted grip belongs to. Grip is
+                                      sub-linear in load -- an axle pressed
+                                      past this reference saturates, a lighter
+                                      one keeps relatively more -- and this is
+                                      the pivot of that curve (1.0 across the
+                                      shipped fleet) */
+    float lateral_scale;         /*   multiplier on the lateral force */
     float mu_static;             /*   gripping */
     float mu_slide;              /*   sliding; the gap between the two is
                                       what makes a slide a slide */
@@ -79,6 +85,9 @@ typedef struct {
 } N2AeroSpec;
 
 typedef struct {
+    float com[3];                /* centre of mass in body axes; Z is its
+                                    height above the contact patch -- the
+                                    game's own load-transfer lever arm */
     float mass;                  /* tonnes */
     float dims[3];               /* L, W, H */
     float inertia[3];            /* diagonal of the inertia tensor */
