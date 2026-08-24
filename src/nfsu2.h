@@ -1449,34 +1449,61 @@ static float n2_bbox_overlap(const float *a, const float *b) {
  * proved why neither alone is safe:
  *   - name alone is wrong: truncation makes L/R pairs collide (LANCEREVO8 and
  *     IMPREZAWRX both have SIX meshes reading "..._KIT00_HEADLIGHT_"), and on
- *     HUMMER/GOLF/MUSTANGGT/NAVIGATOR some same-named DOOR_PANEL / DOOR_SILL /
+ *     on several cars some same-named DOOR_PANEL / DOOR_SILL /
  *     BRAKELIGHT nodes are distinct parts sitting apart. Deduping those by
  *     name would delete real geometry. The overlap gate keeps them: the
  *     anchor only absorbs meshes sharing its space, so the right-hand
  *     headlight simply starts its own group.
  *   - file order is wrong: keeping the first occurrence loses detail, because
  *     the tiers are NOT always stored best-first. Seven parts across the fleet
- *     (GOLF/PEUGOT/RSX roofs, CIVIC/RX8 brakelights, SUPRA/FOCUS skirts) store
+ *     (roofs, brake lights and skirts on a number of cars) store
  *     a later tier with MORE vertices than the one named _A.
- * Hence: group spatially, then keep max vertex count. */
+ * Hence: group spatially, then keep the tier with the most detail.
+ *
+ * The unit of the decision is the PART, not the mesh: a part is split into one
+ * mesh per material, and two tiers of the same part need not split the same
+ * way. Comparing meshes individually drops a slice the winning tier has no
+ * counterpart for, and the bodywork ends up with holes in it. So slices are
+ * grouped by part name, tiers are compared by their total vertex count, and
+ * the losing tiers go out whole. */
 #define N2_LOD_OVERLAP 0.4f
 static void n2_car_dedupe_lod(N2Scene *s) {
     int n = s->count;
     if (n < 2) return;
     float (*bb)[6] = (float (*)[6])malloc((size_t)n * sizeof *bb);
     char *drop = (char *)calloc((size_t)n, 1);
-    if (!bb || !drop) { free(bb); free(drop); return; }   /* OOM: keep everything */
+    char *done = (char *)calloc((size_t)n, 1);
+    if (!bb || !drop || !done) { free(bb); free(drop); free(done); return; }
     for (int i = 0; i < n; i++) n2_mesh_bbox(&s->meshes[i], bb[i]);
+
     for (int i = 0; i < n; i++) {
-        if (drop[i] || !s->meshes[i].namekey) continue;
-        int best = i;                       /* i stays the spatial anchor */
-        for (int j = i + 1; j < n; j++) {
-            if (drop[j] || s->meshes[j].namekey != s->meshes[i].namekey) continue;
+        if (done[i] || drop[i] || !s->meshes[i].namekey) continue;
+
+        /* This family: same key, sharing the anchor's space. */
+        int member[256], nmem = 0;
+        member[nmem++] = i; done[i] = 1;
+        for (int j = i + 1; j < n && nmem < 256; j++) {
+            if (done[j] || drop[j]) continue;
+            if (s->meshes[j].namekey != s->meshes[i].namekey) continue;
             if (n2_bbox_overlap(bb[i], bb[j]) < N2_LOD_OVERLAP) continue;
-            if (s->meshes[j].nverts > s->meshes[best].nverts) { drop[best] = 1; best = j; }
-            else drop[j] = 1;
+            member[nmem++] = j; done[j] = 1;
         }
+        if (nmem < 2) continue;
+
+        /* Score each tier by all of its slices together. */
+        long best_score = -1; const char *best_name = s->meshes[i].aname;
+        for (int a = 0; a < nmem; a++) {
+            const char *name = s->meshes[member[a]].aname;
+            long score = 0;
+            for (int b = 0; b < nmem; b++)
+                if (!strcmp(s->meshes[member[b]].aname, name))
+                    score += s->meshes[member[b]].nverts;
+            if (score > best_score) { best_score = score; best_name = name; }
+        }
+        for (int a = 0; a < nmem; a++)
+            if (strcmp(s->meshes[member[a]].aname, best_name)) drop[member[a]] = 1;
     }
+
     int w = 0;
     for (int i = 0; i < n; i++) {
         if (drop[i]) { free(s->meshes[i].verts); free(s->meshes[i].idx); continue; }
@@ -1484,8 +1511,9 @@ static void n2_car_dedupe_lod(N2Scene *s) {
         w++;
     }
     s->count = w;
-    free(bb); free(drop);
+    free(bb); free(drop); free(done);
 }
+
 
 /* Plastic trim within N2_CAR_BODY: bumpers and rocker skirts are moulded
  * polyurethane, not the metal body shell, and carry their own name tokens
