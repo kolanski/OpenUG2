@@ -2674,7 +2674,15 @@ int main(int argc, char **argv) {
         printf("\n");
     }
     static N2LightSrc lsrc[16384]; int nlsrc = 0; /* district light sources */
-    GLuint tex_glow = 0;                          /* SFX_FLARE_GLOWA: the halo */
+    GLuint tex_glow = 0;                          /* SFX_FLARE_GLOWA: the lamp halo */
+    /* SHARED LIGHT TEXTURES. Headlight and tail-light meshes name texture keys
+       that exist in no texture pack at all. They are not meant to be resolved
+       that way: the game binds these BY NAME from the global bundle and plugs
+       them straight into the shader.
+         HEADLIGHTS    128x64   uncompressed BGRA
+         BRAKE_GLOBAL  128x128  DXT1, with BRAKE_GLOBAL_LEFT beside it
+         HEADLIGHTGLOW          the glow around a lit lamp */
+    GLuint tex_headlights = 0, tex_brake = 0, tex_brake_l = 0, tex_hlglow = 0;
     static uint32_t tmapkey[2048]; static GLuint tmaptex[2048];
     int ntmap = world_bind_textures(&world, tmapkey, tmaptex, 2048);
     printf("track textures bound: %d distinct\n", ntmap);
@@ -2991,6 +2999,24 @@ int main(int argc, char **argv) {
            says instead of by per-class constants. */
         nlmat = n2_load_lightmats(globdata, globlen, lmat, 256);
         if (nlmat) printf("material records: %d\n", nlmat);
+
+        {   N2Tpk gt = n2_tpk_open(globdata, globlen);
+            struct { uint32_t key; GLuint *dst; const char *nm; } need[] = {
+                { 0x28eefa9cu, &tex_headlights, "HEADLIGHTS"        },
+                { 0x17f9f794u, &tex_brake,      "BRAKE_GLOBAL"      },
+                { 0x85e9c79eu, &tex_brake_l,    "BRAKE_GLOBAL_LEFT" },
+                { 0x3394fe62u, &tex_hlglow,     "HEADLIGHTGLOW"     },
+            };
+            for (int q = 0; q < 4; q++) {
+                N2Tex t; memset(&t, 0, sizeof t);
+                if (n2_tpk_decode(globdata, globlen, gt, need[q].key, &t)) {
+                    *need[q].dst = upload_tex(&t);
+                    printf("texture %s: %dx%d\n", need[q].nm, t.w, t.h);
+                    free(t.rgb); free(t.alpha); free(t.dxt);
+                } else printf("texture %s failed to decode\n", need[q].nm);
+            }
+            free(gt.blk);
+        }
 
         int wheel_from_global = 0;
         g_dbg.wheel = wheel_config_for(carname, &carprof, globdata, globlen, &wheel_from_global);
@@ -5432,6 +5458,14 @@ int main(int argc, char **argv) {
            road black. Off at the top of every frame, on only where a submesh
            names a material. */
         glUniform1f(rp.uMatOn, 0.0f);
+        /* And the flat-colour flags, for the same reason: the billboard passes
+           (shadow, lamp halos, glow quads, HUD) all raise them deliberately,
+           and any one of them left raised sends the whole next frame down the
+           shader's unlit early-return -- no texturing, no specular, no
+           reflection. It reads as "the lighting turned off". */
+        glUniform1f(rp.uUnlit, 0.0f);
+        glUniform1f(rp.uSoft, 0.0f);
+        glUniform1f(rp.uAlpha, 1.0f);
         glUniform3f(rp.uFogColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b);
         glUniform1f(rp.uFogDensity, g_dbg.fog_density);
         glUniform1f(rp.uUVCheck, (float)g_dbg.show_uv_checker);
@@ -5936,6 +5970,16 @@ int main(int argc, char **argv) {
                 glUniform1f(rp.uEnvCubeOn, 1.0f);
                 glUniform1f(rp.uEnvYaw, heading);
             }
+            /* uUnlit/uSoft are left ON (1.0) by the shadow, headlight-glow
+               and skid-mark billboards drawn just above -- all three
+               deliberately use the unlit flat-colour path for those quads.
+               Without resetting them here every car mesh below hits the
+               shader's unlit early-return and skips texture sampling, decal
+               blending, specular AND environment mapping entirely. One leaked
+               uniform is enough to keep every lit-path feature off the screen:
+               gloss, badges and reflections all vanish at once, which looks
+               exactly like "the lighting switched off". */
+            glUniform1f(uUnlit, 0.0f); glUniform1f(uSoft, 0.0f);
             float *pnt = g_dbg.paint_override ? g_dbg.paint : paint;
             /* uUnlit/uSoft were left ON (1.0) by the shadow/headlight-glow/
                skid-mark billboards drawn just above (all three intentionally
@@ -6016,6 +6060,23 @@ int main(int argc, char **argv) {
                 GLuint tex = 0; int hasalpha = 0;
                 for (int j = 0; j < nmap; j++) if (mapkey[j]==cgm[i].texkey) {
                     tex = maptex[j]; hasalpha = mapalpha[j]; break; }
+                /* SHARED LAMP TEXTURE, bound by name. The key these parts
+                   carry resolves nowhere, and is not meant to.
+                   It belongs to the LENS, and only the lens is unwrapped for
+                   it. A light part also contains its housing and the body
+                   slice around it, which carry the same class but ordinary
+                   body UVs -- putting the lamp texture on those samples it at
+                   meaningless coordinates and the panel comes out dark. So it
+                   is bound only where the material says glass; everything else
+                   takes the flat emissive colour.
+                   The sheets are greyscale masks -- BRAKE_GLOBAL averages
+                   60/60/59 -- so they carry the SHAPE of the lens, not its
+                   colour: the emissive colour has to survive and the texture
+                   multiplies it. */
+                int lens = (cgm[i].matkey == n2_str_hash("HEADLIGHTGLASS") ||
+                            cgm[i].matkey == n2_str_hash("BRAKELIGHTGLASS"));
+                if (!tex && lens && c == N2_CAR_LIGHT)      tex = tex_headlights;
+                if (!tex && lens && c == N2_CAR_BRAKELIGHT) tex = tex_brake;
                 if (c == N2_CAR_BODY || c == N2_CAR_MISC) {
                     /* glossy paint; a mesh that references the badge/vinyl
                        atlas in its OWN 0x134012 slot list (a real per-mesh
