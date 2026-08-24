@@ -1,7 +1,9 @@
-# NFS: Underground 2 — file format notes
+# NFS: Underground 2 — file format reference
 
-Reverse-engineered from the retail PC data files. Enough to load geometry,
-textures and racing lines. All integers are little-endian.
+Clean-room interoperability notes for the retail PC data files. This document
+records the layouts that OpenUG2 currently consumes, the evidence behind each
+claim, and the source function that implements it. All integers are
+little-endian unless a section explicitly says otherwise.
 
 > These are independent, clean-room notes on the *layout* of a game's data
 > files, produced for interoperability (reading data you already own), in the
@@ -9,6 +11,39 @@ textures and racing lines. All integers are little-endian.
 > assets. "Need for Speed" and "Underground" are trademarks of Electronic Arts;
 > this project is unaffiliated with and unendorsed by EA. See the README's
 > Legal Notice & Disclaimer.
+
+## How to read this document
+
+Every non-trivial claim belongs to one of three evidence levels:
+
+- **PROVEN** — byte layout and meaning agree across multiple records or files,
+  and a production parser/test exercises the relationship end to end.
+- **PLAUSIBLE** — the values are consistent and useful, but no structural link
+  or independent cross-check proves the field's meaning yet.
+- **UNKNOWN** — bytes or a relationship exist, but assigning semantics would be
+  guesswork. Unknown fields must stay unknown in code and documentation.
+
+Offsets are relative to the payload of the chunk or record being described,
+not to its 8-byte chunk header. Examples below are synthetic: do not paste
+retail bytes, extracted asset tables, executable output, or disassembly into the
+repository. When a new fact is proven, update both this file and the parser
+guard that makes the assumption safe.
+
+### Implementation map
+
+| data | production reader | owner after parsing |
+|---|---|---|
+| generic chunks, track/car meshes, TPK, codecs | `src/nfsu2.h` | `N2Scene`, `N2Tex`, `N2Path` |
+| region loading, events, nav, ground/contact | `src/world.c` | `World` |
+| file mapping and content discovery | `src/resource.c` | caller |
+| car axle/track anchors in `GLOBALB.BUN` | `n2_global_wheel_attr` in `src/nfsu2.h` | `N2WheelAttr` |
+| generic `0x00135200` attribute records | `src/attrib.h` | diagnostic `N2Attrib` view |
+| ABK, Ginsu and XAS audio | `src/audio.c` | `EngineAudio` and decoded PCM |
+
+The parser is deliberately defensive. A format observation is not permission
+to index unchecked data: validate the chunk boundary, filler, record stride,
+index range, material slot, allocation, and output count before emitting a
+runtime object.
 
 ## Chunk container (`.BIN` / `.BUN`)
 
@@ -25,56 +60,177 @@ u8  payload[size]
   is itself a sequence of nested chunks; recurse into `[payload, payload+size)`.
 - otherwise → an opaque leaf chunk identified by its 32-bit id.
 
-## Track / scenery geometry (`TRACKS/STREAM*.BUN`, family `0x134xxx`)
+**PROVEN parser rule.** Container recursion is a property of the magic's high
+nibble, not of a filename or a hard-coded parent list. A safe walker is:
 
-The big `STREAM*.BUN` files hold the visible world. The small per-region
-`L4R*.BUN` files are mostly metadata/VFX/gameplay, **not** the render mesh.
-
+```c
+walk(data, begin, end):
+    off = begin
+    while off + 8 <= end:
+        id   = read_u32le(data + off)
+        size = read_u32le(data + off + 4)
+        body = off + 8
+        if body + size < body || body + size > end: stop_as_malformed()
+        if id == wanted_leaf: consume(body, size)
+        else if id != 0 && (id >> 28) == 8: walk(data, body, body + size)
+        off = body + size
 ```
-0x80134000  object
-  0x80134010  mesh   (one material)
-    0x00134011   material (name string, e.g. TRN_ROADA_CHOP_*, TRN_TERRAINA_*)
-    0x80134100  geometry
-      0x00134900   header/counts
-      0x00134B01   vertex buffer   (see below)
-      0x00134B02   submesh table
-      0x00134B03   index buffer    (u16 triangle list)
+
+The production helper is `n2_find_leaves`. It follows this traversal but the
+current implementation still trusts a measured retail chunk size against its
+parent end; that is a known hardening gap, not a contract to copy. New readers
+must keep the explicit overflow/bounds check. Never search beyond the current
+container merely because a magic value happens to occur in texture pixels or
+compressed data.
+
+## Track and car geometry (family `0x134xxx`)
+
+The large `TRACKS/STREAM*.BUN` files hold renderable world geometry. The small
+per-region `TRACKS/L4R*.BUN` companions hold gameplay/script definitions and
+are not substitutes for the STREAM mesh. Car geometry uses the same object
+family in `CARS/<NAME>/GEOMETRY.BIN`, with a different vertex stride.
+
+```text
+0x80134000  object collection
+  0x80134010  drawable object
+    0x00134011  object/material header: asset name and world matrix
+    0x00134012  positional texture-slot list
+    0x80134100  geometry container
+      0x00134900  header/counts (not required by the current extractor)
+      0x00134B01  vertex buffer
+      0x00134B02  material/index-range table
+      0x00134B03  u16 triangle index buffer
 ```
 
-**Vertex buffer (`0x134B01`).** A run of `0x11` filler bytes prefixes the data
-(scan until the byte value stops being `0x11`). Two vertex layouts:
+One `0x80134010` is an authored object, not necessarily one runtime draw. If
+its `0x134B02` records select different texture slots, OpenUG2 emits one
+`N2Mesh` per validated index range.
 
-| asset | stride | layout |
-|-------|--------|--------|
-| scenery (STREAM) | **24 B** | `pos: f32[3]`, `color: u32 ARGB`, `uv: f32[2]` |
-| car parts        | **36 B** | `pos: f32[3]`, `normal: f32[3]`, `color: u32`, `uv: f32[2]` |
+### `0x134011`: name and placement
 
-**Object placement matrix (`0x134011 +0x40`, verified 2026-07).** After the
-header's own `0x11` filler, offset `+0x40` holds a 4x4 `f32` world transform.
-Layout is the **D3D row-vector convention: basis rows at floats 0-2 / 4-6 /
-8-10, translation at floats 12-14, `m[15] == 1`** — byte-identical to an
-OpenGL column-major matrix, so the array is applied as-is
-(`world = v.x*m[0..2] + v.y*m[4..6] + v.z*m[8..10] + m[12..14]`), no
-transposition. Audited with `tools/props_audit.py` across L4RH + L4RB
-(2817 objects): road/terrain chunks carry an **identity** matrix (their
-vertices are already world-space); props/buildings (`XO_*`, `XB_*`, `XU_*`)
-carry a real placement (all 1094 rotations orthonormal to 1e-3; reading the
-transpose instead yields zero translation for every object, i.e. everything
-would pile at the origin). Every object has exactly **one** `0x134011`
-header, so one matrix per object is safe. Objects (props + skydome) can
-appear **twice** in a file with identical data — harmless to draw (equal
-depth), just redundant.
+**PROVEN.** After the leaf's own `0x11` filler, `+0x40` holds a 4x4 `f32`
+affine transform. Basis vectors occupy floats 0–2, 4–6 and 8–10; translation is
+floats 12–14; a sane affine record has `m[15]` near 1.
 
-**Submesh table (`0x134B02`).** 60-byte records, the index buffer consumed in
-order: `bbox_min: f32[3]`, `idx_count: u32`, `bbox_max: f32[3]`,
-`mat_id: u32`, `flag: u32 (0xff)`, 24 B reserved.
+```c
+world.x = x*m[0] + y*m[4] + z*m[8]  + m[12];
+world.y = x*m[1] + y*m[5] + z*m[9]  + m[13];
+world.z = x*m[2] + y*m[6] + z*m[10] + m[14];
+```
 
-**Material chain.** `submesh.mat_id` → `0x134003` hash list → a `0x134011`
-material record carrying a texture name/hash.
+The 16-float array is byte-compatible with the column-major matrix convention
+used by the renderer; do not transpose it. Terrain/road vertices are commonly
+already in world space and therefore carry identity. Placed buildings and props
+carry local vertices plus a non-identity transform. Production reader:
+`n2_obj_matrix`.
+
+The same leaf contains an ASCII asset/material name. The parser scans a bounded
+name run rather than assuming a universal offset. This name drives two distinct
+classifications:
+
+- draw/contact category: road, terrain, sky, glow or other;
+- scenery semantics in `N2Mesh.scen`: terrain, building, prop, tree, wall,
+  structure or other.
+
+Known paved exceptions are deliberate: `TRN_RDP*` and `TRN_CONCRETE*` are
+classified as road before the generic `TRN*` terrain rule. Names help select
+behaviour; they are not placement records.
+
+### `0x134B01`: vertex buffers
+
+A filler prefix precedes the records. World/car vertex leaves use a byte run of
+`0x11`; index and submesh leaves require paired `0x1111` words so the first
+real data byte cannot be consumed accidentally.
+
+| asset | stride | offsets |
+|---|---:|---|
+| STREAM scenery | 24 B | position `f32[3] @+0`; prelight RGBA8 `@+12`; UV `f32[2] @+16` |
+| car part | 36 B | position `f32[3] @+0`; normal `f32[3] @+12`; colour `u32 @+24`; UV `f32[2] @+28` |
+
+OpenUG2 stores parsed vertices as five floats `{x,y,z,u,v}`. World prelight is
+retained separately as four bytes per vertex. Source indices remain `u16`.
+
+**Corrupt-vertex recovery (PROVEN parser robustness, not a new file field).**
+Some otherwise valid world objects contain isolated NaN or approximately
+`1e38` positions. `n2_add_pair` marks any vertex outside ±60,000 m or NaN,
+drops only triangles referencing it, and parks unused corrupt vertices on a
+known-good point so bounds and GPU batches cannot inherit the spike. If every
+vertex or every triangle is invalid, the mesh is rejected. The bad-vertex mask
+must survive until triangle filtering and repair are complete; reconstructing
+it from transformed X alone is incorrect.
+
+### `0x134B02`: submesh/material ranges
+
+**PROVEN layout.** After paired `0x1111` filler, the leaf is an array of
+60-byte records:
+
+| offset | type | meaning |
+|---:|---|---|
+| `+0x00` | `f32[3]` | local range bounding-box minimum |
+| `+0x0c` | `u32` | index count |
+| `+0x10` | `f32[3]` | local range bounding-box maximum |
+| `+0x1c` | `u32` | material slot id |
+| `+0x20` | `u32` | render-state flag; semantics still **UNKNOWN** |
+| `+0x24` | 16 B | unknown/reserved |
+| `+0x34` | `u32` | index start |
+
+The start/count ranges are measured in `u16` indices after index-leaf filler.
+For the simple production path they must start at zero, form a contiguous chain,
+contain at least one triangle each, stay inside `0x134B03`, and end at the last
+whole triangle. One spare alignment index is allowed; a two-index tail is not.
+`n2_mesh_submeshes` currently accepts exactly one submesh leaf whose body is a
+multiple of 60.
+
+### `0x134012`: positional texture slots
+
+The leaf contains 8-byte entries:
+
+```text
++0 u32 texture key
++4 u32 zero/unknown
+```
+
+`submesh.mat_id` is a positional index into this list. No intermediate
+`0x134003` lookup is required by the proven path. A synthetic example:
+
+```text
+slots:  [0]=0x11111111  [1]=0x22222222  [2]=0x33333333
+ranges: {start=0,count=48,mat=1}, {start=48,count=9,mat=2}
+result: first 16 triangles use slot 1; final 3 triangles use slot 2
+```
+
+For world road/terrain, structurally valid records are emitted per range. A key
+available in the region/shared TPK wins; an unavailable key falls back only for
+that range. A malformed object falls back to the legacy one-key whole-object
+path rather than partially dropping geometry.
+
+Cars use the same linkage when multiple records resolve to different textures.
+This matters for small badge/light slices embedded in a large paint panel. If
+all records resolve to the same key, the car remains one draw to avoid a
+pixel-identical draw-call increase. Implementation: `n2_mesh_texslots`,
+`n2_mesh_submeshes`, `n2_walk_meshes`, and `n2_walk_car`.
+
+### Object identity, duplicates and vista objects
+
+The STREAM bundles are overlapping route/event working sets, not adjacent
+open-world tiles. `--track ALL` blindly unions incompatible supersets and is
+not evidence of correct world composition. `world_dedup` removes exact
+same-place duplicates using texture key, six-axis bounds, triangle count and
+vertex count before bounds, ground grids and GPU batches are built.
+
+`PAN_*`, measured `TRN_PANARAMA*`, and `*_WORLD_LOD` sheets are authored
+vista/impostor geometry. They are routed to `World.vista`, never to the
+ordinary collision/ground scene. Production `--tier ordinary` does not batch
+or draw them; the common texture-binding pass may still resolve a vista key
+before the tier gate. `--tier full` is experimental because some shipped
+sheets are fully opaque and still form hard horizon bands.
 
 ## Textures
 
-Two container variants, both DXT-compressed S3TC.
+Two TPK container variants are used. World textures may be P8, DXT1 or DXT3;
+car textures may be raw BGRA, DXT1, DXT3 or DXT5 after decompression. Decoders
+populate `N2Tex.rgb` and retain a separate alpha plane only when at least one
+pixel is not fully opaque.
 
 **Track TPK (uncompressed table).** Header block `0xb3310000` holds fixed
 `0x7c`-byte records. The record is the NFSU2 texture header (per the Nikki
@@ -103,45 +259,73 @@ record, not the (always-0) compression byte:
 - **DXT1 / DXT3** (no palette) — inferred from `Size` (DXT3 base `= W·H`, DXT1
   `= W·H/2`).
 
-Track meshes bind textures exactly like cars: the `0x134012` slot list's key →
-a TPK record `BinKey`. Each region's own `STREAM*.BUN` TPK carries its
+Alpha semantics are format-specific and **PROVEN** by A/B renders:
+
+- P8 palette entries are RGBA and palette byte 3 is alpha.
+- DXT1 is transparent only in the `c0 <= c1` mode and only for selector 3.
+- DXT3 carries an explicit 4-bit alpha value per pixel.
+- An all-255 decoded plane is discarded, preserving the opaque RGB upload path.
+
+Track meshes bind `0x134012` slot keys to TPK `BinKey` values. Each region's
+own `STREAM*.BUN` TPK carries its
 grass/road/prop textures (names vary per region: `TRN_GRASSC` vs
 `ORG_GRASS_001`, `RDP_PARKING…` vs `RDP_AIRPORT_ROADPATCH_A`), and the shared
 `TRACKS/LOC4DYNTEX.BIN` (a compressed offset-slot TPK, same format as car
 TEXTURES.BIN) holds the sky + facade textures.
+
+A STREAM file can contain many header/data pairs. `n2_tpk_open` records every
+`0xb3310000` header and the following `0x33320002` data base once; lookups
+then search those blocks without rescanning the file. World texture resolution
+is region-local first, then shared packs. The region file buffers remain owned
+by `World` until `world_bind_textures` finishes decoding and GPU upload.
 
 **Car TPK (`CARS/*/TEXTURES.BIN`, compressed).** Same outer container
 (`0xb3300000` → `0xb3310000` header + `0xb3320000` pixels). The header block
 has three sub-chunks: `0x33310001` (info), `0x33310002` (hash table),
 `0x33310003` (**offset-slot table**, 24-byte records):
 
-```
-u32 Key            // texture hash
-i32 AbsoluteOffset // FILE-absolute offset of the compressed block
-i32 EncodedSize
-i32 DecodedSize
-i16 RefCount
-i32 Unknown
+```text
++0x00 u32 Key
++0x04 u32 AbsoluteOffset  // file-absolute compressed block
++0x08 u32 EncodedSize
++0x0c u32 DecodedSize
++0x10 u32 HeaderFromEnd
++0x14 u32 Unknown
 ```
 
-Each block at `AbsoluteOffset` is **JDLZ**-compressed (EA's LZ; header
-`"JDLZ"`, `u32 decodedSize @+8`, `u32 encodedSize @+12`). Decompress to get the
-raw DXT pixels directly (no per-texture header) — **DXT1 or DXT3** (DXT3 =
-16-byte blocks: 8-byte 4-bit explicit alpha + 8-byte DXT1 colour). The format
-isn't stored, so infer it: the textures are **square**, and only one
-`(side, format)` makes a full mip chain sum to `DecodedSize` (DXT1 base
-`W·H/2`, DXT3 base `W·H`, each mip ≈ ¼ the last). E.g. a HUMMER body detail
-atlas is `21980 → 128×128 DXT3`; its wheel is `11068 → 128×128 DXT1`.
+The field at slot `+0x10` was previously called `RefCount`; that is wrong.
+It is `HeaderFromEnd`. After decode:
+
+```text
+P = DecodedSize - HeaderFromEnd + 0x88
+P+0x00  u32 key             // must equal the slot key
+P+0x20  u16 width
+P+0x22  u16 height
+P+0x26  u8  compression     // 0x20 BGRA, 0x22 DXT1, 0x24 DXT3, 0x26 DXT5
+```
+
+Most blocks at `AbsoluteOffset` are **JDLZ** compressed (header `"JDLZ"`,
+decoded size at `+8`, encoded size at `+12`). Some are a 16-byte `"HUFF"`
+wrapper around an EAC Huffman stream. The embedded header, not a guessed square
+size, selects dimensions and compression. The full compressed mip chain is
+retained for the GPU fast path when possible; RGB(A) is always decoded as the
+portable fallback. Production reader: `n2_load_car_tex_by_key`.
 
 ## Car material → texture binding (`GEOMETRY.BIN`)
 
 Each car mesh (`0x80134010`) carries, alongside its `0x134011` **material**
 record (part name + a bounding box + a transform), a `0x134012` **texture-slot
-list**: 8-byte entries `u32 key, u32 0`. A mesh lists several slot hashes
-(diffuse / normal / spec / …); the one whose `key` is present in the car's TPK
-offset-slot table is that mesh's **diffuse** — bind it and sample via the
-mesh's UVs. (A HUMMER references only ~6 of its 58 TPK textures this way: one
-body atlas across 105 body meshes, plus wheel / brake / engine.)
+list**: 8-byte entries `u32 key, u32 0`. The slot index is significant:
+`0x134B02.mat_id` selects it positionally. If records select different keys,
+the object is split into per-range draws; this prevents a tiny badge or light
+atlas from being painted over an entire body panel. If the linkage is absent or
+all records resolve to one key, the whole-object path is retained.
+
+Not every listed key is guaranteed to be present in that car's TPK. The
+production path intersects slots with `n2_car_tex_keys`, validates every range,
+and keeps the dominant material slice's part-family key so LOD deduplication
+still chooses one authored tier. A zero/unresolved small slice is allowed to
+remain untextured; inventing a texture would be less accurate than the data.
 
 The hashes are the standard **NFS "bin" hash** of the asset name:
 
@@ -149,21 +333,54 @@ The hashes are the standard **NFS "bin" hash** of the asset name:
 h = 0xFFFFFFFF;  for each byte c of the name:  h = h*0x21 + c   (mod 2^32)
 ```
 
-Verified: the material's part-name hash at `0x134011 +0x10` equals
-`binhash("HUMMER_BASE_A") = 0xEE913807`. The same hash keys the TPK slots, so a
-material→texture link needs no name strings — just the `0x134012` slot list
-intersected with the TPK keys.
+The same hash function is used throughout the asset system, but do not infer
+that every adjacent hash is a diffuse key. The **proven** texture relationship
+is `0x134B02.mat_id -> 0x134012[mat_id].key -> TPK slot key`. Part names and
+their hashes instead drive part identity, LOD grouping and customization-family
+selection in `n2_walk_car`, `n2_car_dedupe_lod` and
+`n2_car_apply_config`.
+
+### Car configuration and external part libraries
+
+`KIT00` is the stock whole car. Higher `KITnn` groups contain only the part
+families overridden by that body kit; dropping `KIT00` would remove most of the
+vehicle. Hood alternatives use `STYLEnn` and override the stock `KIT00_HOOD`.
+Spoilers and wheels are separate `CARS/SPOILER` and `CARS/WHEELS` libraries,
+not variants embedded in the selected car's `GEOMETRY.BIN`.
+
+The parser derives three identities from the part name:
+
+- `namekey`: trailing LOD suffix removed;
+- `vkind/vnum`: `KITnn` or `STYLEnn` variant;
+- `famkey`: variant token also removed, so replacement and stock family match.
+
+This is why an apparently duplicated car object must not be discarded before
+configuration and LOD selection have run.
 
 ## Racing lines & circuits (`TRACKS/ROUTES*/Paths*.bin`)
 
 Container `0x80034147` → children `0x34148/49/4a/4c/4d`. Chunk **`0x34148`** is
-the racing line: **24-byte records**, `x: f32 @+0`, `y: f32 @+4`, then unknown
-fields (a 2D centreline; positions share the STREAM world coordinate system).
+the racing line/navigation record: **24-byte records**:
+
+| offset | type | status |
+|---:|---|---|
+| `+0x00` | `f32 x` | **PROVEN**, STREAM world X |
+| `+0x04` | `f32 y` | **PROVEN**, STREAM world Y |
+| `+0x08` | two `u16` values | segment flags/class, detailed semantics **UNKNOWN** |
+| `+0x0c`, `+0x0e`, `+0x10` | `u16` links, `0xffff` absent | structurally observed; not consumed by the current route loader |
+| `+0x14` | `f32` | cumulative segment distance, **PROVEN** by monotonic runs |
+
+`n2_load_path` consumes only XY for a circuit polyline. `world_load_nav`
+connects consecutive sane records when their spacing is under
+`NAV_LINK_MAX`, then welds coincident route runs within 5 m and builds a CSR
+graph. Do not silently treat the `+8` low value as a district id: its measured
+values span the whole city and change with route segments.
 
 Routes come in two kinds: **open sprints** (first waypoint far from the last)
-and **closed circuits** (first ≈ last) — the latter are what you lap.
-`ROUTESL4RF/Paths4602.bin` is a small 33-waypoint circuit inside the
-`STREAML4RH` region, used here for the lap demo.
+and **closed circuits** (first ≈ last). Runtime circuit discovery is restricted
+to the loaded region's own `ROUTES<stem>/` directory; the old whole-city
+bounding-box filter admitted foreign courses because outlier geometry inflated
+the box.
 
 ### Freeroam vs. race event — the split is the game's own
 
@@ -216,26 +433,24 @@ with no AI route network.
 +32 u32 hash  +36 u32 track id (4000 = freeroam) +40 char[4] tag  +44 u32 0
 ```
 
-18 records per race event, 32 for freeroam (id 4000). **CORRECTION (Phase 72):
-these are NOT checkpoints.** Re-measured for event 4001, all 18 sit inside a
-~15 × 30 m patch around (−400, 255): two 4-wide × 2-deep **starting grids** (one
-per race direction, matching the `F`/`B` route split) plus a couple of lone
-markers. They are spawn slots, not course anchors — the Phase 71 note calling
-them "checkpoint anchors" was wrong.
+The record count is **variable**, not universally 18. Event 4001 has 18; L4RB
+sprint 4201 has 20 arranged as two ten-slot clusters for opposite directions.
+These are **starting grids, not checkpoints**. Direction/orientation fields are
+zero in the measured 4201 records, so OpenUG2 chooses a supported slot near gate
+0 and derives heading from gate 0 → gate 1. A slot is preferred when
+`world_ground_at` finds ROAD within 1 m of its shipped Z; this rejects the
+opposite-direction cluster when its stored Z belongs to another layer.
 
 ### Checkpoint gates & laps — derived, not stored (Phase 72)
 
-There is no shipped checkpoint list. The **course order** is the event's own
-`0x3414c` outline polygon (already decoded above): its vertices are ordered
-around the lap, and each lands **2–23 m** from a racing-line node (measured over
-all 17 of event 4001's). The engine (`world_race_start` in `src/world.c`) turns
-each outline vertex into a **checkpoint gate**: snap it to the nearest racing-
-line node so it sits on the road, then square a line to the direction of travel
-taken from its outline neighbours. Gate 0 (the closing/first vertex) is the
-start/finish; it lands 8 m from the `0x34146` start grid, so both decodes agree
-on where the line is. Only the single armed gate scores, and only on a forward
-crossing (previous→current position straddles the line), so corner-cutting and
-reversing both fail to advance. Event 4001: 16 gates, 2 laps.
+There is no separately decoded checkpoint list. The **course order** is the
+event's own `0x3414c` outline polygon. `world_race_start` snaps each live
+outline point to the nearest node from that event's `0x34148` range and builds
+a gate perpendicular to the local course direction. For a circuit, the repeated
+closing point is removed and gate 0 is start/finish. For a sprint, every live
+outline point is retained and the last gate finishes the event without a lap
+wrap. Only the armed gate can score and the previous→current car segment must
+cross it, preventing proximity-only and out-of-order clears.
 
 ### Race barriers — no barrier chunk exists (**measured, Phase 71**)
 
@@ -247,6 +462,52 @@ event's route network simply does not contain the side streets. The engine
 therefore derives barrier placement (`world_set_mode` in `src/world.c`) as the
 links where the freeroam graph leaves the active event's corridor. Measured for
 event 4001: 341 corridor nodes, **24 barriers, 103 directed links masked**.
+
+## Global vehicle attributes (`GLOBAL/GLOBALB.BUN`)
+
+`GLOBALB.BUN` is the decompressed form of `GlobalB.lzc`. It contains several
+unrelated systems; do not describe the entire file as one flat AttribSys stream.
+
+### Per-car geometry anchor
+
+**PROVEN.** The ASCII path `CARS\\<NAME>\\GEOMETRY.BIN` occurs exactly once for
+each sampled drivable car. The surrounding per-car table repeats on a 2,192-byte
+stride. A wheel block begins 0x40 bytes before the path anchor:
+
+| offset from `anchor - 0x40` | type | meaning |
+|---:|---|---|
+| `+288` | `f32` | front axle X |
+| `+292` | `f32` | front half-track Y |
+| `+384` | `f32` | rear axle X |
+| `+388` | `f32` | rear half-track Y |
+
+The coordinates share the car model frame: front X is positive, rear X is
+negative, and full track width is `2*abs(Y)`. Values reproduce real wheelbase
+and track dimensions across the sampled fleet. `n2_global_wheel_attr` accepts
+the record only after conservative plausibility bounds; otherwise the caller
+falls back to measurements derived from that car's geometry.
+
+Two nearby values at offsets `+772/+776` form a pair separated by 500 and sort
+cars in a credible limiter/redline order. Their meaning is **PLAUSIBLE**, not
+structurally proven, and OpenUG2 does not consume them.
+
+### What is not decoded
+
+Mass, torque curves, gear ratios, drivetrain split, brake force, centre of
+gravity, spring rates and dampers remain **UNKNOWN**. A scan found no fixed
+four-byte column near the path anchor that yields distinct plausible kilogram
+mass values across the sampled cars. Current acceleration/braking differences
+therefore use a bounded body-volume proxy; that is engine policy, not a decoded
+retail field.
+
+### `0x00135200` AttribSys records
+
+The file also contains standard chunk-framed records with magic
+`0x00135200`. `src/attrib.h` can enumerate them, find a bounded printable
+instance name, read the class hash preceding that name and expose a conservative
+trailing-float view for diagnostics. The per-car path anchors above are **not
+inside those records**. Never use the generic AttribSys walker to justify fixed
+offsets around a car path, or vice versa.
 
 ## Engine sound banks (`SOUND/ENGINE/CAR_*_ENG_MB_SPU.abk`)
 
@@ -352,8 +613,8 @@ animation driver are NOT wired yet — see "Open" below.*
 
 ### Entity definition table
 
-Container `0x80034020` holds **N named entities** (89 in L4RA). Each entity is a
-**triple** of consecutive chunks in this order:
+Container `0x80034020` holds a bundle-dependent number of named definitions.
+Each entity is a **triple** of consecutive chunks in this order:
 
 ```
 0x39200  header   (name, hash, type)        0x5c bytes
@@ -455,7 +716,7 @@ independent implementation.
   reverse-engineering project of NFSU2. The chunk-container structure (the
   8-byte `magic`+`size` header and the `0x8`-nibble nesting rule) was confirmed
   against yugecin's documentation. Huge thanks — great work.
-- **[Nikki](https://github.com/MaxHwoy/Nikki)** — NFS modding library; the
+- **[Nikki](https://github.com/SpeedReflect/Nikki)** — NFS modding library; the
   reference for the TPK layout and the NFSU2 texture-header struct. Its field
   layout was what revealed the `PaletteOffset`/`PaletteSize` fields and cracked
   the P8 road-surface textures (which had otherwise looked like noise).

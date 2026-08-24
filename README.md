@@ -70,7 +70,12 @@ pipeline works, but only selected content has been verified end to end.
   in the same coordinates. It is useful for research, but is **not a valid
   playable open-world composition**.
 
-See [`docs/FORMATS.md`](docs/FORMATS.md) for the reverse-engineered file formats.
+Developer references:
+
+- [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) — architecture,
+  ownership, runtime data flow, invariants, tests and agent workflow.
+- [`docs/FORMATS.md`](docs/FORMATS.md) — evidence-labelled file layouts,
+  parser contracts and clean-room format notes.
 
 ## Build
 
@@ -147,8 +152,8 @@ car is pushed. `--shot out.png` renders one frame to a PNG and exits.
 src/
   main.c      orchestrator: setup, game loop, input, race flow, HUD
   nfsu2.h     single-header asset parser (chunk formats — the ground truth)
-  world.*     World: multi-region city stitching, texture binding, per-mesh
-              bounds for culling, grid-accelerated ground queries
+  world.*     World: region scene assembly, texture binding, per-mesh bounds
+              for culling, grid-accelerated ground/contact queries
   render.*    Renderer: GL objects, shaders, matrices, bitmap font, screenshot
   physics.*   car kinematics (real units, NFSU2-tuned), wall + car collision
   ai.*        racing-line opponents, circuit loading
@@ -156,9 +161,9 @@ src/
   resource.*  file mapping + track/car/circuit discovery
   debug.*     optional Dear ImGui dev overlay (`make debug`)
   world_mesh.* batch uploader for the world render debug pipeline
-  attrib.h    GLOBAL AttribSys reader (real per-car wheel/axle geometry)
+  attrib.h    generic GLOBAL AttribSys diagnostic reader
 tools/   Python utilities used to reverse-engineer & inspect the data formats
-docs/    format documentation (FORMATS.md)
+docs/    engine/developer guide and evidence-labelled format reference
 ```
 
 ## Project direction
@@ -212,6 +217,8 @@ High-value contribution areas:
 - Keep changes small and evidence-driven. Measure the production path before
   changing it; audit-only work must not silently alter behaviour.
 - Document newly proven format facts in [`docs/FORMATS.md`](docs/FORMATS.md).
+- Keep architectural changes and subsystem invariants current in
+  [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md).
 - Build with zero warnings, keep the boot self-tests passing and keep
   `make gles` compiling.
 - Include deterministic evidence: parser/test output for data changes and

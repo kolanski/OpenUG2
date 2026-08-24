@@ -65,7 +65,7 @@ DbgState g_dbg = {
 };
 
 /* ---- Per-car wheel stance ------------------------------------------------
- * Primary source is the GLOBAL AttribSys car table (n2_global_wheel_attr): the
+ * Primary source is the GLOBALB per-car table (n2_global_wheel_attr): the
  * exact factory axle X and track Y the game itself ships, decoded per car with
  * no hash and no hand-tuned table. Cars with no GLOBAL record (or when GLOBAL is
  * absent) fall back to a one-time seed from their own measured body box. Hub Z
@@ -78,7 +78,7 @@ static VehicleWheelConfig wheel_config_for(const char *name, const N2CarProfile 
                                            const unsigned char *gdata, long glen, int *from_global) {
     VehicleWheelConfig c;
     N2WheelAttr wa;
-    if (n2_global_wheel_attr(gdata, glen, name, &wa)) {   /* exact, from GLOBAL AttribSys */
+    if (n2_global_wheel_attr(gdata, glen, name, &wa)) {   /* exact, from GLOBALB car table */
         c.front_axle = wa.front_axle; c.rear_axle = wa.rear_axle;
         c.front_track = wa.front_track; c.rear_track = wa.rear_track;
         c.ride_y = p->hub_z;
@@ -1180,10 +1180,9 @@ int main(int argc, char **argv) {
     /* Point at your own NFSU2 install/data directory (contains TRACKS/, CARS/).
        Usage: nfsu2 [DATA_DIR] [options]
          --car NAME       car folder under CARS/ (default HUMMER)
-         --track NAME     STREAM .BUN under TRACKS/, or ALL = whole city (default).
-                          The 8 region bundles share ONE coord space; world_dedup
-                          fuses the byte-identical re-ships into one seamless map.
-                          (There is no STREAMALL.BUN; ALL = every STREAM<region>.)
+         --track NAME     STREAM .BUN under TRACKS/, or ALL = diagnostic union (default).
+                          The bundles overlap as route/event supersets; ALL is
+                          not a supported playable open-world composition.
          --circuit PATH   circuit Paths .bin under TRACKS/ (default ROUTESL4RF/Paths4602.bin)
          --shot out.png   render one frame and exit
          --carinfo CAR    dump CAR's part list + texture catalog and exit (GL-free) */
@@ -2862,7 +2861,7 @@ int main(int argc, char **argv) {
         n2_car_profile(&car, carname, WHEEL_SEED_FRONTF, WHEEL_SEED_REARF,
                        WHEEL_SEED_TRACKF, n2_car_brake_radius(cdata, 0, clen),
                        &carprof);
-        /* GLOBAL AttribSys holds each car's exact factory wheel positions.
+        /* The GLOBALB per-car table holds each car's factory wheel positions.
            Prefer the pre-decompressed GLOBALB.BUN; if it is absent, decompress
            the shipped GlobalB.lzc in place (it is a JDLZ stream) so the pipeline
            is fully self-contained from the retail files. */
@@ -2891,8 +2890,8 @@ int main(int argc, char **argv) {
         if (wHW < 0.04f) wHW = 0.04f;
         carWheelR = carprof.wheel_r;               /* aftermarket rims fit to this */
         /* M121: this car's handling comes from its own measurements -- body AABB,
-           AttribSys axle line and the tyre mesh -- normalised against the fleet
-           medians, never from a per-car table. */
+           GLOBALB axle line and the tyre mesh -- normalised against the fleet
+           medians, never from a hand-tuned per-car handling table. */
         {
             float bl = carbb[3]-carbb[0], bw = carbb[4]-carbb[1], bh = carbb[5]-carbb[2];
             float wb = g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle;
@@ -2911,7 +2910,7 @@ int main(int argc, char **argv) {
                carprof.name, g_dbg.wheel.front_axle, g_dbg.wheel.rear_axle,
                g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle,
                g_dbg.wheel.front_track, g_dbg.wheel.rear_track, g_dbg.wheel.ride_y,
-               wheel_from_global ? "GLOBAL AttribSys" : "body-box fallback");
+               wheel_from_global ? "GLOBALB car table" : "body-box fallback");
         printf("car profile %-12s wheel R %.3f (X %.3f Z %.3f) W %.3f%s  hubZ %+.3f  ride %.3f  "
                "wheelbase %.2f  track %.2f  clearance %.3f\n",
                carprof.name, carprof.wheel_r, carprof.wheel_rx, carprof.wheel_rz,
@@ -4049,9 +4048,10 @@ int main(int argc, char **argv) {
        so this is purely a rendering tier. */
     N2Batch *vbatch = NULL; int nvista = 0; long vista_tris = 0; int *vmesh = NULL;
     float vista_far = 2000.0f;
-    /* Ordinary and baseline never touch vista content: no texture resolve, no
-       GPU upload, no per-frame work. The scene itself still exists so the
-       exclusion from ground/collision/nav/spawn stays provable. */
+    /* Ordinary and baseline never batch or draw vista content. The shared
+       world_bind_textures pass may already have resolved a vista key into
+       tmap; this gate prevents vista-specific upload and per-frame work. The
+       separate scene keeps exclusion from ground/collision/nav/spawn provable. */
     if (tier == 2 && world.vista.count) {
         printf("vista: EXPERIMENTAL tier requested (--tier full); known "
                "opaque-sheet artifacts remain\n");

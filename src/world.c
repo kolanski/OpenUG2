@@ -157,8 +157,10 @@ static int world_dedup(World *w) {
 int world_load(World *w, const char *troot, const char *trackname) {
     memset(w, 0, sizeof *w);
 
-    /* Region set: ALL stitches every STREAM*.BUN into one scene — they share
-       one world coordinate system, so appending them yields the whole city. */
+    /* Region set. ALL is a diagnostic union, not the retail open world:
+       STREAM bundles overlap as route/event supersets and can author
+       incompatible layers at the same world coordinates. Supported gameplay
+       loads one explicit region. */
     static char regs[WORLD_MAXREG][64]; int nreg = 0;
     if (!strcmp(trackname, "ALL")) {
         int dummy = 0;

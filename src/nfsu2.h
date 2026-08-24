@@ -1807,15 +1807,14 @@ static void n2_car_profile(const N2Scene *s, const char *name,
     p->clearance = p->ride + b0[2];
 }
 
-/* Exact wheel geometry from the GLOBAL AttribSys car table (GLOBALB.BUN, the
- * decompressed GlobalB.lzc). Each car record in the 0x00034600 table holds its
- * four wheel positions as (X,Y,Z) floats at fixed offsets, in the SAME frame and
- * scale as the model (the record's length/width/height match the body AABB to
- * the mm). The record is located by its unique "CARS\<NAME>\GEOMETRY.BIN" path
- * string; the wheel block sits 0x40 before it. front/rear axle X and half-track
- * Y decode to real spec dims (verified across 10 cars: Focus wb 2.62, Skyline
- * 2.66, Miata 2.29, Hummer 3.11, ...). This is the authentic per-car placement,
- * so it supersedes the body-box fraction fallback. Returns 1 on a plausible hit. */
+/* Exact wheel geometry from a per-car table in GLOBALB.BUN (the decompressed
+ * GlobalB.lzc). Structural audit correction: these path anchors are NOT inside
+ * a 0x00135200 AttribSys record, so do not use that reader as proof of this
+ * fixed-offset layout. The unique "CARS\<NAME>\GEOMETRY.BIN" path locates a
+ * repeating 2192-byte record; the wheel block sits 0x40 before the path.
+ * Front/rear axle X and half-track Y are in the same frame and scale as the
+ * model and reproduce real spec dimensions across the sampled fleet. This
+ * supersedes the body-box fraction fallback. Returns 1 on a plausible hit. */
 typedef struct { float front_axle, rear_axle, front_track, rear_track; } N2WheelAttr;
 static int n2_global_wheel_attr(const unsigned char *g, long glen,
                                 const char *carname, N2WheelAttr *w) {
