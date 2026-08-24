@@ -6541,7 +6541,12 @@ int main(int argc, char **argv) {
             for (int k = 0; k < nglow; k++) {
                 N2Batch *b = &glowbatch[k];
                 if (b->tex != lastglowtex) {
-                    if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex); }
+                    /* White, because the unlit path MULTIPLIES the texture by
+                       uColor: left as it was, the glow inherits whatever the
+                       last pass set -- the tail lights leave it red, and every
+                       street lamp and lit window comes out orange. */
+                    if (b->tex) { glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, b->tex);
+                                  glUniform3f(uColor, 1.0f, 1.0f, 1.0f); }
                     else { glUniform1f(uUseTex, 0.0f); glUniform3f(uColor, 1.0f, 0.85f, 0.5f); }
                     lastglowtex = b->tex;
                 }
