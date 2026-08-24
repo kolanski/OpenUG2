@@ -5474,9 +5474,32 @@ int main(int argc, char **argv) {
            and any one of them left raised sends the whole next frame down the
            shader's unlit early-return -- no texturing, no specular, no
            reflection. It reads as "the lighting turned off". */
+        /* FULL RESET OF THE SHADER STATE, every frame.
+         *
+         * A dozen passes raise these deliberately -- shadows, halos, tail
+         * lights, headlight pools, tyre smoke, skid marks, the HUD -- and any
+         * one of them that forgets to lower a flag corrupts everything drawn
+         * after it. Worse, several of those passes only run while DRIVING, so
+         * the corruption appears the moment the menu is left and never in the
+         * menu itself: "the lights go out when the chase camera starts".
+         * Rather than audit every pass for what it restores, the frame begins
+         * from a known state. */
         glUniform1f(rp.uUnlit, 0.0f);
         glUniform1f(rp.uSoft, 0.0f);
         glUniform1f(rp.uAlpha, 1.0f);
+        glUniform1f(rp.uUseTex, 0.0f);
+        glUniform1f(rp.uVColor, 0.0f);
+        glUniform1f(rp.uEnv, 0.0f);
+        glUniform1f(rp.uSpec, 0.0f);
+        glUniform1f(rp.uDecal, 0.0f);
+        glUniform1f(rp.uAlphaTest, 0.0f);
+        glUniform1f(rp.uVista, 0.0f);
+        glUniform1f(rp.uEnvCubeOn, 0.0f);
+        glUniform3f(rp.uColor, 1.0f, 1.0f, 1.0f);
+        glUniform3f(rp.uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
+        glEnable(GL_DEPTH_TEST); glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glEnable(GL_CULL_FACE);
         glUniform3f(rp.uFogColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b);
         glUniform1f(rp.uFogDensity, g_dbg.fog_density);
         glUniform1f(rp.uUVCheck, (float)g_dbg.show_uv_checker);
