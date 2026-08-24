@@ -4239,6 +4239,22 @@ int main(int argc, char **argv) {
        so rather than guarding every one of them the explicit request is simply
        applied after them all. Ground Z is taken here because by now the scene,
        its instances and the ground grid are all final. */
+    /* Free roam starts at the free-roam start. With no place asked for, no
+       event and no capture mode running, the car would otherwise be put
+       wherever the density picker landed -- which is somewhere different on
+       every region and is not a place anyone drives from. N2_SPAWNS[0] is that
+       start; if the loaded region does not cover it, nothing changes. */
+    if (!spawn_set && !shot && !want_event_id && !sstatic && !daudit && !raudit) {
+        float gz = world_ground_z(&scene, N2_SPAWNS[0].x, N2_SPAWNS[0].y,
+                                  N2_GROUND_HIGHEST);
+        if (gz > -2000.0f && gz < 4000.0f) {
+            spawn_set = 1;
+            spawn_x = N2_SPAWNS[0].x; spawn_y = N2_SPAWNS[0].y;
+            if (!head_set) { head_set = 1; head_deg = -10.2f; }
+            printf("free roam: starting at '%s'\n", N2_SPAWNS[0].name);
+        }
+    }
+
     if (spawn_set) {
         spawn[0] = spawn_x; spawn[1] = spawn_y;
         float gz = world_ground_z(&scene, spawn_x, spawn_y, N2_GROUND_HIGHEST);
@@ -4447,6 +4463,12 @@ int main(int argc, char **argv) {
                         carpos[0]=spawn[0]; carpos[1]=spawn[1]; carpos[2]=spawn[2];
         g_ride_ready = 0;   /* M130: re-arm the ride at every placement */
                         heading=heading0; vel[0]=vel[1]=0; speed=0; p_lap=p_prev=0;
+                    } else if ((k==SDLK_RETURN || k==SDLK_SPACE) && spawn_set) {
+                        /* Free roam: the start was asked for explicitly, so
+                           this only drops the countdown and lets the car go.
+                           Snapping to a start line here is what teleported the
+                           player away from the place they had chosen. */
+                        race_state = 0; racetimer = 0;
                     } else if (k==SDLK_RETURN || k==SDLK_SPACE) {
                         /* Snap the player from the showcase spot to the circuit
                            start line so the race itself is fair. start_idx is
