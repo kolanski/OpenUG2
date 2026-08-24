@@ -31,27 +31,26 @@ static const char *FS =
     "varying vec4 vColor;\n"
     "uniform sampler2D uTex;\n"
     "uniform float uVColor;\n"   /* 0..1: apply the source per-vertex prelight */
-    "uniform float uUseTex; uniform vec3 uColor; uniform float uUnlit; uniform float uAlpha; uniform float uSoft; uniform float uSpec; uniform float uDecal;\n"
+    "uniform float uAlphaTest; uniform float uUseTex; uniform vec3 uColor; uniform float uUnlit; uniform float uAlpha; uniform float uSoft; uniform float uSpec; uniform float uDecal;\n"
     "uniform float uAmbient; uniform float uDiffuse; uniform vec3 uLight;\n"
     "uniform vec3 uFogColor; uniform float uFogDensity;\n"
     "uniform vec3 uCamPos; uniform float uEnv; uniform float uUVCheck;\n"
     "uniform float uGloss; uniform float uFlipN;\n"
-    /* Car material response, driven by the material record in the shipped data
-       rather than by hand-picked shading. For each of diffuse, specular and
-       reflection the material stores a Min/Range pair, and the term evaluates
-       as f = Min + dot(V,N) * Range -- so a panel facing the viewer and a panel
-       edge-on differ by exactly what the material asks for, instead of by a
-       guess. uMatOn > 0.5 selects this model. */
-    /* Environment cube map. There is no such texture in the shipped data -- the
-       slot is meant to be filled at runtime, which is also why the graphics
-       options expose a reflection update RATE. It is rendered live; uEnvYaw
-       turns the sampled direction back into world space. Without it the branch
-       falls back to the procedural night sphere above. */
-    "uniform samplerCube uEnvCube; uniform float uEnvCubeOn; uniform float uEnvYaw;\n"
+    "uniform float uVista;\n"
+    "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
+    /* Car material response, driven by the material record rather than by
+       hand-picked shading. For each of diffuse, specular and reflection the
+       material stores a Min/Range pair and the term evaluates as
+           f = Min + dot(V, n) * Range
+       so a panel facing the viewer and a panel edge-on differ by exactly what
+       the material asks for. uMatOn > 0.5 selects this model. */
     "uniform float uMatOn; uniform vec3 uMatDifMin; uniform vec3 uMatDifRange;\n"
     "uniform vec4 uMatSE;\n"   /* specMin, specRange, envMin, envRange */
-    "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
-    "uniform float uVista;\n"     /* >0.5: authored backdrop pass, alpha-blended */
+    /* Environment cube map. There is no such texture to load -- the slot is
+       meant to be filled at runtime, which is also why the graphics options
+       expose a reflection update RATE. We render it ourselves; uEnvYaw turns
+       the reflected ray from the car's axes into world axes. */
+    "uniform samplerCube uEnvCube; uniform float uEnvCubeOn; uniform float uEnvYaw;\n"
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
     "void main(){\n"
@@ -67,6 +66,10 @@ static const char *FS =
     "    gl_FragColor=vec4(vec3(vUV.x,vUV.y,0.2)*mix(0.35,1.0,grid),1.0); return;\n"
     "  }\n"
     "  float fog = clamp(exp(-pow(vDepth*uFogDensity, 2.0)), 0.0, 1.0);\n"
+    /* Emissive path: neon, lamps and halos. The texture IS sampled here.
+       Lamp textures are additive and carry the shape of the bulb and its
+       halo, so ignoring them turns every street light into a featureless
+       bright blob. */
     /* M132-R2 vista path. The backdrops are authored as cut-out sheets: their
        DXT1 blocks carry one-bit transparency (up to 57.7% of texels fully
        clear) and their DXT3 blocks carry real gradients, all of which the
@@ -83,9 +86,10 @@ static const char *FS =
     "    gl_FragColor = vec4(mix(uFogColor, c, fog), a);\n"
     "    return;\n"
     "  }\n"
-    "  if(uUnlit>0.5){ float a=uAlpha;\n"
+    "  if(uUnlit>0.5){ float a=uAlpha; vec3 ec=uColor;\n"
+    "    if(uUseTex>0.5){ vec4 et=texture2D(uTex,vUV); ec=et.rgb*uColor; a*=et.a; }\n"
     "    if(uSoft>0.5){ float d=length(vUV-vec2(0.5)); a*=clamp(1.0-d*2.0,0.0,1.0); a*=a; }\n"
-    "    gl_FragColor=vec4(mix(uFogColor,uColor,fog),a); return; }\n"
+    "    gl_FragColor=vec4(mix(uFogColor,ec,fog),a); return; }\n"
     /* uLight is the sun direction in the OBJECT's model space: normals stay
        model-space (no per-vertex transform), so a rotated object (the car)
        must counter-rotate the light or its lit side turns with it. */
@@ -104,6 +108,10 @@ static const char *FS =
     /* uDecal: paint under an alpha-masked decal atlas (badges/vinyls) —
        texture RGB shows only where its alpha says so, paint elsewhere */
     "  vec4 t = texture2D(uTex,vUV);\n"
+    /* Alpha cutout, enabled per batch and only for cutout textures. Foliage
+       uses one-bit transparency, so alpha is either fully on or fully off and
+       a 0.5 threshold separates them exactly. */
+    "  if(uAlphaTest>0.5 && t.a < 0.5) discard;\n"
     "  vec3 base = uUseTex>0.5 ? (uDecal>0.5 ? mix(uColor,t.rgb,t.a) : t.rgb) : uColor;\n"
     /* Rim paint: recolor the diffuse toward uColor while KEEPING its detail.
        Luminance drives the shade, uColor picks the metal, so a gold OEM sheet
@@ -138,7 +146,23 @@ static const char *FS =
        PS2/RenderWare convention, so building bases darken, terrain gets its
        grass/dirt variation back, and the flat "cardboard" look goes away. Gated
        by uVColor so cars/props (which don't carry it) are untouched. */
-    "  if(uVColor>0.001) lit = mix(lit, lit*clamp(vColor.rgb*2.0, 0.0, 1.6), uVColor);\n"
+    /* World geometry is lit ENTIRELY by its baked vertex colour -- there is
+       no ambient term, no sun direction and no sun colour in the world
+       material, so the only thing a world pixel can do is modulate its
+       texture by the colour the artist baked and then apply fog. Adding a
+       directional term on top is what used to leave the undersides of
+       overpasses black (normal pointing down, N.L near zero) while their tops
+       blew out.
+
+       The x2 is the MODULATE2X convention of the era: 128 is neutral, so a
+       baked value can both darken and brighten the texture. Only RGB is
+       doubled -- alpha stays a plain product.
+
+       Channel order is RGBA: the mean baked bytes on road surfaces run
+       75.2 / 86.3 / 91.9 with the third the largest, and night asphalt reads
+       blue, so the third byte is blue. Swapping to BGR turns the roads
+       yellow. */
+    "  if(uVColor>0.001) lit = mix(lit, base*vColor.rgb*2.0, uVColor);\n"
     /* environment reflection (cars only, uEnv>0): a procedural night-city
        sphere — dark ground, warm city-glow horizon band, dim blue sky —
        sampled with the model-space reflection vector, fresnel-weighted.
@@ -160,13 +184,18 @@ static const char *FS =
     "    }\n"
     "    float fres = 0.35 + 0.65*pow(1.0-clamp(dot(N,V),0.0,1.0), 3.0);\n"
     "    lit += env * (uEnv * menv * fres);\n"
-    "    if(uEnvCubeOn>1.5) lit = env;\n"
+    "    if(uEnvCubeOn>1.5) lit = env;\n"   /* debug: reflection only */
+
     "  }\n"
     /* lit alpha = uAlpha (1 everywhere but the blended glass pass), so
        translucent glass keeps its specular highlight */
-    "  gl_FragColor=vec4(mix(uFogColor, lit, fog), uAlpha);\n"
+    /* World alpha is texture.a * vertexColour.a -- the doubling above touches
+       RGB only. Forcing alpha to 1 here makes glass come out opaque in the
+       blended pass. Gated on uVColor, which is raised for world geometry
+       only. */
+    "  float oa = uVColor>0.001 ? t.a*vColor.a : uAlpha;\n"
+    "  gl_FragColor=vec4(mix(uFogColor, lit, fog), oa);\n"
     "}\n";
-
 /* ---- tiny 4x4 matrix (column-major) ---- */
 void mat_mul(const float *a, const float *b, float *o) {
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) {

@@ -4353,6 +4353,12 @@ int main(int argc, char **argv) {
         else fprintf(stderr, "--spawn: no ground at (%.1f, %.1f) -- is the "
                              "region loaded that covers it?\n", spawn_x, spawn_y);
         printf("--spawn: (%.1f, %.1f, %.3f)\n", spawn[0], spawn[1], spawn[2]);
+        /* Re-arm the sprung ride: it holds the wheel heights from wherever the
+           car was placed before, and moving the body without telling it leaves
+           the wheels reaching for ground that is no longer under them. The car
+           then falls through the world -- which looks like the lighting going
+           out, because what you are seeing is the city from underneath. */
+        g_ride_ready = 0;
     }
     if (head_set) {
         heading0 = head_deg * 0.0174533f;
@@ -6442,8 +6448,8 @@ int main(int argc, char **argv) {
                that the decoder keeps a plane whenever the texture record says
                the texture is not opaque -- the flare is additive, so it is
                kept even though its alpha is close to uniform. */
-            glUniform1f(uUnlit, 1.0f); glUniform1f(uUseTex, 1.0f);
-            glUniform1f(rp.uSoft, 0.0f);
+            glUniform1f(uUnlit, 1.0f);
+            glUniform1f(uUseTex, 1.0f); glUniform1f(rp.uSoft, 0.0f);
             glBindTexture(GL_TEXTURE_2D, tex_glow);
             for (int q = 0; q < nlsrc; q++) {
                 const N2LightSrc *L = &lsrc[q];

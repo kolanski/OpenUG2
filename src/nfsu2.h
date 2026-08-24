@@ -2595,7 +2595,27 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
             unsigned char *alf = (unsigned char *)malloc((long)w*hh);
             tex->alpha = NULL;
             tex->afmt = 0;
-            if (palsz >= 1024 && dbase+paloff+1024 <= len && dbase+off+(long)w*hh <= len) {
+            /* THE FORMAT IS IN THE RECORD. Guessing it -- palette if a palette
+               is present, otherwise DXT3 or DXT1 by size -- is wrong for the
+               uncompressed ones: a 32-bit BGRA sheet read as DXT1 comes out as
+               noise with its red and blue swapped, which is exactly the pink
+               signage. It also decodes the shared headlight texture to solid
+               black, putting the lamps out. */
+            unsigned fmt = d[i+0x3e];
+            if (fmt == 0x20) {                       /* uncompressed BGRA */
+                if (dbase + off + (long)w*hh*4 > len) { free(tex->rgb); free(alf); continue; }
+                const unsigned char *px = d + dbase + off;
+                for (long p = 0; p < (long)w*hh; p++) {
+                    tex->rgb[p*3+0] = px[p*4+2];     /* B,G,R,A -> R,G,B */
+                    tex->rgb[p*3+1] = px[p*4+1];
+                    tex->rgb[p*3+2] = px[p*4+0];
+                    if (alf) alf[p]  = px[p*4+3];
+                }
+                tex->afmt = 8;
+            } else if (fmt == 0x08 || (palsz >= 1024 && dbase+paloff+1024 <= len
+                                       && dbase+off+(long)w*hh <= len)) {
+                if (palsz < 1024 || dbase+paloff+1024 > len
+                    || dbase+off+(long)w*hh > len) { free(tex->rgb); free(alf); continue; }
                 const unsigned char *pal = d + dbase + paloff, *ix = d + dbase + off;
                 for (long p = 0; p < (long)w*hh; p++) {   /* P8: index -> RGBA palette */
                     const unsigned char *c = pal + (long)ix[p]*4;
@@ -2604,9 +2624,14 @@ static int n2_tpk_decode(const unsigned char *d, long len, N2Tpk t, uint32_t has
                 }
                 tex->afmt = 8;                      /* P8 */
             } else if (dbase + off + (long)w*hh/2 <= len) {
-                int dxt3 = (long)sz > (long)w*hh*9/10;
-                if (dxt3) { n2_dxt3(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
-                else      { n2_dxt1(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 1; }
+                if      (fmt == 0x24) { n2_dxt3(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
+                else if (fmt == 0x26) { n2_dxt5(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
+                else if (fmt == 0x22) { n2_dxt1(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 1; }
+                else {   /* record says nothing usable: fall back to the old guess */
+                    int dxt3 = (long)sz > (long)w*hh*9/10;
+                    if (dxt3) { n2_dxt3(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 3; }
+                    else      { n2_dxt1(d + dbase + off, w, hh, tex->rgb, alf); tex->afmt = 1; }
+                }
             } else { free(tex->rgb); free(alf); continue; }
             if (alf) {
 #ifdef N2_NO_WORLD_ALPHA
