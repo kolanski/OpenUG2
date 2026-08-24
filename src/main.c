@@ -1204,6 +1204,9 @@ int main(int argc, char **argv) {
                                     selector from an explicit seed, so two
                                     builds can be compared at one pose (M133) */
     int markrepair = 0;          /* --mark-repaired (M133): diagnostic highlight */
+    int nansweep = 0;            /* --nan-sweep (M133-R): scan every emitted
+                                    mesh in the loaded region(s) for a non-
+                                    finite or out-of-N2_VERT_SANE vertex */
     int lodcensus = 0;           /* --lod-census (M133): structural detail-tier census */
     int lsaudit = 0;             /* --local-scene-audit (M133): source->screen
                                     attribution for everything near the car */
@@ -1289,6 +1292,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--local-scene-audit")) lsaudit = 1;
         else if (!strcmp(argv[i], "--tex-audit")) g_world_texaudit = 1;
         else if (!strcmp(argv[i], "--lod-census")) lodcensus = 1;
+        else if (!strcmp(argv[i], "--nan-sweep")) nansweep = 1;
         else if (!strcmp(argv[i], "--local-scene-objects")) lsaudit = 2;
         else if (!strcmp(argv[i], "--static-spawn-audit") && i+1 < argc) sspawn = trackname = argv[++i];
         else if (!strcmp(argv[i], "--surface-stack") && i+3 < argc) {
@@ -2674,6 +2678,22 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nm; i++)
         for (int j = 0; j < ntmap; j++)
             if (tmapkey[j] == scene.meshes[i].texkey) { mtex[i] = tmaptex[j]; break; }
+    if (nansweep) {
+        long bad = 0, badobj = 0;
+        for (int i = 0; i < nm; i++) {
+            const N2Mesh *me = &scene.meshes[i];
+            int thisbad = 0;
+            for (int v = 0; v < me->nverts; v++)
+                for (int c = 0; c < 3; c++) {
+                    float q = me->verts[v*5+c];
+                    if (q != q || q >= N2_VERT_SANE || q <= -N2_VERT_SANE) { bad++; thisbad = 1; }
+                }
+            if (thisbad) badobj++;
+        }
+        printf("NAN SWEEP %s: %ld non-finite/out-of-range vertex components "
+               "across %ld meshes (of %d) %s\n", trackname, bad, badobj, nm,
+               bad == 0 ? "(clean)" : "(FOUND)");
+    }
     if (lodcensus) {
         /* M133 STRUCTURAL detail-tier census. No names are consulted: meshes
            are grouped purely by identical rounded XY footprint, and within a

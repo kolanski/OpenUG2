@@ -309,11 +309,19 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
 
     N2Mesh m; memset(&m, 0, sizeof(m));
     m.cat = cat; m.texkey = texkey; m.nverts = n;
-    m.verts = (float *)malloc(n * 5 * sizeof(float));
+    m.verts = (float *)malloc((size_t)n * 5 * sizeof(float));
     /* World stream (24B stride) packs an RGBA8 prelight colour between position
        and UV (pos@0, colour@12, uv@16). Car stream (36B) has no such slot. */
     int coloff = (stride == 24) ? 12 : -1;
     if (coloff >= 0) m.vcol = (unsigned char *)malloc((size_t)n * 4);
+    /* M133-R: every allocation this function owns is checked before use, and
+       every early return below frees exactly what was owned at that point —
+       a partially built mesh is never pushed to the scene. */
+    if (!m.verts || (coloff >= 0 && !m.vcol)) {
+        free(m.verts); free(m.vcol);
+        if (vbad != vbad_small) free(vbad);
+        return;
+    }
     for (int i = 0; i < n; i++) {
         float px, py, pz;
         memcpy(&px, rec+i*stride,   4);
@@ -337,15 +345,30 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
     const unsigned char *ib = ib0 + ip;
     int nidx = (ibytes - ip) / 2;
     /* icount >= 0 restricts this draw to one 0x134B02 submesh's slice of the
-       index buffer (its own material). Ranges are in u16s past the filler. */
+       index buffer (its own material). Ranges are in u16s past the filler.
+       m.verts/m.vcol are already allocated and filled by this point, so a
+       rejection here must free them explicitly rather than just returning. */
     if (icount >= 0) {
-        if (istart < 0 || istart >= nidx) return;
+        if (istart < 0 || istart >= nidx) {
+            free(m.verts); free(m.vcol);
+            if (vbad != vbad_small) free(vbad);
+            return;
+        }
         if (istart + icount > nidx) icount = nidx - istart;
-        if (icount < 3) return;
+        if (icount < 3) {
+            free(m.verts); free(m.vcol);
+            if (vbad != vbad_small) free(vbad);
+            return;
+        }
         ib += istart * 2;
         nidx = (int)icount;
     }
-    m.idx = (uint16_t *)malloc(nidx * sizeof(uint16_t));
+    m.idx = (uint16_t *)malloc((size_t)nidx * sizeof(uint16_t));
+    if (!m.idx) {
+        free(m.verts); free(m.vcol);
+        if (vbad != vbad_small) free(vbad);
+        return;
+    }
     m.nidx = 0;
     for (int i = 0; i + 2 < nidx; i += 3) {
         uint16_t a = (uint16_t)(ib[i*2]     | ib[i*2+1]     << 8);
@@ -355,11 +378,18 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
             m.idx[m.nidx++] = a; m.idx[m.nidx++] = b; m.idx[m.nidx++] = c;
         }
     }
-    if (vbad != vbad_small) free(vbad);
-    if (m.nidx == 0) { free(m.verts); free(m.idx); free(m.vcol); return; }
-    /* a corrupt vertex is left in the array (indices reference it) but no
-       triangle uses it; park it on the first good vertex so the bbox, the
-       ground grid and the batch AABB never see the spike */
+    if (m.nidx == 0) {
+        free(m.verts); free(m.idx); free(m.vcol);
+        if (vbad != vbad_small) free(vbad);
+        return;
+    }
+    /* M133-R: repair using the ORIGINAL per-source-vertex mask, still alive —
+       not rediscovered from m.verts[i*5] (transformed X only), which is blind
+       to a corrupt Y or Z and would let it through into the mesh bounds, the
+       ground grid and the GPU batch. A corrupt vertex is left in the array
+       (indices reference it) but no triangle uses it; park it on the first
+       vertex the mask itself calls good, so the bbox/grid/batch never see the
+       spike. nbad == n was already rejected above, so a good vertex exists. */
     m.vrepair = nbad ? 1 : 0;
     if (nbad) {
         static const char *pr2 = (const char *)1;
@@ -368,16 +398,12 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
                          n, nbad, m.nidx/3, mtx?mtx[12]:0.0f, mtx?mtx[13]:0.0f,
                          mtx?mtx[14]:0.0f);
         int good = -1;
-        for (int i = 0; i < n && good < 0; i++)
-            if (m.verts[i*5] == m.verts[i*5] &&
-                m.verts[i*5] < N2_VERT_SANE && m.verts[i*5] > -N2_VERT_SANE) good = i;
+        for (int i = 0; i < n; i++) if (!vbad[i]) { good = i; break; }
         if (good >= 0)
-            for (int i = 0; i < n; i++) {
-                float v = m.verts[i*5];
-                if (v == v && v < N2_VERT_SANE && v > -N2_VERT_SANE) continue;
-                memcpy(m.verts + i*5, m.verts + good*5, 3*sizeof(float));
-            }
+            for (int i = 0; i < n; i++)
+                if (vbad[i]) memcpy(m.verts + i*5, m.verts + good*5, 3*sizeof(float));
     }
+    if (vbad != vbad_small) free(vbad);
     n2_push_mesh(scene, m);
 }
 

@@ -310,10 +310,13 @@ int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap) {
             else if (g_world_texaudit) {
                 /* M133: separate "the archive has no such record" from "we
                    decoded it and then threw it away" -- they need different
-                   fixes and the old counters merged them. */
+                   fixes and the old counters merged them. M133-R: `i` here
+                   indexes w->vista, not w->scene -- attribute to the vista
+                   mesh that actually owns this key, not whatever scene mesh
+                   happens to share the same index. */
                 printf("TEXFAIL key %08x  %s  mesh %-30s cat %d\n", tk,
                        ok ? "DECODED-BUT-REJECTED-AS-NOISE" : "not in any TPK",
-                       w->scene.meshes[i].sname, w->scene.meshes[i].cat);
+                       w->vista.meshes[i].sname, w->vista.meshes[i].cat);
                 if (ok) g_world_texnoise++; else g_world_texmiss++;
             }
             if (ok) { free(tt.rgb); free(tt.alpha); free(tt.dxt); }
