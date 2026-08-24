@@ -43,6 +43,18 @@ typedef struct {
     char sname[32];     /* track meshes: that asset name (e.g. XO_StreetLightC_1a_00) */
     unsigned char vrepair; /* 1 = this mesh kept its good geometry after corrupt
                               source vertices were excluded (M133) */
+    /* --- instance placement (world2) --- */
+    char     aname[28];  /* asset name of the model this came from */
+    unsigned char inst;  /* 1 = a copy placed from an instance record. Not fed
+                            to collision: walls are derived from geometry, and
+                            thousands of trees and parked cars would seal the
+                            player in. */
+    unsigned char hasm;  /* the model HAS a matrix of its own. If not, its
+                            vertices are already in world space and it must not
+                            be placed from instances. */
+    float objm[16];      /* that matrix. The vertices are already transformed by
+                            it, so placing the same model elsewhere needs a
+                            RELATIVE transform: instance matrix * inverse(objm). */
 } N2Mesh;
 
 /* Active customization profile.
@@ -118,6 +130,18 @@ static int n2_skip_filler(const unsigned char *p, int n) {
 }
 
 /* ---- mesh extraction ---- */
+/* A mesh with a NaN or an absurd coordinate anywhere in it. Isolated bad
+ * vertices are a source defect and are repaired per vertex elsewhere; this is
+ * the last check before a mesh is accepted at all. */
+static int n2_mesh_is_broken(const N2Mesh *m) {
+    for (int v = 0; v < m->nverts; v++) {
+        const float *q = m->verts + v*5;
+        for (int k = 0; k < 3; k++)
+            if (!(q[k] == q[k]) || q[k] > 1e8f || q[k] < -1e8f) return 1;
+    }
+    return 0;
+}
+
 static void n2_push_mesh(N2Scene *s, N2Mesh m) {
     if (s->count == s->cap) {
         s->cap = s->cap ? s->cap * 2 : 64;

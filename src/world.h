@@ -265,4 +265,20 @@ extern float world_rc_min[2], world_rc_max[2];
 int world_scripted_defs(const World *w, const char *troot,
                         ScriptedDef *out, int cap);
 
+/* Build the scene from instance records: models stay in local coordinates and
+ * each placement supplies its own transform, so a model that appears many
+ * times is drawn once per placement instead of once overall. The older loader
+ * bakes each model's matrix into its vertices, which then has to be undone for
+ * every further copy; here there is nothing to undo. */
+int world2_build(N2Scene *out, const char *troot,
+                 const char *const *bundles, int nbundles,
+                 float sx, float sy, float viewdist,
+                 const unsigned char *loc4, long loc4len);
+extern int  world2_on;
+extern char world2_bundle[64];   /* district chosen by world2_build */
+
+extern float world_inst_x, world_inst_y, world_inst_r;
+int world_instantiate(World *w, const char *troot, float sx, float sy,
+                      float viewdist);
+
 #endif
