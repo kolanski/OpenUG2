@@ -2688,6 +2688,43 @@ int main(int argc, char **argv) {
     int ntmap = world_bind_textures(&world, tmapkey, tmaptex, tmapalpha, 2048);
     printf("track textures bound: %d distinct\n", ntmap);
 
+    /* Shared effect textures. Spotlight and shop-front beams all share one
+       texture key that no track texture pack carries, which is why they were
+       loading untextured: it lives in the common in-game bundle as
+       SFX_LIGHT_BEAMA, 32x256 DXT3, drawn in the topmost additive layer. */
+    static const char *extra_packs[] = {
+        "GLOBAL/InGameCommon.bun",   /* SFX_LIGHT_BEAMA: spotlight beams */
+        "TRACKS/LOC4DYNTEX.BIN",     /* sky: SKY_SUNRISE_A/_CAP, SKY_SUNSET_A, SKY_NIGHT_A */
+    };
+    for (int xf = 0; xf < (int)(sizeof extra_packs / sizeof *extra_packs); xf++)
+    {   char cp2[1024];
+        snprintf(cp2, sizeof cp2, "%s/%s", dataroot, extra_packs[xf]);
+        long cl2 = 0; unsigned char *cd2 = n2_read_file(cp2, &cl2);
+        if (cd2) {
+            N2Tpk ct2 = n2_tpk_open(cd2, cl2);
+            int added = 0;
+            for (int i = 0; i < scene.count && ntmap < 2048; i++) {
+                uint32_t tk = scene.meshes[i].texkey; if (!tk) continue;
+                int have = 0;
+                for (int j = 0; j < ntmap; j++) if (tmapkey[j] == tk) { have = 1; break; }
+                if (have) continue;
+                N2Tex t = {0};
+                /* This file is laid out like a car's texture file: a slot
+                   table plus compressed blocks, which an ordinary texture-pack
+                   walk does not read. */
+                if (n2_tpk_decode(cd2, cl2, ct2, tk, &t)
+                    || n2_load_car_tex_by_key(cd2, cl2, tk, &t)) {
+                    tmapkey[ntmap] = tk; tmaptex[ntmap] = upload_tex(&t);
+                    tmapalpha[ntmap] = (unsigned char)n2_tex_mode(&t);
+                    ntmap++; added++;
+                    free(t.rgb); free(t.alpha); free(t.dxt);
+                }
+            }
+            if (added) printf("%s: %d textures added\n", extra_packs[xf], added);
+            free(ct2.blk); free(cd2);
+        }
+    }
+
     /* THE LAMP HALO. Its texture is the flare sheet the game ships; the key is
        looked up rather than the texture built, so what is drawn is the game's
        own glow. */
