@@ -1248,6 +1248,7 @@ int main(int argc, char **argv) {
     static N2Paint pal[512]; int npal = 0;        /* body paints, from GLOBALB */
     float paint_rgb[3] = { 0.70f, 0.70f, 0.75f }; /* until the record is read */
     const char *paint_name = NULL;                /* --paint NAME */
+    const char *g_sky_name = NULL;     /* --sky NAME */
     int   no_post = 0;                 /* --no-post: skip the tone pass */
     float post_amount = 1.0f;          /* --post N: scale it */
     int   post_on = 0;                 /* the pass is live this frame */
@@ -1380,6 +1381,8 @@ int main(int argc, char **argv) {
         /* --no-post / --post N: the bloom-and-tone pass, and how much of it. */
         /* --paint NAME: body paint by material name (METPAINTSILVER, ...). */
         else if (!strcmp(argv[i], "--paint") && i+1 < argc) paint_name = argv[++i];
+        /* --sky sunrise|sunset|night: which shipped sky to hang overhead. */
+        else if (!strcmp(argv[i], "--sky") && i+1 < argc) g_sky_name = argv[++i];
         else if (!strcmp(argv[i], "--no-post")) no_post = 1;
         else if (!strcmp(argv[i], "--post") && i+1 < argc)
             post_amount = (float)atof(argv[++i]);
@@ -4238,6 +4241,38 @@ int main(int argc, char **argv) {
        clear colour, which is correct but worth knowing about. */
     N2Batch *skybatch = NULL; int nsky = upload_cat_batches(&scene, N2_SKY, mtex, &skybatch);
     N2Batch *glowbatch = NULL; int nglow = upload_cat_batches(&scene, N2_GLOW, mtex, &glowbatch);
+    /* SKY TEXTURE. The dome mesh names a key that the regional packs do not
+       carry -- the skies live in the shared dynamic-texture file, one dome and
+       one cap per time of day. Without this the dome draws untextured and the
+       top of the frame is flat black. Default is the evening sky the game
+       ships free roam in; --sky picks another. */
+    {   const char *want = g_sky_name ? g_sky_name : "sunset";
+        struct { const char *nm; uint32_t dome, cap; } sk[] = {
+            { "sunrise", 0x2414a01eu, 0x5fb8bcd1u },
+            { "sunset",  0x27f186b7u, 0x3e6947eau },
+            { "night",   0x8a9a05cfu, 0xb0eb9302u },
+        };
+        for (int a = 0; a < 3 && nsky; a++) {
+            if (strcmp(want, sk[a].nm)) continue;
+            char dp2[1024]; snprintf(dp2, sizeof dp2, "%s/TRACKS/LOC4DYNTEX.BIN", dataroot);
+            long dl2 = 0; unsigned char *dd2 = n2_read_file(dp2, &dl2);
+            if (!dd2) { printf("sky: LOC4DYNTEX.BIN did not open\n"); break; }
+            N2Tpk dt = n2_tpk_open(dd2, dl2);
+            for (int q = 0; q < nsky; q++) {
+                uint32_t key = (q == 0) ? sk[a].dome : sk[a].cap;
+                N2Tex t; memset(&t, 0, sizeof t);
+                if (n2_tpk_decode(dd2, dl2, dt, key, &t)
+                    || n2_load_car_tex_by_key(dd2, dl2, key, &t)) {
+                    skybatch[q].tex = upload_tex(&t);
+                    printf("sky %s: batch %d -> %#x (%dx%d)\n",
+                           sk[a].nm, q, key, t.w, t.h);
+                    free(t.rgb); free(t.alpha); free(t.dxt);
+                } else printf("sky %s: key %#x failed to decode\n", sk[a].nm, key);
+            }
+            free(dt.blk); free(dd2);
+            break;
+        }
+    }
     printf("sky: %d batch(es)%s, neon/glow: %d batch(es)\n", nsky,
            nsky ? "" : " (no SKYDOME mesh found in this region set)", nglow);
 
@@ -5608,28 +5643,50 @@ int main(int argc, char **argv) {
            the depth test alone. Falls back to nothing (flat fog clear
            colour shows through) when the region has no SKYDOME mesh. */
         if (nsky && (passmode == 0 || passmode == 3 || passbatch >= 0)) {   /* M78/M79 */
-            float zero[3] = {0,0,0}, Vsky[16], MVPsky[16], Psky[16];
-            mat_lookat(zero, look, Vsky);
-            mat_persp(0.9f, (float)W/H, znear, maxr*30, Psky);  /* deep: dome ~16 km */
+            /* The dome is seen from INSIDE, so back-face culling must be
+               disabled explicitly: GL state is global and may still be on from
+               the previous pass. */
+            glDisable(GL_CULL_FACE);
+            /* THE DOME SITS IN WORLD COORDINATES, not around the origin: it
+               spans the whole map, centred near (-842, 285), a hemisphere some
+               9700 units across and 8000 tall. The usual "camera at the
+               origin" trick moves it aside and the sky misses the frame
+               entirely. It is an ordinary world object with no camera
+               attachment, so it is drawn with the ordinary camera -- only the
+               far plane has to be widened to fit it, and depth writes are
+               off. */
+            float Vsky[16], MVPsky[16], Psky[16];
+            mat_lookat(cam, look, Vsky);
+            mat_persp(0.9f, (float)W/H, znear, 30000.0f, Psky);
             mat_mul(Psky, Vsky, MVPsky);
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPsky);
             glUniform1f(uUnlit, 1.0f);
+            /* No fog on the sky. The dome is thousands of metres away and
+               exp(-(depth*density)^2) is zero at that range, so the whole dome
+               paints in the fog colour -- which is the clear colour, and looks
+               exactly like having no sky at all. */
+            glUniform1f(rp.uFogDensity, 0.0f);
             glDepthMask(GL_FALSE);
-            /* The unlit path outputs mix(uFogColor,uColor,fog) and never
-               samples the texture, so every sky batch is flat-shaded to
-               uColor. It MUST be set here: the loop used to set it only for
-               untextured batches, so a textured sky mesh (region D has one)
-               inherited whatever uColor the previous frame last left -- the
-               red brake-light/neon colour -- and, being camera-locked, drew a
-               fixed red block at the top of the frame. Pin it to the fog
-               colour so the dome always dissolves into the horizon. */
-            glUniform1f(uUseTex, 0.0f);
-            glUniform3f(uColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b);
+            /* The sky is textured: the emissive shader path samples its
+               texture (see render.c), and the images come from the shared
+               dynamic texture file by name. The main texture covers the dome,
+               the _CAP one the zenith. An untextured batch falls back to the
+               fog colour so it dissolves into the horizon rather than
+               inheriting whatever uColor the previous pass left behind -- that
+               used to paint a red block across the top of the frame. */
+            glUniform3f(uColor, 1.0f, 1.0f, 1.0f);
+            glUniform1f(uAlpha, 1.0f);
             for (int k = 0; k < nsky; k++) {
+                if (skybatch[k].tex) { glUniform1f(uUseTex, 1.0f);
+                                       glBindTexture(GL_TEXTURE_2D, skybatch[k].tex); }
+                else { glUniform1f(uUseTex, 0.0f);
+                       glUniform3f(uColor, g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b); }
                 draw_batch(&skybatch[k]);
                 g_dbg.drawn++; skydraws++;
             }
+            glUniform1f(uUseTex, 0.0f);
             glDepthMask(GL_TRUE); glUniform1f(uUnlit, 0.0f);
+            glUniform1f(rp.uFogDensity, g_dbg.fog_density);   /* fog back on */
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);   /* restore the real camera */
         }
 

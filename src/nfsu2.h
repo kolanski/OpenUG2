@@ -322,7 +322,16 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
                 while (j < s && (p[j]=='_' || (p[j]>='A'&&p[j]<='Z') || (p[j]>='0'&&p[j]<='9'))) j++;
                 if (j - i >= 5) {
                     const unsigned char *n = p + i; long L = j - i;
-                    if (n2_contains(n, L, "SKYDOME") || n2_contains(n, L, "SKY")) return N2_SKY;
+                    /* Matching "SKY" as a substring also catches the stadium,
+                       whose texture is named for the sky it reflects but which
+                       is a building: it then joins the sky pass, is drawn with
+                       the sky's matrix and far plane, and blacks out half the
+                       screen. The dome is a 101-vertex mesh thousands of
+                       metres up; the stadium sits at ground level. The dome's
+                       name is exactly SKYDOME. */
+                    if ((L == 7 && n2_contains(n, L, "SKYDOME"))
+                        || (L > 4 && n[0]=='S' && n[1]=='K' && n[2]=='Y' && n[3]=='_'))
+                        return N2_SKY;
                     if (n2_contains(n, L, "ROAD")) return N2_ROAD;
                     if (n2_contains(n, L, "TERRAIN")) return N2_TERRAIN;
                     /* RDP_ is the shipped road-paint/pavement family: RDP_LANEA,
