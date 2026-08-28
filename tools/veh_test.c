@@ -1,7 +1,7 @@
 /* veh_test -- acceptance gate for vehicle_model against the garage dyno.
  *
  *   cc -std=c99 -Isrc -o veh_test tools/veh_test.c src/vehicle_model.c \
- *      src/car_setup.c -lm
+ *      src/car_setup.c src/abs.c -lm
  *   ./veh_test <GLOBALB.BUN>
  *
  * Targets are what the game's own Dyno Results screen reports for the

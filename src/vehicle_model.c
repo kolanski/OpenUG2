@@ -528,23 +528,9 @@ void veh_step(VehState *s, const VehModel *m, const VehInput *in, float dt)
         }
     }
 
-    /* ---- HOLDING A DOUGHNUT ----
-     * Once round and turning, keeping the tyres alight is not automatic. The
-     * 350Z makes 11.9 kN at the wheels at 20 km/h against 12.1 kN of grip --
-     * it CANNOT break traction from a standing throttle at that speed, so the
-     * spin died, the car hooked up and drove off in a 20 m circle at 56 km/h.
-     * What a driver does is keep the revs up where the torque is, riding the
-     * clutch rather than letting it lock the engine down to road speed. Do
-     * the same: while the driver is asking for a slide at low speed, hold the
-     * clutch short of home so the crank stays near peak torque. */
-    if (deliberate && fabsf(s->v_long) < 12.0f && in->throttle > 0.8f) {
-        float peak_rpm = 0.62f * c->motor.max_rpm;
-        if (s->rpm < peak_rpm) {
-            float want_c = 0.20f + 0.80f * (s->rpm / peak_rpm);
-            if (want_c < s->clutch) s->clutch = want_c;
-        }
-    } else if (s->launching && s->clutch < 1.0f) {
-        /* Dropped: the bite is far quicker than the ordinary take-up. */
+    /* Launch clutch, dropped: the bite is far quicker than the ordinary
+     * take-up. */
+    if (s->launching && s->clutch < 1.0f) {
         s->clutch += 8.0f * dt;
         if (s->clutch >= 1.0f) { s->clutch = 1.0f; s->launching = 0; }
     }
@@ -864,15 +850,6 @@ void veh_step(VehState *s, const VehModel *m, const VehInput *in, float dt)
          * and stops the runaway in one line -- and the crank is eased toward
          * steady two-thirds revs, which is where a driver sits it and what
          * the ear expects: one held note, not the limiter. */
-        if (deliberate && !in->handbrake) {
-            float vg3 = sqrtf(s->v_long * s->v_long + s->v_lat * s->v_lat);
-            if (vg3 < 12.0f) {
-                float w_spin = (1.0f + 4.0f) * fmaxf(vg3, 1.2f) / m->r_drive;
-                if (s->omega_drive > w_spin) s->omega_drive = w_spin;
-                float w_note = 0.62f * c->motor.max_rpm * (2.0f * PI / 60.0f);
-                s->omega_engine += (w_note - s->omega_engine) * clampf(4.0f * dt, 0.0f, 1.0f);
-            }
-        }
         if (s->omega_drive < 0.0f && in->throttle > 0.0f) s->omega_drive = 0.0f;
         /* the tyre's own answer replaces the open-loop demand */
         drive_N = Fx_tyre;
@@ -1054,17 +1031,6 @@ void veh_step(VehState *s, const VehModel *m, const VehInput *in, float dt)
      * circle cannot open out; the hands hold the yaw rate near a steady
      * 100 deg/s with bounded authority. Above the speed window the governor
      * is gone and the physics is untouched. */
-    if (deliberate) {
-        float vg = sqrtf(s->v_long * s->v_long + s->v_lat * s->v_lat);
-        /* the foot, still: past ~20 km/h stop feeding the circle */
-        float wind = clampf((vg - 5.5f) / 1.5f, 0.0f, 1.0f);
-        if (Fx > 0.0f) Fx *= 1.0f - wind;
-        float yaw_t = tanhf(in->steer * 2.0f) * 1.75f;   /* ~100 deg/s */
-        float hold = clampf((yaw_t - s->yaw_rate) * 9000.0f,
-                            -0.8f * mzmax, 0.8f * mzmax);
-        Mz += hold * clampf(1.0f - vg / 12.0f, 0.0f, 1.0f);
-    }
-
     s->dbg_Fyf = Fy_f; s->dbg_Fyr = Fy_r; s->dbg_Mz = Mz;
     s->dbg_Nf = Nf; s->dbg_Nr = Nr;
 

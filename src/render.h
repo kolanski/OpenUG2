@@ -78,10 +78,7 @@ typedef struct {
           /* 1 = discard texels below half alpha. Only for textures the record
              calls cutout: applied to an opaque one it punches holes. */
           uAlphaTest,
-          uMatOn, uMatDifMin, uMatDifRange, uMatSE,
-          /* live environment cube: 0 = procedural night sphere, 1 = sample the
-             cube, 2 = show the reflection alone (diagnostic) */
-          uEnvCubeOn, uEnvYaw, uEnvCube;
+          uMatOn, uMatDifMin, uMatDifRange, uMatSE;
 } RProg;
 
 /* world-space sun direction (night scene key light) */
@@ -95,10 +92,6 @@ void mat_persp(float fov, float aspect, float znear, float zfar, float *m);
 void mat_trans(float x, float y, float z, float *m);
 void mat_rotz(float a, float *m);
 void mat_car(const float *pos, float heading, const float *up, float rideh, float *m);
-/* Look-at with an explicit up vector: the cube's top and bottom faces need
-   one, since the usual world-up is degenerate there. */
-void mat_lookat_up(const float eye[3], const float fwd[3], const float up[3],
-                   float out[16]);
 void mat_lookat(const float *eye, const float *fwd, float *m);   /* up = world +Z */
 
 /* ---- GPU objects ---- */

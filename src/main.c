@@ -26,8 +26,6 @@
 
 #include "nfsu2.h"
 #include "render.h"
-#include "sfx/post.h"
-#include "sfx/envcube.h"
 #include "physics.h"
 #include "ai.h"
 #include "audio.h"
@@ -1271,26 +1269,9 @@ int main(int argc, char **argv) {
     int camat = 0; float camx = 0, camy = 0;   /* --cam-at X Y: aim a static capture */
     int spawn_set = 0; float spawn_x = 0, spawn_y = 0;   /* --spawn NAME */
     static N2Paint pal[512]; int npal = 0;        /* body paints, from GLOBALB */
-    /* (350Z default wired below once carname is final) */
     float paint_rgb[3] = { 0.70f, 0.70f, 0.75f }; /* until the record is read */
     const char *paint_name = NULL;                /* --paint NAME */
-    /* Showroom default for the default car: the attribute DB pairs the 350Z's
-       stock record with MATERIAL REGPAINTORANGE (145,35,17). Until the per-car
-       default-paint chain is parsed end to end, pin the one car we boot into;
-       --paint still overrides. */
-    const char *paint_default_350z = "REGPAINTORANGE";
     const char *g_sky_name = NULL;     /* --sky NAME */
-    int   no_post = 0;                 /* --no-post: skip the tone pass */
-    float post_amount = 1.0f;          /* --post N: scale it */
-    int   post_on = 0;                 /* the pass is live this frame */
-/* Resolving has to happen after everything is drawn and before anything reads
-   the pixels, and there are several places that read them. A macro keeps the
-   three lines identical at every one of them rather than trusting a single
-   spot in a 7000-line frame to be on the live path -- an earlier attempt put
-   it in what looked like the right place and it never ran. */
-#define POST_RESOLVE() do { if (post_on) { \
-        pp_end_and_draw(&quad, post_amount); glUseProgram(rp.prog); post_on = 0; } \
-    } while (0)
     int head_set = 0;  float head_deg = 0;               /* --heading DEG */
     const char *b02probe = NULL;   /* --b02-probe NAME (M104): stride/field search */
     const char *shaudit = NULL;    /* --showcase-audit PREFIX [X Y] (M106) */
@@ -1417,14 +1398,10 @@ int main(int argc, char **argv) {
         /* --world2: assemble the scene from instance records instead of from
            models with their matrix baked in. See world2.c. */
         else if (!strcmp(argv[i], "--world2")) world2_on = 1;
-        /* --no-post / --post N: the bloom-and-tone pass, and how much of it. */
         /* --paint NAME: body paint by material name (METPAINTSILVER, ...). */
         else if (!strcmp(argv[i], "--paint") && i+1 < argc) paint_name = argv[++i];
         /* --sky sunrise|sunset|night: which shipped sky to hang overhead. */
         else if (!strcmp(argv[i], "--sky") && i+1 < argc) g_sky_name = argv[++i];
-        else if (!strcmp(argv[i], "--no-post")) no_post = 1;
-        else if (!strcmp(argv[i], "--post") && i+1 < argc)
-            post_amount = (float)atof(argv[++i]);
         /* --spawn NAME: start at a named place; --spawn list prints them. */
         else if (!strcmp(argv[i], "--spawn") && i+1 < argc) {
             const char *nm = argv[++i];
@@ -3090,7 +3067,6 @@ int main(int argc, char **argv) {
            keeps a hand-picked near-white, and near-white metallic under a
            specular highlight is what blows out. */
         npal = n2_load_paints(globdata, globlen, pal, 512);
-        if (!paint_name && !strcmp(carname, "350Z")) paint_name = paint_default_350z;
         if (paint_name) n2_carskin_mat = n2_str_hash(paint_name);
         {   uint32_t want = n2_carskin_mat ? n2_carskin_mat
                                            : n2_str_hash("METPAINTSILVER");
@@ -3264,7 +3240,8 @@ int main(int argc, char **argv) {
             if (got && bodykey && n2_load_car_tex_by_key(ctdata, ctlen, bodykey, &bt)) {
                 int W = bt.w > vt.w ? bt.w : vt.w, H = bt.h > vt.h ? bt.h : vt.h;
                 N2Tex out = { W, H, (unsigned char *)malloc((long)W*H*3),
-                                    (unsigned char *)malloc((long)W*H), NULL, 0, 0, 0 };
+                                    (unsigned char *)malloc((long)W*H), NULL, 0, 0, 0,
+                                    0, 0, 0, 0 };
                 for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
                     long o  = (long)y*W + x;
                     long bo = (long)(y*bt.h/H)*bt.w + x*bt.w/W;   /* nearest */
@@ -4493,18 +4470,6 @@ int main(int argc, char **argv) {
 
     /* unit-quad for the 2D HUD (drawn in NDC via uMVP) */
     GpuMesh quad = make_quad();
-    /* Live reflection cube. 128 px a face is enough for a clear coat: it is
-       reflected, blurred by the mip chain and never seen directly. */
-    int g_envcube_ready = env_cube_init(128);
-    if (g_envcube_ready) {
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, env_cube_tex());
-        glActiveTexture(GL_TEXTURE0);
-        glUseProgram(rp.prog);
-        glUniform1i(rp.uEnvCube, 1);       /* the cube lives on unit 1 */
-        printf("reflections: 128x128 cube map ready\n");
-    }
-
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);   /* coplanar re-draws (last write wins) pass cleanly */
     /* Stock showroom paint: metallic silver (the files carry no chosen
@@ -5739,82 +5704,6 @@ int main(int argc, char **argv) {
 
         int W, H; SDL_GL_GetDrawableSize(win, &W, &H);
         glViewport(0, 0, W, H);
-        /* LIVE REFLECTION. There is no environment texture in the data -- the
-           slot exists and nothing fills it, which is why the game's options
-           expose a reflection rate at all. Six faces are rendered around the
-           car instead, low resolution, one face per frame. */
-        {   static int envtick = 0;
-            /* ONE FACE PER FRAME. Refreshing all six at once costs the same
-               overall but visibly jumps: the map holds for five frames and
-               then changes completely. One face per frame takes the same six
-               frames and spreads the change out. */
-            if (g_envcube_ready && ncar) {
-                /* Unbind the map from unit 1 while rendering into it: it
-                   cannot be a shader source and a framebuffer target at the
-                   same time -- the driver marks such a texture unloadable and
-                   substitutes a null one. */
-                glActiveTexture(GL_TEXTURE1);
-                glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
-                glActiveTexture(GL_TEXTURE0);
-                float eye[3] = { carpos[0], carpos[1], carpos[2] + 1.0f };
-                {   int f = envtick++ % 6;
-                    float fwd[3], upv[3];
-                    env_cube_face_dirs(f, fwd, upv);
-                    float Vf[16], Pf[16], MVPf[16];
-                    mat_lookat_up(eye, fwd, upv, Vf);
-                    mat_persp(1.5708f, 1.0f, 1.0f, 30000.0f, Pf);
-                    mat_mul(Pf, Vf, MVPf);
-                    env_cube_begin(f);
-                    glClearColor(g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b, 1);
-                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-                    glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVPf);
-                    glUniform1f(rp.uEnv, 0.0f); glUniform1f(rp.uMatOn, 0.0f);
-                    glUniform1f(uSpec, 0.0f);
-                    /* sky: no fog, no depth writes */
-                    glUniform1f(uUnlit, 1.0f); glUniform1f(rp.uFogDensity, 0.0f);
-                    glUniform3f(uColor, 1.0f, 1.0f, 1.0f); glUniform1f(uAlpha, 1.0f);
-                    glDepthMask(GL_FALSE);
-                    for (int k = 0; k < nsky; k++) {
-                        if (!skybatch[k].tex) continue;
-                        glUniform1f(uUseTex, 1.0f);
-                        glBindTexture(GL_TEXTURE_2D, skybatch[k].tex);
-                        draw_batch(&skybatch[k]);
-                    }
-                    glDepthMask(GL_TRUE); glUniform1f(uUnlit, 0.0f);
-                    /* the world around the car: what actually reflects */
-                    glUniform1f(rp.uFogDensity, g_dbg.fog_density);
-                    glUniform1f(rp.uVColor, g_dbg.vcolor);
-                    for (int k = 0; k < nbatch; k++) {
-                        N2Batch *b = &wbatch[k];
-                        float dx = eye[0] < b->bbox_min[0] ? b->bbox_min[0]-eye[0]
-                                 : (eye[0] > b->bbox_max[0] ? eye[0]-b->bbox_max[0] : 0);
-                        float dy = eye[1] < b->bbox_min[1] ? b->bbox_min[1]-eye[1]
-                                 : (eye[1] > b->bbox_max[1] ? eye[1]-b->bbox_max[1] : 0);
-                        if (dx*dx + dy*dy > 250.0f*250.0f) continue;
-                        if (b->tex) { glUniform1f(uUseTex, 1.0f);
-                                      glBindTexture(GL_TEXTURE_2D, b->tex); }
-                        else { glUniform1f(uUseTex, 0.0f);
-                               glUniform3f(uColor, 0.28f, 0.29f, 0.31f); }
-                        draw_batch(b);
-                    }
-                    glUniform1f(rp.uVColor, 0.0f);
-                }
-                env_cube_end(W, H);
-                glActiveTexture(GL_TEXTURE1);
-                glBindTexture(GL_TEXTURE_CUBE_MAP, env_cube_tex());
-                glGenerateMipmap(GL_TEXTURE_CUBE_MAP);   /* smooths the sampling */
-                glActiveTexture(GL_TEXTURE0);
-                glActiveTexture(GL_TEXTURE1);
-                glBindTexture(GL_TEXTURE_CUBE_MAP, env_cube_tex());
-                glActiveTexture(GL_TEXTURE0);
-            }
-        }
-
-        /* The frame is drawn into a texture so it can be toned afterwards;
-           see src/sfx/post.c. Without it the picture is the raw scene, which
-           reads cold and flat. */
-        if (!no_post && pp_init(W, H)) { post_on = 1; pp_begin(); }
-        else post_on = 0;
         /* the sky is cleared to the fog colour: distant geometry dissolves
            into exactly what the horizon shows */
         glClearColor(g_dbg.fog_r, g_dbg.fog_g, g_dbg.fog_b, 1);
@@ -5849,7 +5738,6 @@ int main(int argc, char **argv) {
         glUniform1f(rp.uDecal, 0.0f);
         glUniform1f(rp.uAlphaTest, 0.0f);
         glUniform1f(rp.uVista, 0.0f);
-        glUniform1f(rp.uEnvCubeOn, 0.0f);
         glUniform3f(rp.uColor, 1.0f, 1.0f, 1.0f);
         glUniform3f(rp.uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);
         glEnable(GL_DEPTH_TEST); glDepthMask(GL_TRUE);
@@ -6322,7 +6210,6 @@ int main(int argc, char **argv) {
         }
 
         /* car: solid-shaded, positioned + banked to the road (up = car_up) */
-        float player_body_model[16]; int player_body_model_valid = 0;
         if (ncar) {
             float Model[16], MVPc[16], WheelModel[16], MVPwheel[16];
             /* Wheel contact ride is this car's own measured tyre radius. Body
@@ -6331,8 +6218,6 @@ int main(int argc, char **argv) {
             float ride = car_body_ride;   /* body collision envelope uses this ride */
             float bodypos[3] = { carpos[0], carpos[1], carpos[2] };
             mat_car(bodypos, heading, car_up, ride, Model);
-            memcpy(player_body_model, Model, sizeof player_body_model);
-            player_body_model_valid = 1;
             mat_mul(MVP, Model, MVPc);
             /* Wheels never inherit the body spring/drop: their hub stays one
                scaled tyre radius above the exact gameplay contact. */
@@ -6408,14 +6293,6 @@ int main(int argc, char **argv) {
                       memcpy(M, m2, sizeof M);
                   }
                   memcpy(wheelT[k],M,sizeof(M)); } }
-            /* Car reflections come from the cube rendered around the car
-               itself. uEnvYaw turns the reflected ray from car axes into world
-               axes: normals and positions here are model-space, the map is
-               world-space. */
-            if (g_envcube_ready) {
-                glUniform1f(rp.uEnvCubeOn, 1.0f);
-                glUniform1f(rp.uEnvYaw, heading);
-            }
             /* uUnlit/uSoft are left ON (1.0) by the shadow, headlight-glow
                and skid-mark billboards drawn just above -- all three
                deliberately use the unlit flat-colour path for those quads.
@@ -6760,7 +6637,6 @@ int main(int argc, char **argv) {
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, MVP);
             glUniform3f(uLight, N2_SUN_X, N2_SUN_Y, N2_SUN_Z);   /* back to world */
             glUniform1f(rp.uEnv, 0.0f);   /* reflections are cars-only */
-            glUniform1f(rp.uEnvCubeOn, 0.0f);
         }
         /* And once more OUTSIDE that block. The restore above only runs when a
            car was drawn, and which passes run at all depends on the mode --
@@ -7283,8 +7159,6 @@ int main(int argc, char **argv) {
             if (cap >= 0) {
                 char sp[1024]; snprintf(sp, sizeof sp, "%s_%s.png", smaudit, vn[cap]);
                 unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                POST_RESOLVE();
-                POST_RESOLVE();
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                 for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                 write_png(sp, W, H, fl); free(px); free(fl);
@@ -7321,8 +7195,6 @@ int main(int argc, char **argv) {
                                                  "C_tangent_reversed" };
                     char sp[1024]; snprintf(sp, sizeof sp, "%s_%s.png", shaudit, hn[shot107]);
                     unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                    POST_RESOLVE();
-                POST_RESOLVE();
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                     for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                     write_png(sp, W, H, fl); free(px); free(fl);
@@ -7520,8 +7392,6 @@ int main(int argc, char **argv) {
                     char sp[1024];
                     snprintf(sp, sizeof sp, "%s_yaw%d.png", poseshot, YAW[slot]);
                     unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                    POST_RESOLVE();
-                POST_RESOLVE();
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                     for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                     write_png(sp, W, H, fl); free(px); free(fl);
@@ -7534,8 +7404,6 @@ int main(int argc, char **argv) {
             if (tag) {
                 char sp[1024]; snprintf(sp, sizeof sp, "%s%s.png", raudit, tag);
                 unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-                POST_RESOLVE();
-                POST_RESOLVE();
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
                 for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
                 write_png(sp, W, H, fl); free(px); free(fl);
@@ -7567,7 +7435,6 @@ int main(int argc, char **argv) {
         if (daudit && shotframe == 2) {   /* one normal rendered frame at spawn */
             char sp[1024]; snprintf(sp, sizeof sp, "%s_spawn.png", daudit);
             unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-            POST_RESOLVE();
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
             for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
             write_png(sp, W, H, fl); free(px); free(fl);
@@ -7575,7 +7442,6 @@ int main(int argc, char **argv) {
         }
         if (shot && ++shotframe >= shotframes) {
             unsigned char *px = malloc((size_t)W*H*3), *fl = malloc((size_t)W*H*3);
-            POST_RESOLVE();
             glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
             for (int y = 0; y < H; y++) memcpy(fl+(size_t)y*W*3, px+(size_t)(H-1-y)*W*3, W*3);
             write_png(shot, W, H, fl);
@@ -7701,7 +7567,6 @@ int main(int argc, char **argv) {
             printf("wrote %s (%dx%d) after driving to (%.0f,%.0f)\n", shot, W, H, carpos[0], carpos[1]);
             running = 0;
         }
-        POST_RESOLVE();
         SDL_GL_SwapWindow(win);
     }
 

@@ -25,7 +25,7 @@ else
 endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
-SRC  := src/main.c src/render.c src/sfx/post.c src/sfx/envcube.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world2.c src/world_mesh.c src/car_setup.c src/vehicle_model.c src/abs.c
+SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world2.c src/world_mesh.c src/car_setup.c src/vehicle_model.c src/abs.c
 HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world_mesh.h src/car_setup.h src/vehicle_model.h src/abs.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
@@ -62,7 +62,7 @@ build/debugui.o: src/debugui.cpp src/debug.h
 
 DBG_OBJ := $(SRC:src/%.c=build/%.dbg.o)
 build/%.dbg.o: src/%.c $(HDRS) $(GEN)
-	@mkdir -p build
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -DDEBUG_UI -c $< -o $@
 
 debug: $(DBG_OBJ) $(IMGUI_OBJ)
