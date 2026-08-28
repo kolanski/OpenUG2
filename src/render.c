@@ -31,13 +31,21 @@ static const char *FS =
     "varying vec4 vColor;\n"
     "uniform sampler2D uTex;\n"
     "uniform float uVColor;\n"   /* 0..1: apply the source per-vertex prelight */
-    "uniform float uUseTex; uniform vec3 uColor; uniform float uUnlit; uniform float uAlpha; uniform float uSoft; uniform float uSpec; uniform float uDecal;\n"
+    "uniform float uAlphaTest; uniform float uUseTex; uniform vec3 uColor; uniform float uUnlit; uniform float uAlpha; uniform float uSoft; uniform float uSpec; uniform float uDecal;\n"
     "uniform float uAmbient; uniform float uDiffuse; uniform vec3 uLight;\n"
     "uniform vec3 uFogColor; uniform float uFogDensity;\n"
     "uniform vec3 uCamPos; uniform float uEnv; uniform float uUVCheck;\n"
     "uniform float uGloss; uniform float uFlipN;\n"
+    "uniform float uVista;\n"
     "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
-    "uniform float uVista;\n"     /* >0.5: authored backdrop pass, alpha-blended */
+    /* Car material response, driven by the material record rather than by
+       hand-picked shading. For each of diffuse, specular and reflection the
+       material stores a Min/Range pair and the term evaluates as
+           f = Min + dot(V, n) * Range
+       so a panel facing the viewer and a panel edge-on differ by exactly what
+       the material asks for. uMatOn > 0.5 selects this model. */
+    "uniform float uMatOn; uniform vec3 uMatDifMin; uniform vec3 uMatDifRange;\n"
+    "uniform vec4 uMatSE;\n"   /* specMin, specRange, envMin, envRange */
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
     "void main(){\n"
@@ -53,6 +61,10 @@ static const char *FS =
     "    gl_FragColor=vec4(vec3(vUV.x,vUV.y,0.2)*mix(0.35,1.0,grid),1.0); return;\n"
     "  }\n"
     "  float fog = clamp(exp(-pow(vDepth*uFogDensity, 2.0)), 0.0, 1.0);\n"
+    /* Emissive path: neon, lamps and halos. The texture IS sampled here.
+       Lamp textures are additive and carry the shape of the bulb and its
+       halo, so ignoring them turns every street light into a featureless
+       bright blob. */
     /* M132-R2 vista path. The backdrops are authored as cut-out sheets: their
        DXT1 blocks carry one-bit transparency (up to 57.7% of texels fully
        clear) and their DXT3 blocks carry real gradients, all of which the
@@ -69,9 +81,10 @@ static const char *FS =
     "    gl_FragColor = vec4(mix(uFogColor, c, fog), a);\n"
     "    return;\n"
     "  }\n"
-    "  if(uUnlit>0.5){ float a=uAlpha;\n"
+    "  if(uUnlit>0.5){ float a=uAlpha; vec3 ec=uColor;\n"
+    "    if(uUseTex>0.5){ vec4 et=texture2D(uTex,vUV); ec=et.rgb*uColor; a*=et.a; }\n"
     "    if(uSoft>0.5){ float d=length(vUV-vec2(0.5)); a*=clamp(1.0-d*2.0,0.0,1.0); a*=a; }\n"
-    "    gl_FragColor=vec4(mix(uFogColor,uColor,fog),a); return; }\n"
+    "    gl_FragColor=vec4(mix(uFogColor,ec,fog),a); return; }\n"
     /* uLight is the sun direction in the OBJECT's model space: normals stay
        model-space (no per-vertex transform), so a rotated object (the car)
        must counter-rotate the light or its lit side turns with it. */
@@ -90,6 +103,10 @@ static const char *FS =
     /* uDecal: paint under an alpha-masked decal atlas (badges/vinyls) —
        texture RGB shows only where its alpha says so, paint elsewhere */
     "  vec4 t = texture2D(uTex,vUV);\n"
+    /* Alpha cutout, enabled per batch and only for cutout textures. Foliage
+       uses one-bit transparency, so alpha is either fully on or fully off and
+       a 0.5 threshold separates them exactly. */
+    "  if(uAlphaTest>0.5 && t.a < 0.5) discard;\n"
     "  vec3 base = uUseTex>0.5 ? (uDecal>0.5 ? mix(uColor,t.rgb,t.a) : t.rgb) : uColor;\n"
     /* Rim paint: recolor the diffuse toward uColor while KEEPING its detail.
        Luminance drives the shade, uColor picks the metal, so a gold OEM sheet
@@ -103,15 +120,20 @@ static const char *FS =
        this fakes the early-2000s baked-AO look by darkening paint where the
        surface turns away from the camera, instead of claiming detail that
        isn't in the asset. */
-    "  if(uSpec>0.001){\n"
-    "    float edge=pow(1.0-clamp(dot(N,V),0.0,1.0), 4.0);\n"
-    "    base *= mix(1.0, 0.6, edge);\n"
+    "  float vn = clamp(dot(N,V), 0.0, 1.0);\n"
+    "  float mspec = 1.0, menv = 1.0;\n"
+    "  if(uMatOn>0.5){\n"
+    "    base *= uMatDifMin + vn*uMatDifRange;\n"
+    "    mspec = max(uMatSE.x + vn*uMatSE.y, 0.0);\n"
+    "    menv  = max(uMatSE.z + vn*uMatSE.w, 0.0);\n"
+    "  } else if(uSpec>0.001){\n"
+    "    base *= mix(1.0, 0.6, pow(1.0-vn, 4.0));\n"
     "  }\n"
     /* Phong: reflect the light about the normal and test it against the VIEW
        vector. The old form used dot(N,L) with no V term at all, so it was a
        sharpened diffuse -- the highlight could not travel across a panel as
        the camera moved, which is what made the paint read flat/matte. */
-    "  float sp = pow(max(dot(reflect(-L,N), V), 0.0), uGloss)*uSpec;\n"
+    "  float sp = pow(max(dot(reflect(-L,N), V), 0.0), uGloss)*uSpec*mspec;\n"
     "  float rim = pow(1.0-abs(N.z), 3.0)*uSpec*0.4;\n"        /* fresnel-ish edge sheen */
     "  vec3 lit = base*d*1.35 + sp + rim;\n"
     /* per-vertex prelight (world geometry): the source stores baked AO/lighting
@@ -119,7 +141,23 @@ static const char *FS =
        PS2/RenderWare convention, so building bases darken, terrain gets its
        grass/dirt variation back, and the flat "cardboard" look goes away. Gated
        by uVColor so cars/props (which don't carry it) are untouched. */
-    "  if(uVColor>0.001) lit = mix(lit, lit*clamp(vColor.rgb*2.0, 0.0, 1.6), uVColor);\n"
+    /* World geometry is lit ENTIRELY by its baked vertex colour -- there is
+       no ambient term, no sun direction and no sun colour in the world
+       material, so the only thing a world pixel can do is modulate its
+       texture by the colour the artist baked and then apply fog. Adding a
+       directional term on top is what used to leave the undersides of
+       overpasses black (normal pointing down, N.L near zero) while their tops
+       blew out.
+
+       The x2 is the MODULATE2X convention of the era: 128 is neutral, so a
+       baked value can both darken and brighten the texture. Only RGB is
+       doubled -- alpha stays a plain product.
+
+       Channel order is RGBA: the mean baked bytes on road surfaces run
+       75.2 / 86.3 / 91.9 with the third the largest, and night asphalt reads
+       blue, so the third byte is blue. Swapping to BGR turns the roads
+       yellow. */
+    "  if(uVColor>0.001) lit = mix(lit, base*vColor.rgb*2.0, uVColor);\n"
     /* environment reflection (cars only, uEnv>0): a procedural night-city
        sphere — dark ground, warm city-glow horizon band, dim blue sky —
        sampled with the model-space reflection vector, fresnel-weighted.
@@ -135,13 +173,17 @@ static const char *FS =
     "    vec3 env = mix(vec3(0.03,0.03,0.05), vec3(0.10,0.14,0.24), up)\n"
     "             + vec3(0.85,0.66,0.42)*pow(1.0-abs(R.z), 4.0);\n"
     "    float fres = 0.35 + 0.65*pow(1.0-clamp(dot(N,V),0.0,1.0), 3.0);\n"
-    "    lit += env * (uEnv * fres);\n"
+    "    lit += env * (uEnv * menv * fres);\n"
     "  }\n"
     /* lit alpha = uAlpha (1 everywhere but the blended glass pass), so
        translucent glass keeps its specular highlight */
-    "  gl_FragColor=vec4(mix(uFogColor, lit, fog), uAlpha);\n"
+    /* World alpha is texture.a * vertexColour.a -- the doubling above touches
+       RGB only. Forcing alpha to 1 here makes glass come out opaque in the
+       blended pass. Gated on uVColor, which is raised for world geometry
+       only. */
+    "  float oa = uVColor>0.001 ? t.a*vColor.a : uAlpha;\n"
+    "  gl_FragColor=vec4(mix(uFogColor, lit, fog), oa);\n"
     "}\n";
-
 /* ---- tiny 4x4 matrix (column-major) ---- */
 void mat_mul(const float *a, const float *b, float *o) {
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) {
@@ -256,6 +298,11 @@ RProg render_program(void) {
     r.uLight   = glGetUniformLocation(r.prog, "uLight");
     r.uVColor  = glGetUniformLocation(r.prog, "uVColor");
     r.uGloss   = glGetUniformLocation(r.prog, "uGloss");
+    r.uAlphaTest   = glGetUniformLocation(r.prog, "uAlphaTest");
+    r.uMatOn       = glGetUniformLocation(r.prog, "uMatOn");
+    r.uMatDifMin   = glGetUniformLocation(r.prog, "uMatDifMin");
+    r.uMatDifRange = glGetUniformLocation(r.prog, "uMatDifRange");
+    r.uMatSE       = glGetUniformLocation(r.prog, "uMatSE");
     r.uFlipN   = glGetUniformLocation(r.prog, "uFlipN");
     r.uRimTint = glGetUniformLocation(r.prog, "uRimTint");
     glUniform1f(r.uAlpha, 1.0f); glUniform1f(r.uSoft, 0.0f); glUniform1f(r.uSpec, 0.0f);
@@ -300,6 +347,7 @@ GpuMesh *upload_scene(N2Scene *s) {
         glGenBuffers(1,&gm[i].ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,gm[i].ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, m->nidx*sizeof(uint16_t), m->idx, GL_STATIC_DRAW);
         gm[i].nidx = m->nidx; gm[i].cat = m->cat; gm[i].texkey = m->texkey;
+        gm[i].matkey = m->matkey;
         gm[i].trim = m->trim;
         free(nor);
     }
@@ -676,7 +724,7 @@ static GLuint make_wheel_tex_var(int spin_blur) {
         unsigned char *o = px + (y*S + x)*3;
         o[0] = v; o[1] = v; o[2] = (unsigned char)(v + v/16);        /* cool metal */
     }
-    N2Tex t = { S, S, px, NULL, NULL, 0, 0, 0 };
+    N2Tex t = { S, S, px, NULL, NULL, 0, 0, 0, 0, 0, 0, 0 };
     GLuint id = upload_tex(&t);
     /* radial, single-sample cap texture (no tiling intended) — clamp so a
        filter footprint near u/v=0 or 1 can't wrap and bleed in colour from

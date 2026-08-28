@@ -175,7 +175,11 @@ int world_load(World *w, const char *troot, const char *trackname);
 /* Decode + upload every distinct mesh texture (own TPK -> LOC4 -> master),
  * writing the key->GL map, then free the region buffers. Needs a GL context.
  * Returns the number of textures bound. */
-int world_bind_textures(World *w, uint32_t *keys, GLuint *texs, int cap);
+/* Bind every distinct world texture. `mode` receives each one's draw mode
+   from its record (0 opaque, 1 cutout, 2 blended, 3 additive); pass NULL if
+   the caller does not care. */
+int world_bind_textures(World *w, uint32_t *keys, GLuint *texs,
+                        unsigned char *mode, int cap);
 
 /* Ground height at (x,y): same contract as n2_ground_z but only tests the
  * road/terrain meshes whose bbox covers the point (grid lookup). */
