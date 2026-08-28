@@ -5651,7 +5651,14 @@ int main(int argc, char **argv) {
                   vsteer += (sinf(dt) * 0.5f - vsteer) * 0.25f;    /* +/-0.5 rad oscillation */
               } else {
                   wang += speed / wR;
-                  vsteer += (steer_filtered*0.50f - vsteer) * 0.25f;
+                  /* The VISUAL wheels follow the raw input, not the physics
+                     filter: steer_filtered is an exponential smoother standing
+                     in for a steering rack, and easing it AGAIN here ran two
+                     filters in series -- full visual lock arrived a third of a
+                     second after the key went down, which reads as the wheels
+                     not steering at all. The 0.25 ease below is already the
+                     rack the eye sees; feed it the driver's hand directly. */
+                  vsteer += (steer*0.50f - vsteer) * 0.25f;
               }
               wang = fmodf(wang, 6.2831853f);
               float c = cosf(wang), sn = sinf(wang);
