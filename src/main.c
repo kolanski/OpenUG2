@@ -366,6 +366,19 @@ static int dump_car_info(const char *dataroot, const char *car) {
 }
 
 
+/* Named places to start from, measured from world objects rather than chosen:
+ * each is the position of an entrance light beam in the shipped scene. The
+ * free-roam start is the one exception -- five independent reference
+ * recordings all begin at the same position on a heading of -10.2 degrees. */
+static const struct { const char *name; float x, y; } N2_SPAWNS[] = {
+    { "start",        1695.2f,  -883.6f },
+    { "garage",        660.7f,  -120.2f },
+    /* Airport: the welcome sign stands at (1718.6, -1002.9); backed off by
+       35 m so it sits in frame ahead of the car. */
+    { "airport",      1685.0f, -1009.0f },
+    { "airport_sign", 1718.6f, -1002.9f },
+};
+
 /* ---- static-capture spawn safety (Milestone 80) ---------------------------
  * Used ONLY by --shot-static / --static-spawn-audit. The interactive, menu and
  * race spawn paths are left exactly as they were: this runs after them and
@@ -1229,6 +1242,8 @@ int main(int argc, char **argv) {
     const char *matdump = NULL, *matmesh = NULL;     /* --mesh-material PREFIX NAME (M100) */
     int fbcensus = 0;   /* --fallback-census (M102): who still takes the old path */
     int camat = 0; float camx = 0, camy = 0;   /* --cam-at X Y: aim a static capture */
+    int spawn_set = 0; float spawn_x = 0, spawn_y = 0;   /* --spawn NAME */
+    int head_set = 0;  float head_deg = 0;               /* --heading DEG */
     const char *b02probe = NULL;   /* --b02-probe NAME (M104): stride/field search */
     const char *shaudit = NULL;    /* --showcase-audit PREFIX [X Y] (M106) */
     int cprobe = 0; float cpx = 0, cpy = 0;   /* --cover-probe X Y (M110v) */
@@ -1343,6 +1358,33 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--b02-probe") && i+1 < argc) {
             b02probe = argv[++i]; fbcensus = 1; n2_m102 = 1; }
+        /* --world2: assemble the scene from instance records instead of from
+           models with their matrix baked in. See world2.c. */
+        else if (!strcmp(argv[i], "--world2")) world2_on = 1;
+        /* --spawn NAME: start at a named place; --spawn list prints them. */
+        else if (!strcmp(argv[i], "--spawn") && i+1 < argc) {
+            const char *nm = argv[++i];
+            int nsp = (int)(sizeof N2_SPAWNS / sizeof N2_SPAWNS[0]);
+            if (!strcmp(nm, "list")) {
+                printf("spawn points:\n");
+                for (int k = 0; k < nsp; k++)
+                    printf("  %-13s X=%9.1f  Y=%9.1f\n",
+                           N2_SPAWNS[k].name, N2_SPAWNS[k].x, N2_SPAWNS[k].y);
+                return 0;
+            }
+            int found = 0;
+            for (int k = 0; k < nsp; k++)
+                if (!strcmp(nm, N2_SPAWNS[k].name)) {
+                    spawn_set = 1; spawn_x = N2_SPAWNS[k].x;
+                    spawn_y = N2_SPAWNS[k].y; found = 1; break;
+                }
+            if (!found) fprintf(stderr, "--spawn: no such place '%s'"
+                                        " (try --spawn list)\n", nm);
+        }
+        /* --heading DEG: set the starting heading outright. */
+        else if (!strcmp(argv[i], "--heading") && i+1 < argc) {
+            head_set = 1; head_deg = (float)atof(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--cam-at") && i+2 < argc) {
             camat = 1; camx = (float)atof(argv[++i]); camy = (float)atof(argv[++i]); }
         else if (!strcmp(argv[i], "--mesh-material") && i+2 < argc) {
@@ -1960,6 +2002,11 @@ int main(int argc, char **argv) {
     }
 
     static World world;
+    /* Instance placement only reads the sections within range, so it has to be
+       told where that is before the world is loaded. */
+    if (spawn_set && world2_on) {
+        world_inst_x = spawn_x; world_inst_y = spawn_y; world_inst_r = 600.0f;
+    }
     int nm = world_load(&world, troot, trackname);
 
     /* --objdump: write the exact post-dedup, world-space scene the GPU batches
@@ -2645,6 +2692,14 @@ int main(int argc, char **argv) {
        where the on-circuit sample finds no reroutable pair) and flooded the
        console -- exactly the automated race telemetry the manual-testing
        protocol drops. The barrier/checkpoint logic in world.c is unchanged. */
+    /* A named start point means free roam: the shipped events are not armed
+       and the car is not moved to a start grid. Asking for both is a
+       contradiction, and the grid would silently win. */
+    if (spawn_set && want_event_id) {
+        fprintf(stderr, "--spawn and --event are exclusive; ignoring --event %d\n",
+                want_event_id);
+        want_event_id = 0;
+    }
     if (want_event_id && world.nev > 0) {
         int wi = -1;
         for (int i = 0; i < world.nev; i++) if (world.ev[i].id == want_event_id) wi = i;
@@ -4178,9 +4233,50 @@ int main(int argc, char **argv) {
        colour; badges/vinyls overlay as decals). The debug pane's paint
        override still allows any colour live. */
     float paint[3] = { 0.70f, 0.70f, 0.75f };
+    /* A named start point has the last word. Several rules ahead of this one
+       move the car -- the density spawn, the static-capture picker, the
+       showcase pose, an armed race grid -- and each is right for its own mode,
+       so rather than guarding every one of them the explicit request is simply
+       applied after them all. Ground Z is taken here because by now the scene,
+       its instances and the ground grid are all final. */
+    /* Free roam starts at the free-roam start. With no place asked for, no
+       event and no capture mode running, the car would otherwise be put
+       wherever the density picker landed -- which is somewhere different on
+       every region and is not a place anyone drives from. N2_SPAWNS[0] is that
+       start; if the loaded region does not cover it, nothing changes. */
+    if (!spawn_set && !shot && !want_event_id && !sstatic && !daudit && !raudit) {
+        float gz = world_ground_z(&scene, N2_SPAWNS[0].x, N2_SPAWNS[0].y,
+                                  N2_GROUND_HIGHEST);
+        if (gz > -2000.0f && gz < 4000.0f) {
+            spawn_set = 1;
+            spawn_x = N2_SPAWNS[0].x; spawn_y = N2_SPAWNS[0].y;
+            if (!head_set) { head_set = 1; head_deg = -10.2f; }
+            printf("free roam: starting at '%s'\n", N2_SPAWNS[0].name);
+        }
+    }
+
+    if (spawn_set) {
+        spawn[0] = spawn_x; spawn[1] = spawn_y;
+        float gz = world_ground_z(&scene, spawn_x, spawn_y, N2_GROUND_HIGHEST);
+        if (gz > -2000.0f && gz < 4000.0f) spawn[2] = gz;
+        else fprintf(stderr, "--spawn: no ground at (%.1f, %.1f) -- is the "
+                             "region loaded that covers it?\n", spawn_x, spawn_y);
+        printf("--spawn: (%.1f, %.1f, %.3f)\n", spawn[0], spawn[1], spawn[2]);
+        /* Re-arm the sprung ride: it holds the wheel heights from wherever the
+           car was placed before, and moving the body without telling it leaves
+           the wheels reaching for ground that is no longer under them. The car
+           then falls through the world -- which looks like the lighting going
+           out, because what you are seeing is the city from underneath. */
+        g_ride_ready = 0;
+    }
+    if (head_set) {
+        heading0 = head_deg * 0.0174533f;
+        printf("--heading: %.1f deg\n", head_deg);
+    }
+
     float carpos[3] = { spawn[0], spawn[1], spawn[2] };
     float car_up[3] = { 0, 0, 1 };   /* chassis up, lerped toward the ground normal */
-    if (shot && !sstatic && !daudit && aipath.n > 0) {
+    if (shot && !sstatic && !daudit && !spawn_set && aipath.n > 0) {
         /* --shot skips the menu (and its Enter-key start-line snap), so the
            showcase density-spawn would leave the car parked off-circuit in
            the void on proxy regions. Snap to the start line like a race. */
@@ -4190,7 +4286,7 @@ int main(int argc, char **argv) {
         heading0 = atan2f(aipath.xy[nx*2+1]-carpos[1], aipath.xy[nx*2]-carpos[0]);
     }
     /* an armed race wins: start on its own grid, facing through the start line */
-    if (!sstatic) race_place_on_grid(&world, &scene, carpos, &heading0);
+    if (!sstatic && !spawn_set) race_place_on_grid(&world, &scene, carpos, &heading0);
     float heading = heading0, speed = 0.0f, vel[2] = {0,0};
     float steer_filtered = 0.0f;
     float cam[3] = { spawn[0], spawn[1], spawn[2]+5 };
@@ -4373,6 +4469,12 @@ int main(int argc, char **argv) {
                         carpos[0]=spawn[0]; carpos[1]=spawn[1]; carpos[2]=spawn[2];
         g_ride_ready = 0;   /* M130: re-arm the ride at every placement */
                         heading=heading0; vel[0]=vel[1]=0; speed=0; p_lap=p_prev=0;
+                    } else if ((k==SDLK_RETURN || k==SDLK_SPACE) && spawn_set) {
+                        /* Free roam: the start was asked for explicitly, so
+                           this only drops the countdown and lets the car go.
+                           Snapping to a start line here is what teleported the
+                           player away from the place they had chosen. */
+                        race_state = 0; racetimer = 0;
                     } else if (k==SDLK_RETURN || k==SDLK_SPACE) {
                         /* Snap the player from the showcase spot to the circuit
                            start line so the race itself is fair. start_idx is
